@@ -13,6 +13,7 @@ env/
 # ── Node / Frontend ──────────────────────────────────────────────────────────
 node_modules/
 frontend/dist/
+backend/frontend_dist/
 
 # ── Backend runtime data (auto-seeded on first request) ──────────────────────
 backend/data/

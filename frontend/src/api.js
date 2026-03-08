@@ -1,4 +1,6 @@
-const BASE = 'http://127.0.0.1:8000'
+// Development: VITE_API_URL=http://127.0.0.1:8000 (set in .env.development or via CLI)
+// Production:  empty string — requests go to the same server serving the frontend
+const BASE = import.meta.env.VITE_API_URL ?? ''
 
 // POST /chat
 export async function sendMessage({ sessionId, message }) {

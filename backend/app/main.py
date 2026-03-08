@@ -23,11 +23,14 @@
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 # ── Third-party ────────────────────────────────────────────────────────────────
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 # ── Our code ───────────────────────────────────────────────────────────────────
 from app.core.config import settings
@@ -129,3 +132,37 @@ async def health() -> dict[str, Any]:
         "llm_reachable": llm_ok,
         "phase": "0",
     }
+
+
+# ── Serve React frontend build (production only) ────────────────────────────
+#
+# When frontend/dist/ exists (after `npm run build`), FastAPI serves the React
+# app from the same URL. No separate frontend server needed in production.
+#
+# During development (npm run dev + uvicorn), frontend/dist/ doesn't exist,
+# so none of this activates — dev workflow is unchanged.
+
+# Check two locations:
+#   1. ../frontend/dist/  — local dev (after npm run build)
+#   2. ./frontend_dist/   — Render deploy (build command copies dist here)
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+_FRONTEND_DIST = _BACKEND_ROOT.parent / "frontend" / "dist"      # local
+if not _FRONTEND_DIST.is_dir():
+    _FRONTEND_DIST = _BACKEND_ROOT / "frontend_dist"               # Render
+
+if _FRONTEND_DIST.is_dir():
+    logger.info("Frontend build found at %s — serving static files.", _FRONTEND_DIST)
+
+    # Serve JS/CSS bundles from dist/assets/
+    app.mount(
+        "/assets",
+        StaticFiles(directory=_FRONTEND_DIST / "assets"),
+        name="frontend-assets",
+    )
+
+    # Catch-all: any path not matched by API routes → serve index.html
+    # React handles client-side routing from there.
+    # MUST be last — after all API routes and include_router() calls.
+    @app.get("/{path:path}", include_in_schema=False)
+    async def serve_frontend(path: str) -> FileResponse:
+        return FileResponse(_FRONTEND_DIST / "index.html")
