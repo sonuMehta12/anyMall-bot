@@ -1,0 +1,531 @@
+{
+  "project": "AnyMall-chan Backend",
+  "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
+  "last_updated": "2026-03-08",
+  "state": "phase-1b-complete",
+  "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
+
+  "current_focus": "phase-1c-database",
+
+  "storage_strategy": "File-based JSON storage (data/ directory) until all agent logic is proven. PostgreSQL replaces it in Phase 1C. Agent 2 and Agent 3 code will not change when that swap happens.",
+
+  "phases": [
+
+    {
+      "id": "phase-0",
+      "name": "MVP — Agent 1 End-to-End",
+      "description": "Get a user talking to Agent 1 and receiving a real response. No database, no Redis, no Agent 2/3. Pet context (Luna + Shara) is hardcoded. This phase is done when you can send a message via Postman or React UI and get an intelligent response back.",
+      "goal": "POST /chat works. Agent 1 generates a real Azure OpenAI response. Guardrails filter it. Response returned.",
+      "status": "complete",
+      "features": [
+        {
+          "id": "p0-001",
+          "name": "requirements.txt — minimal dependencies",
+          "complete": true,
+          "tested": true,
+          "files": ["requirements.txt"],
+          "notes": "pip install -r requirements.txt completes without errors. Verified."
+        },
+        {
+          "id": "p0-002",
+          "name": ".env.example — environment variable template",
+          "complete": true,
+          "tested": true,
+          "files": [".env.example"],
+          "notes": "Committed with placeholder values only. .env is gitignored."
+        },
+        {
+          "id": "p0-003",
+          "name": "constants.py — all business logic constants",
+          "complete": true,
+          "tested": true,
+          "files": ["constants.py"],
+          "notes": "All regex patterns pre-compiled at module load. No secrets. Safe to commit."
+        },
+        {
+          "id": "p0-004",
+          "name": "app/core/config.py — environment config",
+          "complete": true,
+          "tested": true,
+          "files": ["app/__init__.py", "app/core/__init__.py", "app/core/config.py"],
+          "notes": "pydantic-settings BaseSettings. get_settings() with lru_cache — created once at startup."
+        },
+        {
+          "id": "p0-005",
+          "name": "app/llm/base.py — abstract LLM provider",
+          "complete": true,
+          "tested": true,
+          "files": ["app/llm/__init__.py", "app/llm/base.py"],
+          "notes": "Strategy pattern — agent never knows which LLM it is talking to."
+        },
+        {
+          "id": "p0-006",
+          "name": "app/llm/azure_openai.py — Azure OpenAI implementation",
+          "complete": true,
+          "tested": true,
+          "files": ["app/llm/azure_openai.py"],
+          "notes": "Verified: live Azure call returned a real response. health_check() returns True."
+        },
+        {
+          "id": "p0-007",
+          "name": "app/llm/factory.py — provider factory",
+          "complete": true,
+          "tested": true,
+          "files": ["app/llm/factory.py"],
+          "notes": "Only place that decides which LLM implementation to use."
+        },
+        {
+          "id": "p0-008",
+          "name": "dummy_context.py — hardcoded Luna + Shara test data",
+          "complete": true,
+          "tested": true,
+          "files": ["dummy_context.py"],
+          "notes": "DELETED — replaced by context_builder.py + JSON files in data/. Same defaults auto-seeded on first run."
+        },
+        {
+          "id": "p0-009",
+          "name": "app/services/guardrails.py — response filtering",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/__init__.py", "app/services/guardrails.py"],
+          "notes": "Phase 1A: IntentFlags and classify_intent() removed. Now only apply_guardrails() remains. One job: clean Agent 1 output."
+        },
+        {
+          "id": "p0-010",
+          "name": "app/agents/conversation.py — Agent 1",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/__init__.py", "app/agents/conversation.py"],
+          "notes": "Phase 1A: accepts intent_type str instead of IntentFlags. _build_flag_section() injects HEALTH/FOOD INTENT DETECTED block into system prompt."
+        },
+        {
+          "id": "p0-011",
+          "name": "app/main.py — FastAPI app + POST /chat",
+          "complete": true,
+          "tested": true,
+          "files": ["app/main.py"],
+          "notes": "Phase 1A: IntentClassifier wired in. ChatResponse simplified. Deeplink payload added."
+        },
+        {
+          "id": "p0-012",
+          "name": "Manual test: full Phase 0 verification",
+          "complete": true,
+          "tested": true,
+          "files": [],
+          "notes": "Tested via React UI + curl. Frontend simplified: removed all screens except Chat."
+        }
+      ]
+    },
+
+    {
+      "id": "phase-1a",
+      "name": "IntentClassifier + Deeplink Routing",
+      "description": "Replace unreliable regex intent detection with an LLM-based IntentClassifier that runs before Agent 1 on every request. Wire up health and food redirect logic so the mobile app can route users to specialist modules.",
+      "goal": "Health and food messages get short empathetic responses + redirect payload. General messages get full Agent 1 response. Classifier handles negation, past tense, and positive vet visits correctly.",
+      "status": "complete",
+      "features": [
+        {
+          "id": "p1a-001",
+          "name": "app/agents/intent_classifier.py — LLM-based classifier",
+          "description": "IntentClassifier class. Calls LLM with temperature=0.0, max_tokens=48. Returns (intent_type, urgency) tuple. Retry on bad JSON or low confidence. Immediate fallback on API error.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/intent_classifier.py"],
+          "notes": "Tested with 7 edge cases including negation and past-tense. All correct. Verified via debug_flow.py."
+        },
+        {
+          "id": "p1a-002",
+          "name": "Remove IntentFlags and classify_intent() — Option B cleanup",
+          "description": "Delete IntentFlags dataclass, classify_intent() function, and all entity regex logic from guardrails.py. guardrails.py now has one job: clean Agent 1 output.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/guardrails.py", "constants.py"],
+          "notes": "Removed HEALTH_URGENCY_HIGH_KEYWORDS, HEALTH_URGENCY_MEDIUM_KEYWORDS, FOOD_INTENT_KEYWORDS from constants.py. All dead code gone."
+        },
+        {
+          "id": "p1a-003",
+          "name": "Health and food redirect / deeplink logic",
+          "description": "build_deeplink() in deeplink.py returns DeeplinkPayload for health/food intents. ChatResponse includes redirect: RedirectPayload | None. Simulator pages at /health/chat and /food/chat.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/deeplink.py", "app/main.py"],
+          "notes": "Tested health redirect via React UI. Redirect payload appears in response. Urgency=high shown in red on simulator page."
+        },
+        {
+          "id": "p1a-004",
+          "name": "Wire IntentClassifier into chat route",
+          "description": "main.py calls IntentClassifier.classify() before Agent 1. Passes intent_type to agent.run(). Passes intent_type + urgency to build_deeplink().",
+          "complete": true,
+          "tested": true,
+          "files": ["app/main.py"],
+          "notes": "Log line: Chat complete — session=... | intent=health | urgency=high | ..."
+        },
+        {
+          "id": "p1a-005",
+          "name": "Fix Agent 1 prompt direction bug",
+          "description": "RULES_TEXT Rules 7 and 8 referenced 'flags below' but flag_section renders above RULES in the template. LLM looked below, found nothing, ignored the instruction. Fixed to 'flags above'.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/conversation.py"],
+          "notes": "Root cause of 'agent ignores health intent' bug. After fix: health messages get 1-2 sentence empathy-only response as intended."
+        }
+      ]
+    },
+
+    {
+      "id": "phase-1b",
+      "name": "Agent 2 (Compressor) + Agent 3 (Aggregator) — File-Based Storage",
+      "description": "Build fact extraction and aggregation pipeline using JSON files on disk. No PostgreSQL yet — logic first, infrastructure later. Storage interface designed so swapping in Postgres later requires zero changes to agent code.",
+      "goal": "After a conversation, extracted facts are saved to fact_log.json and merged into active_profile.json. Next session, Agent 1 can be given richer context from accumulated facts.",
+      "status": "complete",
+      "features": [
+        {
+          "id": "p1b-001",
+          "name": "app/agents/state.py — AgentState dataclass",
+          "description": "Shared context carrier for the background agent pipeline. Populated incrementally: main.py sets session_id + pet fields, ConversationAgent sets is_entity, Compressor sets extracted_facts + low_confidence_fields.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/state.py"],
+          "notes": "Plain dataclass — no framework. low_confidence_fields is replaced each turn, never accumulated across requests."
+        },
+        {
+          "id": "p1b-002",
+          "name": "app/storage/file_store.py — JSON file storage helpers",
+          "description": "append_fact_log() and read_fact_log(). Atomic write pattern: write to .tmp then os.replace() — original file untouched if process dies mid-write.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/storage/__init__.py", "app/storage/file_store.py"],
+          "notes": "append_fact_log() tested via e2e suite. Atomic write verified. data/ directory auto-created."
+        },
+        {
+          "id": "p1b-003",
+          "name": "app/agents/compressor.py — Agent 2",
+          "description": "CompressorAgent class. is_entity gate: exits immediately if Agent 1 says no facts. Calls LLM (temp=0.0, max_tokens=400). Returns list of ExtractedFact with confidence >= 0.50. Caller splits by 0.70 threshold.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/compressor.py"],
+          "notes": "18/18 e2e tests pass. Handles: single/multiple facts, negative facts, past-tense time_scope, vet-confirmed source_rank, hedged confidence, full schema validation. Minor output schema updates pending (PRD review)."
+        },
+        {
+          "id": "p1b-004",
+          "name": "Wire Agent 1 is_entity + Compressor fire-and-forget in POST /chat",
+          "description": "Agent 1 outputs {reply, is_entity} JSON. AgentState built per request. asyncio.create_task(_run_background) after reply sent. Compressor wired. Aggregator call pending (Aggregator not built yet).",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/conversation.py", "app/main.py"],
+          "notes": "Agent 1 JSON output + _parse_agent_response() added. _run_background() splits facts by 0.70 threshold, writes to fact_log.json."
+        },
+        {
+          "id": "p1b-005",
+          "name": "Debug fields in ChatResponse + GET /debug/facts endpoint",
+          "description": "POST /chat response now includes is_entity, intent_type, urgency. GET /debug/facts?session_id=xxx returns Compressor output from fact_log.json filtered by session.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/main.py"],
+          "notes": "debug/facts endpoint also used by frontend console.log for Agent 2 visibility."
+        },
+        {
+          "id": "p1b-006",
+          "name": "tests/run_e2e.py — automated end-to-end test suite",
+          "description": "18 tests across 4 sections: infrastructure, intent routing, session management, Compressor fact extraction. Each test uses a unique session_id — facts in fact_log.json are traceable by session.",
+          "complete": true,
+          "tested": true,
+          "files": ["tests/run_e2e.py"],
+          "notes": "All 18 tests pass. Covers: non-fact skip, single/multiple facts, negative fact, past-tense, vet-confirmed, hedged confidence, needs_clarification flag, full schema."
+        },
+        {
+          "id": "p1b-007",
+          "name": "app/agents/aggregator.py — Agent 3",
+          "description": "Aggregator class. Pure deterministic logic — no LLM. Conflict resolution Rules 0-6. Reads active_profile.json, merges high-confidence facts, writes back atomically.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/aggregator.py"],
+          "notes": "Rules 0-6 implemented. user_correction source_rank added to Compressor prompt. Wired into _run_background(). GET /debug/profile endpoint added. 6 Aggregator-specific e2e tests pass (24 total)."
+        },
+        {
+          "id": "p1b-008",
+          "name": "Compressor output schema — PRD review",
+          "description": "Review output field types and taxonomy against the PRD before Aggregator is built on top of them.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/compressor.py"],
+          "notes": "PRD reviewed — on track. No blocking changes needed before Aggregator build."
+        },
+        {
+          "id": "p1b-009",
+          "name": "Data model — dataclasses for PetProfile, ActiveProfileEntry, UserProfile",
+          "description": "Three dataclasses in app/models/context.py mirroring future PostgreSQL tables. Each has to_dict() and from_dict(). ActiveProfileEntry handles both simple seed format and full Aggregator format.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/models/__init__.py", "app/models/context.py"],
+          "notes": "11 fields on ActiveProfileEntry including PRD conflict resolution fields (status, change_detected, trend_flag). Confidence auto-normalized from 0-100 to 0.0-1.0."
+        },
+        {
+          "id": "p1b-010",
+          "name": "context_builder.py — replaces dummy_context.py",
+          "description": "Reads pet_profile.json, active_profile.json, user_profile.json from data/. Returns same 5 values Agent 1 needs. Seeds Luna+Shara defaults on first run. Computes pet_summary and gap_list at runtime.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/context_builder.py"],
+          "notes": "dummy_context.py deleted. 18/18 e2e tests pass. JSON files auto-seeded on first request."
+        },
+        {
+          "id": "p1b-011",
+          "name": "file_store.py — read/write for pet, active, user profiles",
+          "description": "Added 6 functions (read/write for each profile type) plus internal _read_json/_write_json helpers. Same atomic write pattern as fact_log.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/storage/file_store.py"],
+          "notes": "read functions return None (not {}) when file missing. Aggregator must handle None."
+        },
+        {
+          "id": "p1b-012",
+          "name": "constants.py — FULL_FIELD_LIST + expanded FIELD_LABELS",
+          "description": "Added 8 new field labels (sex, food_brand, appetite, etc.). Added FULL_FIELD_LIST for gap computation. Added GAP_QUESTION_HINTS for new askable fields.",
+          "complete": true,
+          "tested": true,
+          "files": ["constants.py"],
+          "notes": "Compressor prompt key names aligned with FULL_FIELD_LIST (weight not weight_kg, medications not current_medications)."
+        },
+        {
+          "id": "p1b-013",
+          "name": "Aggregator design doc",
+          "description": "Full design document with conflict resolution rules, sub-phase plan, data model section, and interface specification.",
+          "complete": true,
+          "tested": true,
+          "files": ["design-docs/aggregator-design.md"],
+          "notes": "13 sections. Rules 0-6 in priority order. Three sub-phases: A (core merge), B (gap list), C (confidence bar)."
+        },
+        {
+          "id": "p1b-014",
+          "name": "Route refactor — split main.py into app/routes/",
+          "description": "Extracted POST /chat, debug endpoints, and simulator endpoints from main.py into separate route modules using FastAPI APIRouter. Shared state via app.state instead of module globals.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/main.py", "app/routes/__init__.py", "app/routes/chat.py", "app/routes/debug.py", "app/routes/simulator.py"],
+          "notes": "main.py reduced to ~120 lines (app creation, CORS, lifespan, /health). All agents/sessions on app.state, accessed via request.app.state in routes. 21/24 e2e tests pass (2 pre-existing LLM flakes, 1 transient)."
+        },
+        {
+          "id": "p1b-015",
+          "name": "Confidence calculator — confidence bar in ChatResponse",
+          "description": "calculate_confidence_score() computes 0-100 score from three signals: per-field confidence (Compressor/Aggregator), time decay (exponential, per-field category + life stage), and importance weight (Tier A=3, B=2, C=1). 22 scored fields, 4 decay categories (static/slow/medium/fast), life stage multipliers for puppy through senior. confidence_color() maps to green (80-100) / yellow (50-79) / red (0-49).",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/confidence_calculator.py", "app/routes/chat.py", "design-docs/confidence-bar.md"],
+          "notes": "Pure arithmetic, sub-ms, no LLM. Computed on-the-fly each request (not persisted — decay is time-dependent). Dropped PRD 'depth' component — per-field confidence already captures quality. Design doc at design-docs/confidence-bar.md."
+        },
+        {
+          "id": "p1b-018",
+          "name": "Frontend confidence bar — wire ConfidenceBar into Chat UI",
+          "description": "Connected existing ConfidenceBar component (compact variant) to /chat response. Shows confidence_score + confidence_color in the chat header next to pet name.",
+          "complete": true,
+          "tested": true,
+          "files": ["frontend/src/screens/Chat.jsx"],
+          "notes": "ConfidenceBar.jsx and ConfidenceBar.css already existed. Only Chat.jsx changed: import, 2 state vars, update from API response, render in header. ~6 lines added."
+        },
+        {
+          "id": "p1b-016",
+          "name": "Code review + quick fixes",
+          "description": "Code review of all backend files. Fixed 5 issues: stale comments (2), fragile mutation in context_builder.py, stale import reference in deeplink.py docstring, unused import cleanup.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/context_builder.py", "app/services/deeplink.py"],
+          "notes": "Deferred: dead code in constants.py (ENTITY_PATTERNS, MEDICAL_KEYWORDS, NUTRITIONAL_KEYWORDS) — cleanup tracked separately."
+        },
+        {
+          "id": "p1b-017",
+          "name": "Frontend Agent 3 console.log",
+          "description": "Added Agent 3 (Aggregator) debug logging in browser console. Fetches /debug/profile 8s after each message, logs field values with confidence and status.",
+          "complete": true,
+          "tested": true,
+          "files": ["frontend/src/api.js"],
+          "notes": "Amber color (#d97706) in console. Shows field_count, per-field value/confidence/status."
+        }
+      ]
+    },
+
+    {
+      "id": "phase-1c",
+      "name": "Real Database — Swap JSON Files for PostgreSQL",
+      "description": "Replace file-based JSON storage with real PostgreSQL. context_builder.py already exists (reads JSON now, will read Postgres later). Agent 2 and Agent 3 code does not change.",
+      "goal": "Profile facts extracted from conversation, stored in Postgres, loaded for next session.",
+      "status": "not-started",
+      "features": [
+        {
+          "id": "p1c-001",
+          "name": "docker-compose.yml — Postgres + Redis",
+          "complete": false,
+          "tested": false,
+          "files": ["docker-compose.yml"],
+          "notes": "PostgreSQL 16 on port 5432. Redis 7 on port 6379."
+        },
+        {
+          "id": "p1c-002",
+          "name": "Add DB packages to requirements.txt",
+          "complete": false,
+          "tested": false,
+          "files": ["requirements.txt"],
+          "notes": "Add: sqlalchemy[asyncio], asyncpg, alembic, redis."
+        },
+        {
+          "id": "p1c-003",
+          "name": "Add DATABASE_URL and REDIS_URL to config",
+          "complete": false,
+          "tested": false,
+          "files": [".env.example", "app/core/config.py"],
+          "notes": "DATABASE_URL format: postgresql+asyncpg://user:pass@localhost:5432/anymallchan"
+        },
+        {
+          "id": "p1c-004",
+          "name": "app/db/ — ORM models + repositories",
+          "complete": false,
+          "tested": false,
+          "files": ["app/db/session.py", "app/db/models/", "app/db/repositories/"],
+          "notes": "Same interface as file_store.py. Swap in without changing agent code."
+        },
+        {
+          "id": "p1c-005",
+          "name": "Alembic setup + initial migration",
+          "complete": false,
+          "tested": false,
+          "files": ["alembic.ini", "migrations/"],
+          "notes": "Creates 5 tables: pets, fact_log, active_profile, conversation_log, compressed_history."
+        },
+        {
+          "id": "p1c-006",
+          "name": "app/services/context_builder.py — swap JSON reads for PostgreSQL",
+          "complete": false,
+          "tested": false,
+          "files": ["app/services/context_builder.py"],
+          "notes": "context_builder.py already exists and reads JSON files. Phase 1C: change it to query PostgreSQL instead."
+        }
+      ]
+    },
+
+    {
+      "id": "phase-2",
+      "name": "Redis Cache",
+      "description": "Add Redis for fast profile retrieval. Cache-aside pattern.",
+      "goal": "Active profile loaded from Redis in <5ms instead of hitting Postgres every request.",
+      "status": "not-started",
+      "features": [
+        {
+          "id": "p2-001",
+          "name": "app/db/redis_client.py — Redis connection",
+          "complete": false,
+          "tested": false,
+          "files": ["app/db/redis_client.py"],
+          "notes": "Use redis.asyncio (built into redis-py 5+)"
+        },
+        {
+          "id": "p2-002",
+          "name": "Cache-aside for active_profile",
+          "complete": false,
+          "tested": false,
+          "files": ["app/services/context_builder.py", "app/agents/aggregator.py"],
+          "notes": "Try Redis GET before hitting Postgres. On miss: load from Postgres, SET in Redis TTL=3600."
+        },
+        {
+          "id": "p2-003",
+          "name": "Cache health_check result (60s TTL)",
+          "complete": false,
+          "tested": false,
+          "files": ["app/llm/azure_openai.py"],
+          "notes": "Stop making real Azure API calls on every /health ping."
+        }
+      ]
+    },
+
+    {
+      "id": "phase-3",
+      "name": "Background Jobs",
+      "description": "Session compaction and nightly passive context gathering.",
+      "status": "not-started",
+      "features": [
+        {
+          "id": "p3-001",
+          "name": "Session compaction job",
+          "complete": false,
+          "tested": false,
+          "files": ["app/jobs/compaction.py"],
+          "notes": "After N sessions: LLM summarizes conversation_log into compressed_history."
+        },
+        {
+          "id": "p3-002",
+          "name": "Nightly passive context batch",
+          "complete": false,
+          "tested": false,
+          "files": ["app/jobs/nightly_batch.py"],
+          "notes": "Scan Health + Food module logs. Run Agent 2+3 pipeline on them."
+        }
+      ]
+    },
+
+    {
+      "id": "phase-4",
+      "name": "Auth + Security",
+      "description": "JWT auth for Flutter app. Rate limiting. Lock down CORS.",
+      "status": "not-started",
+      "features": [
+        {
+          "id": "p4-001",
+          "name": "JWT auth middleware",
+          "complete": false,
+          "tested": false,
+          "files": ["app/core/security.py", "app/api/auth.py"],
+          "notes": ""
+        },
+        {
+          "id": "p4-002",
+          "name": "Rate limiting on POST /chat",
+          "complete": false,
+          "tested": false,
+          "files": ["app/core/rate_limiter.py"],
+          "notes": "slowapi. 20 messages per IP per minute."
+        }
+      ]
+    },
+
+    {
+      "id": "phase-5",
+      "name": "Testing + Deployment",
+      "description": "Unit tests, integration tests, Docker, production deploy.",
+      "status": "not-started",
+      "features": [
+        {
+          "id": "p5-001",
+          "name": "Unit tests — aggregator conflict resolution rules",
+          "complete": false,
+          "tested": false,
+          "files": ["tests/test_aggregator.py", "tests/conftest.py"],
+          "notes": "Most important unit test — pure logic, fully deterministic, no LLM needed."
+        },
+        {
+          "id": "p5-002",
+          "name": "Integration tests — POST /chat pipeline",
+          "complete": false,
+          "tested": false,
+          "files": ["tests/test_api.py"],
+          "notes": "Full pipeline test with MockLLMProvider injected."
+        },
+        {
+          "id": "p5-003",
+          "name": "Dockerfile + production deployment",
+          "complete": false,
+          "tested": false,
+          "files": ["Dockerfile"],
+          "notes": ""
+        }
+      ]
+    }
+
+  ],
+
+  "summary": {
+    "total_features": 50,
+    "complete": 35,
+    "in_progress": 0,
+    "not_started": 15,
+    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (18/18) = 35 complete. Phase 1B fully done: Aggregator built, routes refactored, confidence calculator with tier weights + time decay + life stage modifiers, confidence bar wired into React UI. 24 e2e tests (23 passing, 1 LLM flake). Next: Phase 1C (PostgreSQL)."
+  }
+}

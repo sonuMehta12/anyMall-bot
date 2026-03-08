@@ -1,0 +1,9 @@
+# Phase 0 — MVP dependencies only
+# Add database/Redis packages in Phase 1
+
+fastapi>=0.110.0          # Web framework — routing, request/response handling
+uvicorn[standard]>=0.29.0 # ASGI server that runs FastAPI. [standard] adds performance extras
+pydantic>=2.0.0           # Data validation — FastAPI uses this for all request/response models
+pydantic-settings>=2.0.0  # Extends Pydantic to read config from .env files
+openai>=1.30.0            # Azure OpenAI + direct OpenAI SDK (same package, handles both)
+python-dotenv>=1.0.0      # Loads .env file into os.environ on startup

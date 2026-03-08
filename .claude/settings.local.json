@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pdfplumber; pdf = pdfplumber.open\\(r''C:\\\\Users\\\\sonu1\\\\Downloads\\\\PW1-AnyMall-chan_ Context Compression & Management System Overview and Architecture-120226-061545.pdf''\\); print\\(len\\(pdf.pages\\), ''pages''\\); [print\\(f''--- Page {i+1} ---''\\); print\\(p.extract_text\\(\\)\\) for i, p in enumerate\\(pdf.pages\\)]\")",
+      "Bash(python -c \":*)",
+      "Bash(pip install pymupdf -q)",
+      "Bash(python -c \"import fitz; doc = fitz.open\\(r''C:\\\\Users\\\\sonu1\\\\Downloads\\\\PW1-AnyMall-chan_ Context Compression & Management System Overview and Architecture-120226-061545.pdf''\\); [print\\(f''--- Page {i+1} ---'', page.get_text\\(\\)\\) for i, page in enumerate\\(doc\\)]\")",
+      "Bash(npm run build)",
+      "Bash(ls -la \"c:\\\\Users\\\\sonu1\\\\OneDrive - HR sevice PVT LTD\\\\Documents\\\\Desktop\\\\AnyMall-chat\\\\frontend\"\" | grep -E \"^.\" || echo \"No dotfiles found \")",
+      "Bash(taskkill /PID 55212 /F)",
+      "Bash(cmd /c \"taskkill /PID 55212 /F\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(cmd /c taskkill /PID 55212 /F)",
+      "Bash(cmd /c \"taskkill /PID 55212 /F && echo killed || echo failed\")",
+      "Bash(powershell -Command \"Stop-Process -Id 55212 -Force; Write-Host ''Killed 55212''; netstat -ano | Select-String '':8000''\")",
+      "Bash(powershell -Command \"Get-Process -Id 55212 -ErrorAction SilentlyContinue | Select-Object Id,Name,Path\")",
+      "Bash(powershell -Command \"netstat -ano | Select-String '':8000''\")",
+      "Bash(powershell -Command \"Get-Process -Name python -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name uvicorn -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host done\")",
+      "Bash(rm -f config.py main.py requirements.txt)",
+      "Bash(rm -rf __pycache__)"
+    ]
+  }
+}
