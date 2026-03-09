@@ -324,6 +324,15 @@
           "notes": "ConfidenceBar.jsx and ConfidenceBar.css already existed. Only Chat.jsx changed: import, 2 state vars, update from API response, render in header. ~6 lines added."
         },
         {
+          "id": "p1b-019",
+          "name": "Prompt v2 — PRD-aligned system prompt rewrite",
+          "description": "Rewrote Agent 1 system prompt to align with PW1-PRD v0.2b. Identity, tone, emoji budget (max 2), pet suffix rules (-chan/-kun), priority ladder gap questions (Rank A-D bilingual), soft redirect for health/food, emergency override, prompt injection defense. MAX_QUESTIONS_PER_SESSION reduced 5→3. GAP_QUESTION_HINTS replaced with GAP_PRIORITY_LADDER.",
+          "complete": true,
+          "tested": true,
+          "files": ["constants.py", "app/agents/conversation.py", "app/routes/chat.py", "design-docs/prompt-gap-analysis.md", "design-docs/prompt-v2-proposal.md"],
+          "notes": "22/24 e2e tests pass. 2 failures are pre-existing Compressor LLM flakes, unrelated to prompt changes. language_str hardcoded to EN — auto-detect deferred to Phase 2."
+        },
+        {
           "id": "p1b-016",
           "name": "Code review + quick fixes",
           "description": "Code review of all backend files. Fixed 5 issues: stale comments (2), fragile mutation in context_builder.py, stale import reference in deeplink.py docstring, unused import cleanup.",
@@ -522,10 +531,10 @@
   ],
 
   "summary": {
-    "total_features": 50,
-    "complete": 35,
+    "total_features": 51,
+    "complete": 36,
     "in_progress": 0,
     "not_started": 15,
-    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (18/18) = 35 complete. Phase 1B fully done: Aggregator built, routes refactored, confidence calculator with tier weights + time decay + life stage modifiers, confidence bar wired into React UI. 24 e2e tests (23 passing, 1 LLM flake). Next: Phase 1C (PostgreSQL)."
+    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (19/19) = 36 complete. Phase 1B fully done: Aggregator, routes refactored, confidence calculator, confidence bar in React UI, prompt v2 (PRD-aligned). 24 e2e tests (22 passing, 2 LLM flakes). Next: Phase 1C (PostgreSQL)."
   }
 }

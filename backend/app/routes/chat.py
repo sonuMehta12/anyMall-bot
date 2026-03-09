@@ -137,10 +137,9 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     )
 
     # Count questions asked so far this session.
-    # Heuristic: count "?" in assistant messages.
-    # Known limitation: rhetorical "?" also counts. Fixed properly in Phase 1.
+    # Heuristic: count "?" and "？" in assistant messages.
     questions_so_far = sum(
-        msg["content"].count("?")
+        msg["content"].count("?") + msg["content"].count("？")
         for msg in session_messages
         if msg["role"] == "assistant"
     )
@@ -159,6 +158,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         relationship_context=relationship_context,
         intent_type=intent_type,
         questions_asked_so_far=questions_so_far,
+        urgency=urgency,
+        language_str="EN",  # TODO: detect from user message in Phase 2
     )
 
     # Propagate is_entity flag from Agent 1 to state so Compressor knows whether to run.

@@ -410,10 +410,55 @@ Decay floored at 0.3 — old data is still better than nothing.
 the `/chat` response in `frontend/src/screens/Chat.jsx`. Shows colored progress bar + percentage
 in the chat header next to the pet name. Updates after every message.
 
+### Prompt v2 — PRD-Aligned System Prompt (2026-03-09)
+
+Rewrote Agent 1's system prompt to align with PW1-PRD v0.2b (25-page document from
+prompt engineering team). The PRD defines AnyMall-chan's persona, tone, emoji rules,
+speech quirks, question discipline, and redirect protocol.
+
+**Process:**
+1. Extracted PDF contents (PyMuPDF) and analyzed 14 prompt sections
+2. Wrote gap analysis (`design-docs/prompt-gap-analysis.md`) — 17 gaps identified
+3. Wrote proposed prompt (`design-docs/prompt-v2-proposal.md`) — reviewed with user
+4. User made decisions on all 17 gaps, then approved implementation
+
+**What changed:**
+
+1. **`constants.py`** — `MAX_QUESTIONS_PER_SESSION` reduced from 5 to 3 (PRD guidance).
+   Replaced flat `GAP_QUESTION_HINTS` dict (13 EN-only fields) with `GAP_PRIORITY_LADDER`
+   (Rank A-D, bilingual hints: `hint_en` + `hint_ja`). `HIGH_PRIORITY_FIELDS` reordered
+   to match PRD Rank A (chronic_illness, allergies first).
+
+2. **`app/agents/conversation.py`** — Complete prompt rewrite:
+   - Identity block: "You are AnyMall-chan" with persona rules
+   - Pet suffix rules: -chan/ちゃん for female, -kun/くん for male (from pet sex + language)
+   - Emoji budget: max 2 per reply (0 for urgent health)
+   - Speech quirks: sentence-final particles in JA mode
+   - Response policy: 4-step decision flow (empathize → answer → ask → close)
+   - Priority Ladder gap questions: walks Rank A→D, picks FIRST missing field
+   - Soft redirect for health/food: "learning tool" framing, not "expert consultation"
+   - Emergency override: urgency=high → direct vet-contact advice, 0 emojis
+   - Prompt injection defense section
+   - `run()` now accepts `urgency` and `language_str` params
+   - `_build_gap_section()` rewritten for bilingual priority ladder
+   - `_build_flag_section()` has 3 modes: URGENT, HEALTH (soft), FOOD (soft)
+   - New `_build_pet_suffix()` static method
+
+3. **`app/routes/chat.py`** — Passes `urgency` and `language_str="EN"` to `agent.run()`.
+   Question counting now includes Japanese "？" marks.
+
+**Design docs created:**
+- `design-docs/prompt-gap-analysis.md` — 17 gaps with severity ratings, side-by-side comparison
+- `design-docs/prompt-v2-proposal.md` — full proposed prompt text with review checklist
+
+**Test results:** 22/24 e2e tests pass. 2 failures are pre-existing Compressor LLM flakes
+(multi-fact extraction), unrelated to prompt changes.
+
 ### What is pending after Phase 1B
 
 - **Clarification loop** — low_confidence_fields feed back to Agent 1 next turn (Phase 1C).
 - **Dead code cleanup** — remove unused regex constants from constants.py.
+- **Language detection** — `language_str` is hardcoded to "EN". Auto-detect from user message in Phase 2.
 
 ---
 

@@ -245,7 +245,7 @@ PREACHY_PHRASES: list[str] = [
 # We track this to let guardrails catch a response that asks two questions
 # before sending it to the user.
 
-MAX_QUESTIONS_PER_SESSION: int = 5
+MAX_QUESTIONS_PER_SESSION: int = 3
 MAX_QUESTIONS_PER_MESSAGE: int = 1
 
 
@@ -293,47 +293,152 @@ FULL_FIELD_LIST: list[str] = list(FIELD_LABELS.keys())
 
 # Fields that are considered HIGH-PRIORITY gaps.  Agent 1 should try to fill
 # these before lower-priority ones.  Ordered by importance.
+# Aligned with Rank A of GAP_PRIORITY_LADDER below.
 HIGH_PRIORITY_FIELDS: list[str] = [
+    "chronic_illness",
+    "allergies",
+    "medications",
+    "diet_type",
+    "meal_frequency",
+    "bathroom_habits",
+    "indoor_outdoor",
     "species",
     "breed",
     "age",
-    "weight",
-    "diet_type",
-    "medications",
-    "chronic_illness",
-    "allergies",
 ]
 
 
-# ── 9. Gap-Question Hints ─────────────────────────────────────────────────────
+# ── 9. Gap-Question Priority Ladder ─────────────────────────────────────────
 #
-# When Agent 1 detects a gap (a field with low confidence), it uses these hints
-# to construct a natural question.  The hint is a short phrase — Agent 1 wraps
-# it in a conversational sentence.
+# Agent 1 uses this to decide WHICH gap question to ask, in priority order.
+# Based on PW1-PRD v0.2b Section 8 (Priority Ladder, Rank A-E).
 #
-# Keys match FIELD_LABELS keys.  Not every field needs a hint (Agent 1 can
-# improvise for less common fields), but having hints makes questions consistent.
+# Structure: Rank → list of fields, each with bilingual hints.
+# conversation.py walks Rank A → B → C → D and picks the FIRST field that
+# is also in the current gap_list. Only ONE hint shown per turn.
+#
+# Rank A: Initial trust building — highest value questions
+# Rank B: Daily rhythm & light health signals
+# Rank C: Personality & routine detail
+# Rank D: Deeper — only after trust is built
 
-GAP_QUESTION_HINTS: dict[str, str] = {
-    "age":            "how old {name} is",
-    "weight":         "how much {name} weighs",
-    "breed":          "what breed {name} is",
-    "diet_type":      "what {name} usually eats",
-    "medications":    "whether {name} is on any medications or supplements",
-    "energy_level":   "how active {name} generally is",
-    "neutered_spayed": "whether {name} has been neutered or spayed",
-    "chronic_illness": "whether {name} has any ongoing health conditions",
-    "allergies":      "whether {name} has any known allergies",
-    "vaccinations":   "whether {name}'s vaccinations are up to date",
-    "last_vet_visit": "when {name} last saw a vet",
-    "vet_name":       "which vet or clinic {name} goes to",
-    "appetite":       "how {name}'s appetite has been lately",
-    "activity_level": "how active {name} generally is",
+GAP_PRIORITY_LADDER: dict[str, list[dict[str, str]]] = {
+    "A": [
+        {
+            "key": "chronic_illness",
+            "hint_en": "any ongoing health conditions or things you watch out for with {name}",
+            "hint_ja": "持病とかアレルギーで、普段ちょっと気をつけてることってあったりする？",
+        },
+        {
+            "key": "allergies",
+            "hint_en": "any known allergies {name} has",
+            "hint_ja": "アレルギーとかで気をつけてることあったりする？",
+        },
+        {
+            "key": "medications",
+            "hint_en": "any medications or supplements {name} takes regularly",
+            "hint_ja": "いま続けて飲んでるお薬やサプリがあったりする？",
+        },
+        {
+            "key": "diet_type",
+            "hint_en": "what {name} usually eats (dry, wet, or homemade)",
+            "hint_ja": "普段のごはんは、ドライ？ウェット？それとも手作りだったりする？",
+        },
+        {
+            "key": "meal_frequency",
+            "hint_en": "how many times a day {name} eats and roughly how much",
+            "hint_ja": "ごはんって、1日に何回くらい・どれくらいの量あげてる？",
+        },
+        {
+            "key": "bathroom_habits",
+            "hint_en": "whether {name}'s bathroom schedule is regular",
+            "hint_ja": "トイレ行くタイミングって、だいたい決まってたりする？",
+        },
+        {
+            "key": "indoor_outdoor",
+            "hint_en": "whether {name} is mostly indoors or spends time outside",
+            "hint_ja": "普段はお家の中が多いタイプかな？それとも外に出る時間も長め？",
+        },
+    ],
+    "B": [
+        {
+            "key": "weight",
+            "hint_en": "how much {name} weighs, or any recent weight changes",
+            "hint_ja": "最近、体重に変化あったりしたかな？",
+        },
+        {
+            "key": "exercise",
+            "hint_en": "how much exercise or walk time {name} gets daily",
+            "hint_ja": "お散歩や遊びの時間って、1日にどれくらい取れてそうかな？",
+        },
+        {
+            "key": "appetite",
+            "hint_en": "how {name}'s appetite has been lately",
+            "hint_ja": "ここ最近で、食欲とかお水の飲み方に変化あったりする？",
+        },
+        {
+            "key": "home_alone",
+            "hint_en": "whether {name} spends time home alone during the day",
+            "hint_ja": "平日の昼間って、一人でお留守番すること多かったりする？",
+        },
+        {
+            "key": "family_other_pets",
+            "hint_en": "whether other family members or pets live together",
+            "hint_ja": "一緒に暮らしてるご家族や、ほかのペットっているかな？",
+        },
+    ],
+    "C": [
+        {
+            "key": "personality",
+            "hint_en": "whether {name} is more laid-back or energetic",
+            "hint_ja": "性格としては、おっとり？それとも元気いっぱい？",
+        },
+        {
+            "key": "sleep_location",
+            "hint_en": "where {name} usually sleeps at night",
+            "hint_ja": "夜はどこで寝ることが多い？",
+        },
+        {
+            "key": "grooming",
+            "hint_en": "how often {name} gets brushed or bathed",
+            "hint_ja": "ブラッシングとかシャンプーって、どれくらいのペースでやってる？",
+        },
+        {
+            "key": "favorite_toys",
+            "hint_en": "any favorite toys or games",
+            "hint_ja": "特に好きな遊びとか、おもちゃあったりする？",
+        },
+    ],
+    "D": [
+        {
+            "key": "neutered_spayed",
+            "hint_en": "whether {name} has been neutered or spayed",
+            "hint_ja": "避妊・去勢はしてるかな？",
+        },
+        {
+            "key": "last_vet_visit",
+            "hint_en": "when {name} last saw a vet",
+            "hint_ja": "最後に病院に行ったの、いつ頃だったか覚えてる？",
+        },
+        {
+            "key": "vaccinations",
+            "hint_en": "whether {name}'s vaccinations are up to date",
+            "hint_ja": "ワクチンは最新のものを打ってあるかな？",
+        },
+        {
+            "key": "problem_behaviors",
+            "hint_en": "any behaviors or habits that are a bit tricky",
+            "hint_ja": "ちょっと困ってる行動やクセ、気になってることあったりする？",
+        },
+    ],
 }
-# Usage example (in conversation.py):
-#   hint = GAP_QUESTION_HINTS["diet_type"].format(name="Luna")
-#   → "what Luna usually eats"
-#   Agent 1 then wraps it: "By the way, could you tell me what Luna usually eats?"
+
+# All ladder keys flattened — used to validate field names.
+GAP_LADDER_ALL_KEYS: list[str] = [
+    entry["key"]
+    for rank_entries in GAP_PRIORITY_LADDER.values()
+    for entry in rank_entries
+]
 
 
 # ── 10. Intent Type Constants ─────────────────────────────────────────────────

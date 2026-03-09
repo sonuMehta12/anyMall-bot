@@ -33,8 +33,8 @@ understanding of what it does and why it is there.
 
 **Current goal: Phase 1B ✓ complete → Phase 1C (PostgreSQL) next.**
 
-Phase 0 ✓. Phase 1A ✓. Phase 1B ✓ (Compressor + Aggregator + route refactor + confidence calculator).
-24 e2e tests (21 passing, 2 pre-existing LLM flakes, 1 transient).
+Phase 0 ✓. Phase 1A ✓. Phase 1B ✓ (Compressor + Aggregator + route refactor + confidence calculator + prompt v2).
+24 e2e tests (22 passing, 2 pre-existing LLM flakes).
 Next: Phase 1C — swap JSON files for PostgreSQL.
 
 ---
@@ -65,7 +65,7 @@ See `notes.md` Phase 1A section for full details.
 
 ## Phase 1B — Complete ✓
 
-**All agents built and tested. Routes refactored. Confidence calculator added.**
+**All agents built and tested. Routes refactored. Confidence calculator added. Prompt v2 (PRD-aligned) deployed.**
 
 **Current pipeline (Phase 1B complete):**
 ```
@@ -87,7 +87,7 @@ User message
 backend/
 |-- app/
 |   |-- agents/
-|   |   |-- conversation.py          # Agent 1 — outputs {reply, is_entity} JSON
+|   |   |-- conversation.py          # Agent 1 — PRD-aligned bilingual prompt, outputs {reply, is_entity} JSON
 |   |   |-- intent_classifier.py     # IntentClassifier — Phase 1A
 |   |   |-- state.py                 # AgentState dataclass
 |   |   |-- compressor.py            # Agent 2 — fact extraction (LLM, temp=0.0)
@@ -114,14 +114,16 @@ backend/
 |   |   `-- factory.py               # creates provider from settings
 |   `-- core/
 |       `-- config.py                # reads .env -> Settings
-|-- constants.py                     # business logic constants + FULL_FIELD_LIST
+|-- constants.py                     # business logic constants + FULL_FIELD_LIST + GAP_PRIORITY_LADDER
 |-- design-docs/                     # all design & architecture documents
 |   |-- aggregator-design.md         # Aggregator design doc
 |   |-- compressor-design.md         # Compressor design doc + decision log
 |   |-- confidence-bar.md            # Confidence bar formula, tiers, decay, decision log
 |   |-- security.md                  # production security risks + fix phases
 |   |-- system-design.md             # full system architecture
-|   `-- system.md                    # PRD review notes
+|   |-- system.md                    # PRD review notes
+|   |-- prompt-gap-analysis.md       # 17-gap comparison: current prompt vs PW1-PRD v0.2b
+|   `-- prompt-v2-proposal.md        # Approved prompt v2 design + review checklist
 |-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health
 |-- tests/
 |   `-- run_e2e.py                   # 24 automated end-to-end tests
