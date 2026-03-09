@@ -20,6 +20,7 @@ export default function Chat({ pet, parentName }) {
   const [confidenceColor, setConfidenceColor] = useState('red')
 
   const messagesEndRef = useRef(null)
+  const textareaRef = useRef(null)
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -40,6 +41,8 @@ export default function Chat({ pet, parentName }) {
     if (!text || isTyping) return
 
     setInputText('')
+    // Reset textarea height after send
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
     // Show user message immediately
     setMessages(prev => [...prev, { id: Date.now(), text, isUser: true }])
@@ -151,10 +154,17 @@ export default function Chat({ pet, parentName }) {
       <div className="chat-input-bar">
         <div className="chat-input-wrap">
           <textarea
+            ref={textareaRef}
             className="chat-input"
             placeholder={`Message about ${pet.name}...`}
             value={inputText}
-            onChange={e => setInputText(e.target.value)}
+            onChange={e => {
+              setInputText(e.target.value)
+              // Auto-resize: reset to 1 row, then grow to fit content
+              const ta = e.target
+              ta.style.height = 'auto'
+              ta.style.height = `${ta.scrollHeight}px`
+            }}
             onKeyDown={handleKeyDown}
             rows={1}
           />
