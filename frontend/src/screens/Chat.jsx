@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ChatBubble from '../components/ChatBubble.jsx'
 import ConfidenceBar from '../components/ConfidenceBar.jsx'
-import { sendMessage } from '../api.js'
+import { sendMessage, fetchConfidence } from '../api.js'
 import './Chat.css'
 
 const SPECIES_EMOJI = { dog: '🐕', cat: '🐱' }
@@ -18,6 +18,7 @@ export default function Chat({ pet, parentName }) {
   const [isTyping, setIsTyping] = useState(false)
   const [confidenceScore, setConfidenceScore] = useState(0)
   const [confidenceColor, setConfidenceColor] = useState('red')
+  const [activeRedirect, setActiveRedirect] = useState(null)
 
   const messagesEndRef = useRef(null)
   const textareaRef = useRef(null)
@@ -26,6 +27,16 @@ export default function Chat({ pet, parentName }) {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isTyping])
+
+  // Fetch confidence score on mount (before any chat messages)
+  useEffect(() => {
+    fetchConfidence()
+      .then(data => {
+        setConfidenceScore(data.confidence_score ?? 0)
+        setConfidenceColor(data.confidence_color ?? 'red')
+      })
+      .catch(err => console.warn('Could not fetch initial confidence:', err))
+  }, [])
 
   // Show opening greeting when chat first mounts
   useEffect(() => {
@@ -56,6 +67,9 @@ export default function Chat({ pet, parentName }) {
 
       if (data.redirect) {
         console.log('[Redirect payload]', data.redirect)
+        setActiveRedirect(data.redirect)
+      } else {
+        setActiveRedirect(null)
       }
 
       setIsTyping(false)
@@ -63,8 +77,17 @@ export default function Chat({ pet, parentName }) {
         id: Date.now() + 1,
         text: data.message,
         isUser: false,
-        redirect: data.redirect || null,
       }])
+
+      // Refresh confidence after background pipeline finishes (~3s for Compressor + Aggregator)
+      setTimeout(() => {
+        fetchConfidence()
+          .then(fresh => {
+            setConfidenceScore(fresh.confidence_score ?? data.confidence_score)
+            setConfidenceColor(fresh.confidence_color ?? data.confidence_color)
+          })
+          .catch(() => {})  // silent — chat score is already set above
+      }, 4000)
     } catch (err) {
       setIsTyping(false)
       setMessages(prev => [...prev, {
@@ -104,51 +127,37 @@ export default function Chat({ pet, parentName }) {
           <span>Today</span>
         </div>
 
-        {messages.map(msg => {
-          const r = msg.redirect
-          let btnLabel = null
-          let btnColor = null
-          if (r) {
-            btnLabel = r.module === 'food' ? 'Talk to Food Specialist →' : 'Talk to Health Assistant →'
-            btnColor = r.urgency === 'high' ? '#ef4444' : r.urgency === 'medium' ? '#f97316' : '#22c55e'
-          }
-          return (
-            <div key={msg.id}>
-              <ChatBubble message={msg.text} isUser={msg.isUser} />
-              {r && (
-                <div style={{ display: 'flex', justifyContent: 'flex-start', padding: '4px 16px 8px' }}>
-                  <button
-                    onClick={() => {
-                      const params = new URLSearchParams({
-                        query: r.pre_populated_query,
-                        urgency: r.urgency,
-                        pet_summary: r.pet_summary,
-                      })
-                      window.open(`${r.deep_link}?${params}`, '_blank')
-                    }}
-                    style={{
-                      background: btnColor,
-                      color: '#fff',
-                      border: 'none',
-                      borderRadius: '20px',
-                      padding: '8px 18px',
-                      fontSize: '0.85rem',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {btnLabel}
-                  </button>
-                </div>
-              )}
-            </div>
-          )
-        })}
+        {messages.map(msg => (
+          <ChatBubble key={msg.id} message={msg.text} isUser={msg.isUser} />
+        ))}
 
         {isTyping && <ChatBubble isTyping />}
 
         <div ref={messagesEndRef} />
       </div>
+
+      {/* ── Sticky redirect nudge ── */}
+      {activeRedirect && (
+        <div className="chat-sticky-nudge">
+          <button
+            className="redirect-sticky-btn"
+            onClick={() => {
+              const params = new URLSearchParams({
+                query: activeRedirect.pre_populated_query,
+                urgency: activeRedirect.urgency,
+                pet_summary: activeRedirect.pet_summary,
+              })
+              window.open(`${activeRedirect.deep_link}?${params}`, '_blank')
+            }}
+            style={{
+              background: activeRedirect.urgency === 'high' ? '#ef4444' : '#f97316',
+            }}
+          >
+            {activeRedirect.module === 'food' ? '🍖 Food Specialist →' : '🏥 Health Assistant →'}
+          </button>
+          <button className="redirect-dismiss" onClick={() => setActiveRedirect(null)}>✕</button>
+        </div>
+      )}
 
       {/* ── Input ── */}
       <div className="chat-input-bar">

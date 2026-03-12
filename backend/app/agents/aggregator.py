@@ -83,9 +83,18 @@ class AggregatorAgent:
         self._lock = asyncio.Lock()
         logger.info("AggregatorAgent initialised (no LLM).")
 
-    async def run(self, facts: list[ExtractedFact], session_id: str) -> dict:
+    async def run(
+        self,
+        facts: list[ExtractedFact],
+        session_id: str,
+        active_profile: dict | None = None,
+    ) -> dict:
         """
-        Merge a list of high-confidence facts into active_profile.json.
+        Merge a list of high-confidence facts into active_profile.
+
+        When active_profile is provided (from app.state), mutates it in place
+        and writes through to disk for persistence.  When None, falls back to
+        reading from disk (backward compatible for tests).
 
         Acquires an asyncio lock around the entire read-apply-write cycle
         to prevent concurrent background tasks from racing.
@@ -93,12 +102,13 @@ class AggregatorAgent:
         Args:
             facts: High-confidence ExtractedFact objects (confidence > 0.70).
             session_id: Which conversation produced these facts.
+            active_profile: In-memory profile dict (from app.state). Optional.
 
         Returns:
             The updated active_profile dict after all merges.
         """
         async with self._lock:
-            profile = read_active_profile() or {}
+            profile = active_profile if active_profile is not None else (read_active_profile() or {})
             changes = 0
 
             for fact in facts:

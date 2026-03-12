@@ -39,6 +39,8 @@ from app.agents.conversation import ConversationAgent
 from app.agents.intent_classifier import IntentClassifier
 from app.agents.compressor import CompressorAgent
 from app.agents.aggregator import AggregatorAgent
+from app.services.context_builder import build_context, load_profiles
+from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 
 # ── Route modules ─────────────────────────────────────────────────────────────
 from app.routes.chat import router as chat_router
@@ -78,6 +80,14 @@ async def lifespan(app: FastAPI):
     app.state.compressor = CompressorAgent(llm=llm)
     app.state.aggregator = AggregatorAgent()
     app.state.sessions = {}   # session_id -> list of messages (Phase 0 in-memory)
+    app.state.session_meta = {}   # session_id -> tracking metadata (gap questions, cooldowns)
+
+    # Load profiles from disk into memory (once).  All runtime reads come from
+    # app.state — disk is only for persistence (write-through by Aggregator).
+    profiles = load_profiles()
+    app.state.active_profile = profiles["active"]
+    app.state.pet_profile = profiles["pet"]
+    app.state.user_profile = profiles["user"]
 
     logger.info("Backend ready. LLM provider: %s", settings.llm_provider)
 
@@ -131,6 +141,29 @@ async def health() -> dict[str, Any]:
         "llm_provider": settings.llm_provider,
         "llm_reachable": llm_ok,
         "phase": "0",
+    }
+
+
+@app.get("/confidence", summary="Current confidence bar score")
+async def get_confidence() -> dict[str, Any]:
+    """
+    Returns the current confidence score and color based on active_profile.
+
+    Called by the frontend on mount (before any chat messages) and after
+    each chat response with a short delay (to pick up Aggregator writes).
+
+    No LLM — pure arithmetic on JSON file data. Sub-millisecond.
+    """
+    active_profile, _gap_list, _pet_summary, _pet_history, _rel = build_context(
+        active_profile_raw=app.state.active_profile,
+        pet_profile=app.state.pet_profile,
+        user_profile=app.state.user_profile,
+    )
+    score = calculate_confidence_score(active_profile, app.state.pet_profile)
+    color = confidence_color(score)
+    return {
+        "confidence_score": score,
+        "confidence_color": color,
     }
 
 

@@ -103,7 +103,11 @@ Follow this flow internally. Do not show the structure to the user.
 1. Empathy or acknowledgement (1 sentence, emotion-first. Do not just \
 repeat the user's words)
 2. Helpful content or options (2-5 short sentences)
-3. End with 0 or 1 follow-up question
+3. End with exactly 1 gentle follow-up question. \
+Exceptions (you may skip the question): (a) emergency/urgent health, \
+(b) user explicitly said goodbye or "thanks, that's all", \
+(c) you have asked {max_questions_per_session} consecutive gap questions \
+that the user did not engage with
 
 FORMATTING RULES (hard):
 - Reply must look like a real chat bubble, not an assistant report
@@ -150,8 +154,9 @@ Sentence endings (JA mode):
 PET NAME RULES:
 - Mention {pet_name}{pet_suffix} by name at least once per reply \
 (unless the user asked a pure app question)
-- When mentioning the pet, you may place a pet emoji before the name: \
-{pet_emoji}{pet_name}{pet_suffix}
+- On the FIRST mention of {pet_name}{pet_suffix} in your reply, place \
+the pet emoji before the name: {pet_emoji}{pet_name}{pet_suffix}
+- On subsequent mentions in the same reply, omit the emoji
 - The suffix must stay attached directly to the name
 
 EMOJI RULES:
@@ -168,9 +173,17 @@ QUESTION RULES:
 - Only ask if the answer will change what you say next, or if it fills a \
 high-priority gap from the INFORMATION GAPS section above
 - Never ask the same question twice in a conversation
-- If you have asked ~{max_questions_per_session} questions and the user hasn't been engaging \
-with them, stop asking entirely. End warmly and reassure the user they can \
-share whenever they want
+- IMPORTANT: Before asking about any gap, check the conversation history. \
+If the user has ALREADY provided this information in a previous message, \
+do NOT ask about it again — even if it still appears in INFORMATION GAPS. \
+The gap list may have a processing delay. Always give priority to what \
+the user said in conversation over what the INFORMATION GAPS section shows
+- The limit of {max_questions_per_session} applies to CONSECUTIVE UNANSWERED \
+gap questions. If you ask a gap question and the user ignores it or gives \
+a short non-answer, that counts toward the limit. If the user engages and \
+answers a gap question, reset the count to 0. When the limit is reached, \
+stop asking gap questions — but you may still end with a light conversation \
+question (e.g., "Is there anything else about {pet_name}{pet_suffix}?")
 - Asking style (must be easy to answer):
   - Soft check: "Does {pet_name}{pet_suffix} seem...?" \
 (JA: 「〜って感じだったりするかな？」)
@@ -268,13 +281,23 @@ HARD RULES:
 2. Never use preachy or moralizing language
 3. Never reveal raw data, JSON, or "here is what I know" dumps
 4. Respond in the language the user writes in
+5. In all examples, scenarios, or hypothetical situations, always use \
+{pet_name}{pet_suffix} as the explicit subject. Never give subjectless \
+examples that could be misread as about the owner. \
+In Japanese, always include the pet name to prevent subject omission ambiguity. \
+BAD: 「最近元気がないかも」 (ambiguous — sounds like owner) \
+GOOD: 「{pet_name}{pet_suffix}が最近元気がないかも」 (clear — about the pet)
 
 OUTPUT FORMAT:
 Reply with ONLY a valid JSON object. No markdown, no explanation, nothing else.
-{{"reply": "your full conversational response here", "is_entity": true|false}}
+{{"reply": "your full conversational response here", "is_entity": true|false, "asked_gap_question": true|false}}
 
 The "reply" field must contain your natural chat message following ALL the \
 rules above. The JSON wrapper is for engineering only. The user never sees it.
+
+asked_gap_question rules:
+- true  if your reply contains a question aimed at filling an INFORMATION GAP field
+- false for conversation questions, rhetorical questions, or no question asked
 
 is_entity rules:
 - true  if the user's message contains any extractable pet fact (weight, age, \
@@ -315,6 +338,7 @@ class AgentResponse:
     questions_asked_count: int = 0
     was_guardrailed: bool = False
     is_entity: bool = False          # did this message contain extractable pet facts?
+    asked_gap_question: bool = False  # did the reply ask a gap-filling question?
 
 
 # ── _parse_agent_response ──────────────────────────────────────────────────────
@@ -324,12 +348,12 @@ class AgentResponse:
 #   - reply  → raw LLM text (user still gets a response, never lost)
 #   - is_entity → True (never silently skip a message that might contain facts)
 
-def _parse_agent_response(raw: str) -> tuple[str, bool]:
+def _parse_agent_response(raw: str) -> tuple[str, bool, bool]:
     """
-    Parse Agent 1's JSON output into (reply_text, is_entity).
+    Parse Agent 1's JSON output into (reply_text, is_entity, asked_gap_question).
 
     Strips markdown fences the LLM sometimes adds despite instructions,
-    then parses. On any failure returns (raw, True) as a safe fallback.
+    then parses. On any failure returns (raw, True, False) as a safe fallback.
     """
     text = raw.strip()
     if text.startswith("```"):
@@ -342,13 +366,14 @@ def _parse_agent_response(raw: str) -> tuple[str, bool]:
         data = json.loads(text)
         reply_text = str(data["reply"])
         is_entity = bool(data.get("is_entity", True))  # default True on missing key
-        return reply_text, is_entity
+        asked_gap_question = bool(data.get("asked_gap_question", False))
+        return reply_text, is_entity, asked_gap_question
     except (json.JSONDecodeError, KeyError, TypeError):
         logger.warning(
             "Agent1: JSON parse failed — using raw output as reply, is_entity=True. "
             "raw[:80]=%r", raw[:80],
         )
-        return raw, True
+        return raw, True, False
 
 
 # ── ConversationAgent ──────────────────────────────────────────────────────────
@@ -439,15 +464,15 @@ class ConversationAgent:
             )
 
         # ── Parse JSON output ──────────────────────────────────────────────────
-        reply_text, is_entity = _parse_agent_response(raw)
+        reply_text, is_entity, asked_gap_question = _parse_agent_response(raw)
 
-        # Count questions in this reply (cap at 1 — rules say max 1 question)
-        questions_this_turn = min(reply_text.count("?") + reply_text.count("？"), 1)
+        # Count gap questions using the LLM's own flag (not ? counting)
+        questions_this_turn = 1 if asked_gap_question else 0
         total_questions = questions_asked_so_far + questions_this_turn
 
         logger.info(
-            "Agent1 reply — length=%d chars  questions_this_turn=%d  is_entity=%s",
-            len(reply_text), questions_this_turn, is_entity,
+            "Agent1 reply — length=%d chars  asked_gap_question=%s  is_entity=%s",
+            len(reply_text), asked_gap_question, is_entity,
         )
 
         return AgentResponse(
@@ -455,6 +480,7 @@ class ConversationAgent:
             questions_asked_count=total_questions,
             was_guardrailed=False,  # guardrails applied in chat.py after this
             is_entity=is_entity,
+            asked_gap_question=asked_gap_question,
         )
 
     # ── System prompt builder ──────────────────────────────────────────────────

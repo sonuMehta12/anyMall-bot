@@ -95,7 +95,7 @@ def build_deeplink(
             deep_link=f"{base_url}/food/chat",
             pre_populated_query=user_message,
             pet_summary=pet_summary,
-            urgency=URGENCY_LOW,   # food questions are never high-urgency
+            urgency=urgency,       # pass through classifier's urgency
         )
         logger.info("build_deeplink → food redirect built")
         return payload

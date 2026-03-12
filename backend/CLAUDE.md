@@ -33,9 +33,8 @@ understanding of what it does and why it is there.
 
 **Current goal: Phase 1B ✓ complete → Phase 1C (PostgreSQL) next.**
 
-Phase 0 ✓. Phase 1A ✓. Phase 1B ✓ (Compressor + Aggregator + route refactor + confidence calculator + prompt v2).
-24 e2e tests (22 passing, 2 pre-existing LLM flakes).
-Next: Phase 1C — swap JSON files for PostgreSQL.
+Phase 0 ✓. Phase 1A ✓. Phase 1B ✓ (Compressor + Aggregator + route refactor + confidence calculator + prompt v2 + reviewer feedback v1 + in-memory optimization).
+24 e2e tests. Next: Phase 1C — swap JSON files for PostgreSQL.
 
 ---
 
@@ -71,16 +70,24 @@ See `notes.md` Phase 1A section for full details.
 ```
 User message
     → IntentClassifier (LLM)      health / food / general + urgency
-    → Agent 1 (LLM)               outputs {"reply": "...", "is_entity": bool}
+    → _detect_language()          Unicode range check → "EN" or "JA"
+    → Agent 1 (LLM)               outputs {"reply": "...", "is_entity": bool, "asked_gap_question": bool}
     → apply_guardrails()
-    → build_deeplink()
-    → confidence_calculator()     confidence_score + confidence_color
+    → build_deeplink()            (food LOW urgency → no redirect)
+    → confidence_calculator()     confidence_score + confidence_color (reads from app.state)
     → Return response to user     (includes is_entity, intent_type, urgency, confidence)
     ↓  [fire-and-forget — user does NOT wait]
     → _run_background(AgentState)
          → Compressor (LLM, temp=0.0)   → fact_log.json
-         → Aggregator (no LLM)          → active_profile.json
+         → Aggregator (no LLM)          → app.state.active_profile (mutates in place) + write-through to disk
 ```
+
+**In-memory profile pattern:**
+- `load_profiles()` in `context_builder.py` called once at startup → loads into `app.state`
+- All runtime reads from `app.state` (no disk I/O on hot path)
+- Aggregator mutates `app.state.active_profile` by reference, writes through to disk for persistence
+- `build_context()` accepts optional in-memory profiles; `None` falls back to disk read
+- `GET /confidence` reads from `app.state` — frontend calls on mount + 4s after each message
 
 **File structure — current state (Phase 1B complete):**
 ```
@@ -256,7 +263,8 @@ Phase 1A (DONE): IntentClassifier (LLM) before Agent 1. Health/food redirect log
 Phase 1B (DONE): Agent 2 (Compressor) ✓ — extracts facts → fact_log.json.
                   Agent 3 (Aggregator) ✓ — merges facts → active_profile.json.
                   Data model + context_builder.py ✓. Route refactor ✓.
-                  Confidence calculator ✓. 24 e2e tests.
+                  Confidence calculator ✓. Prompt v2 ✓. Reviewer feedback v1 ✓.
+                  In-memory profile optimization ✓. GET /confidence endpoint ✓.
 
 Phase 1C:        Swap JSON files for real PostgreSQL.
                  context_builder.py + file_store.py get PostgreSQL calls.

@@ -214,3 +214,41 @@
   border-radius: 10px;
   text-align: center;
 }
+
+/* ── Sticky redirect nudge ─────────────────────────────────────────────── */
+.chat-sticky-nudge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: white;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.redirect-sticky-btn {
+  flex: 1;
+  color: #fff;
+  border: none;
+  border-radius: 20px;
+  padding: 10px 18px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.redirect-sticky-btn:hover {
+  opacity: 0.9;
+}
+
+.chat-sticky-nudge .redirect-dismiss {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 16px;
+  padding: 4px 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+  margin-left: 0;
+}

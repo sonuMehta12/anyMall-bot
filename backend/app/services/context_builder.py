@@ -180,42 +180,86 @@ def _build_pet_summary(pet_profile: dict, active_entries: dict) -> str:
     return summary
 
 
+# ── Load profiles (called once at startup) ───────────────────────────────────
+
+def load_profiles() -> dict[str, dict]:
+    """
+    Read all three profile files from disk, seeding defaults if needed.
+
+    Called once at startup by lifespan() in main.py.  The returned dicts are
+    stored on app.state and used as the in-memory source of truth for the
+    entire server lifetime.  Disk is only read here — after this, all reads
+    come from memory.
+    """
+    pet = read_pet_profile()
+    if pet is None:
+        logger.info("pet_profile.json not found — seeding with Luna defaults.")
+        pet = dict(_DEFAULT_PET_PROFILE)
+        write_pet_profile(pet)
+
+    active = read_active_profile()
+    if active is None:
+        logger.info("active_profile.json not found — seeding with defaults.")
+        active = dict(_DEFAULT_ACTIVE_PROFILE)
+        write_active_profile(active)
+
+    user = read_user_profile()
+    if user is None:
+        logger.info("user_profile.json not found — seeding with Shara defaults.")
+        user = dict(_DEFAULT_USER_PROFILE)
+        write_user_profile(user)
+
+    return {"active": active, "pet": pet, "user": user}
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def build_context() -> tuple[dict, list[str], str, str, str]:
+def build_context(
+    active_profile_raw: dict | None = None,
+    pet_profile: dict | None = None,
+    user_profile: dict | None = None,
+) -> tuple[dict, list[str], str, str, str]:
     """
     Build the 5 context values Agent 1 needs on every request.
 
-    Returns:
-        (active_profile_dict, gap_list, pet_summary, pet_history, relationship_context)
+    Parameters
+    ----------
+    active_profile_raw, pet_profile, user_profile : dict | None
+        When provided (from app.state), used directly — no disk I/O.
+        When None, falls back to reading from disk (backward compatible).
 
-    Reads from data/*.json files. Seeds defaults on first run.
-    Called every request — reads from disk, no caching.
+    Returns
+    -------
+    (active_profile_dict, gap_list, pet_summary, pet_history, relationship_context)
 
     The returned active_profile_dict matches the shape conversation.py expects:
         {"field_name": {"value": "...", "confidence": N}, ...}
     """
 
-    # ── 1. Read pet_profile.json ─────────────────────────────────────────────
-    pet_profile = read_pet_profile()
+    # ── 1. Resolve pet_profile ───────────────────────────────────────────────
     if pet_profile is None:
-        logger.info("pet_profile.json not found — seeding with Luna defaults.")
-        pet_profile = dict(_DEFAULT_PET_PROFILE)
-        write_pet_profile(pet_profile)
+        pet_profile = read_pet_profile()
+        if pet_profile is None:
+            logger.info("pet_profile.json not found — seeding with Luna defaults.")
+            pet_profile = dict(_DEFAULT_PET_PROFILE)
+            write_pet_profile(pet_profile)
 
-    # ── 2. Read active_profile.json ──────────────────────────────────────────
-    active_raw = read_active_profile()
+    # ── 2. Resolve active_profile ────────────────────────────────────────────
+    active_raw = active_profile_raw
     if active_raw is None:
-        logger.info("active_profile.json not found — seeding with defaults.")
-        active_raw = dict(_DEFAULT_ACTIVE_PROFILE)
-        write_active_profile(active_raw)
+        active_raw = read_active_profile()
+        if active_raw is None:
+            logger.info("active_profile.json not found — seeding with defaults.")
+            active_raw = dict(_DEFAULT_ACTIVE_PROFILE)
+            write_active_profile(active_raw)
 
-    # ── 3. Read user_profile.json ────────────────────────────────────────────
-    user_profile = read_user_profile()
+    # ── 3. Resolve user_profile ──────────────────────────────────────────────
     if user_profile is None:
-        logger.info("user_profile.json not found — seeding with Shara defaults.")
-        user_profile = dict(_DEFAULT_USER_PROFILE)
-        write_user_profile(user_profile)
+        user_profile = read_user_profile()
+        if user_profile is None:
+            logger.info("user_profile.json not found — seeding with Shara defaults.")
+            user_profile = dict(_DEFAULT_USER_PROFILE)
+            write_user_profile(user_profile)
 
     # ── 4. Merge pet_profile static fields into active_profile ───────────────
     #

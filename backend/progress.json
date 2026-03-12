@@ -5,7 +5,7 @@
   "state": "phase-1b-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
-  "current_focus": "phase-1c-database",
+  "current_focus": "phase-1c-database (reviewer feedback v1 + in-memory optimization done)",
 
   "storage_strategy": "File-based JSON storage (data/ directory) until all agent logic is proven. PostgreSQL replaces it in Phase 1C. Agent 2 and Agent 3 code will not change when that swap happens.",
 
@@ -333,6 +333,33 @@
           "notes": "22/24 e2e tests pass. 2 failures are pre-existing Compressor LLM flakes, unrelated to prompt changes. language_str hardcoded to EN — auto-detect deferred to Phase 2."
         },
         {
+          "id": "p1b-020",
+          "name": "Reviewer feedback v1 — 6 issues fixed",
+          "description": "Fixed Issues 2,3,4,5,7 from product team reviewer-feedback-v1-proposal.md. Issue 2: response structure rewritten (end with exactly 1 follow-up question). Issue 3: HARD RULE #5 — pet name as explicit subject. Issue 4: asked_gap_question field added to Agent 1 JSON output, replacing ? counting. Issue 5: language detection via Unicode range check (Hiragana/Katakana/CJK). Issue 7: emoji rule tightened to first mention only. Food urgency gating: LOW urgency food intents no longer redirect.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/conversation.py", "app/agents/intent_classifier.py", "app/routes/chat.py", "app/services/deeplink.py", "tests/run_e2e.py"],
+          "notes": "asked_gap_question: bool added to AgentResponse. _detect_language() in chat.py uses Unicode ranges. Food intent with urgency=low returns no redirect. Medium urgency food gated by cooldown."
+        },
+        {
+          "id": "p1b-021",
+          "name": "In-memory profile optimization — app.state read, write-through to disk",
+          "description": "Eliminated per-request disk I/O. Profiles loaded from JSON once at startup into app.state. All runtime reads come from memory. Aggregator mutates shared dict by reference and writes through to disk for persistence. context_builder.py parameterized with optional in-memory profiles. Backward compatible (None falls back to disk read).",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/context_builder.py", "app/main.py", "app/routes/chat.py", "app/agents/aggregator.py"],
+          "notes": "load_profiles() called once in lifespan(). build_context() accepts optional active_profile_raw, pet_profile, user_profile params. Dict passed by reference — Aggregator mutations visible to all readers immediately. asyncio.Lock prevents concurrent mutations."
+        },
+        {
+          "id": "p1b-022",
+          "name": "GET /confidence endpoint — dedicated confidence score API",
+          "description": "Standalone GET /confidence endpoint so frontend can fetch score on mount without waiting for a /chat response. Reads from app.state (in-memory). Returns {confidence_score, confidence_color}.",
+          "complete": true,
+          "tested": true,
+          "files": ["app/main.py", "frontend/src/api.js", "frontend/src/screens/Chat.jsx"],
+          "notes": "Frontend calls fetchConfidence() on mount and 4s after each message. Sticky redirect nudge replaces per-message inline buttons."
+        },
+        {
           "id": "p1b-016",
           "name": "Code review + quick fixes",
           "description": "Code review of all backend files. Fixed 5 issues: stale comments (2), fragile mutation in context_builder.py, stale import reference in deeplink.py docstring, unused import cleanup.",
@@ -530,11 +557,26 @@
 
   ],
 
+  "future_tasks": [
+    {
+      "id": "ft-001",
+      "name": "Eliminate 4-second confidence bar delay",
+      "description": "After a chat message, the Aggregator runs in the background (fire-and-forget). Frontend polls GET /confidence 4s later to pick up the updated score. Three options identified:",
+      "options": [
+        "Option A: Recalculate confidence in _run_background() after Aggregator finishes, cache on app.state. GET /confidence returns cached value instantly. Simplest, no new infra.",
+        "Option B: SSE (Server-Sent Events) push. Backend pushes updated score to frontend when Aggregator finishes. Real-time, but adds SSE infrastructure.",
+        "Option C: Accept the 4-second delay. It works, users unlikely to notice. Revisit only if it becomes a UX issue."
+      ],
+      "status": "not-started",
+      "priority": "low"
+    }
+  ],
+
   "summary": {
-    "total_features": 51,
-    "complete": 36,
+    "total_features": 54,
+    "complete": 39,
     "in_progress": 0,
     "not_started": 15,
-    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (19/19) = 36 complete. Phase 1B fully done: Aggregator, routes refactored, confidence calculator, confidence bar in React UI, prompt v2 (PRD-aligned). 24 e2e tests (22 passing, 2 LLM flakes). Next: Phase 1C (PostgreSQL)."
+    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22/22) = 39 complete. Phase 1B fully done: Aggregator, routes refactored, confidence calculator, prompt v2 (PRD-aligned), reviewer feedback v1 (6 issues), in-memory optimization, GET /confidence endpoint. 24 e2e tests. Next: Phase 1C (PostgreSQL)."
   }
 }

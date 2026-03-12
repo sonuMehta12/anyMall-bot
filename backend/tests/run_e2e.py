@@ -159,6 +159,7 @@ def test_response_structure() -> bool:
             "questions_asked_count": int,
             "was_guardrailed": bool,
             "is_entity": bool,
+            "asked_gap_question": bool,
             "intent_type": str,
             "urgency": str,
         }
@@ -218,22 +219,20 @@ def test_health_intent_redirect() -> bool:
         return failed("Health intent", str(exc))
 
 
-def test_food_intent_redirect() -> bool:
-    """A food-related message produces redirect with module='food'."""
+def test_food_low_urgency_no_redirect() -> bool:
+    """A routine food question (LOW urgency) produces redirect=null after gating."""
     sid = new_sid()
     try:
         data = post_chat(
-            "What's the best food to feed Luna? She seems hungry all the time lately",
+            "What brand of dry food do you recommend for a Shiba Inu?",
             sid,
         )
         redirect = data.get("redirect")
-        if redirect is None:
-            return failed("Food intent — redirect present", "redirect is null")
-        if redirect.get("module") != "food":
-            return failed("Food intent — module=food", f"got module={redirect.get('module')!r}")
-        return passed("Food intent", "module=food")
+        if redirect is not None:
+            return failed("Food LOW urgency — no redirect", f"got redirect: {redirect}")
+        return passed("Food LOW urgency", "redirect=null as expected")
     except Exception as exc:
-        return failed("Food intent", str(exc))
+        return failed("Food LOW urgency", str(exc))
 
 
 def test_health_reply_is_short() -> bool:
@@ -805,7 +804,7 @@ def main() -> None:
     section("2  Intent Routing")
     results.append(test_general_intent_no_redirect())
     results.append(test_health_intent_redirect())
-    results.append(test_food_intent_redirect())
+    results.append(test_food_low_urgency_no_redirect())
     results.append(test_health_reply_is_short())
 
     # ── Section 3: Session Management ─────────────────────────────────────────

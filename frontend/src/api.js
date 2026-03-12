@@ -99,3 +99,11 @@ export async function sendMessage({ sessionId, message }) {
 
   return data
 }
+
+
+// GET /confidence — dedicated endpoint for fresh confidence score
+export async function fetchConfidence() {
+  const res = await fetch(`${BASE}/confidence`)
+  if (!res.ok) throw new Error(`${res.status} — failed to fetch confidence`)
+  return res.json()
+}

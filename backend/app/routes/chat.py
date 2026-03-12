@@ -27,12 +27,36 @@ from app.agents.state import AgentState
 from app.services.guardrails import apply_guardrails
 from app.services.deeplink import build_deeplink
 from app.services.context_builder import build_context
-from app.storage.file_store import append_fact_log, read_pet_profile
+from constants import INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM
+from app.storage.file_store import append_fact_log
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ── Language detection ───────────────────────────────────────────────────────
+
+def _detect_language(text: str) -> str:
+    """
+    Detect if text is primarily Japanese based on Unicode character ranges.
+
+    Checks for Hiragana (U+3040-309F), Katakana (U+30A0-30FF), and CJK
+    Unified Ideographs (U+4E00-9FFF).  Returns "JA" if any Japanese character
+    is found, "EN" otherwise.
+
+    Used to select the correct language for gap-question hints in Agent 1's
+    system prompt.  The LLM itself adapts reply language from the user's input,
+    but the gap hints are built in code and need the right language key.
+    """
+    ja_count = sum(
+        1 for c in text
+        if '\u3040' <= c <= '\u309f'      # Hiragana
+        or '\u30a0' <= c <= '\u30ff'       # Katakana
+        or '\u4e00' <= c <= '\u9fff'       # CJK Unified Ideographs
+    )
+    return "JA" if ja_count >= 1 else "EN"
 
 
 # ── Request / response models ──────────────────────────────────────────────────
@@ -74,11 +98,23 @@ class ChatResponse(BaseModel):
     # These expose Agent 1 + IntentClassifier internals so the UI can display them.
     # Agent 2 (Compressor) output is available via GET /debug/facts?session_id=...
     is_entity: bool       # Agent 1: did the user message contain extractable pet facts?
+    asked_gap_question: bool = False  # Agent 1: did the reply ask a gap-filling question?
     intent_type: str      # IntentClassifier: "health" | "food" | "general"
     urgency: str          # IntentClassifier: "high" | "medium" | "low"
     # ── Confidence bar ────────────────────────────────────────────────────────
     confidence_score: int  # 0-100, how well AnyMall-chan knows the pet
     confidence_color: str  # "green" (80-100) | "yellow" (50-79) | "red" (0-49)
+
+
+def _to_redirect_payload(deeplink) -> RedirectPayload:
+    """Convert a DeeplinkPayload dataclass to the Pydantic RedirectPayload."""
+    return RedirectPayload(
+        module=deeplink.module,
+        deep_link=deeplink.deep_link,
+        pre_populated_query=deeplink.pre_populated_query,
+        pet_summary=deeplink.pet_summary,
+        urgency=deeplink.urgency,
+    )
 
 
 # ── Route ─────────────────────────────────────────────────────────────────────
@@ -114,13 +150,16 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
     session_messages = sessions[session_id]
 
-    # ── 1b. Load pet context from JSON files ─────────────────────────────────
-    # Called per request so Aggregator's background writes are seen immediately.
-    active_profile, gap_list, pet_summary, pet_history, relationship_context = build_context()
+    # ── 1b. Load pet context from in-memory profiles ─────────────────────────
+    # Reads from app.state (loaded once at startup, updated in-place by Aggregator).
+    active_profile, gap_list, pet_summary, pet_history, relationship_context = build_context(
+        active_profile_raw=state_bag.active_profile,
+        pet_profile=state_bag.pet_profile,
+        user_profile=state_bag.user_profile,
+    )
 
     # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
-    pet_profile_raw = read_pet_profile() or {}
-    conf_score = calculate_confidence_score(active_profile, pet_profile_raw)
+    conf_score = calculate_confidence_score(active_profile, state_bag.pet_profile)
     conf_color = confidence_color(conf_score)
 
     # Build AgentState — shared context for the background pipeline.
@@ -136,13 +175,12 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         recent_history=list(session_messages),  # snapshot before this turn
     )
 
-    # Count questions asked so far this session.
-    # Heuristic: count "?" and "？" in assistant messages.
-    questions_so_far = sum(
-        msg["content"].count("?") + msg["content"].count("？")
-        for msg in session_messages
-        if msg["role"] == "assistant"
-    )
+    # Track gap questions and redirect cooldowns per session.
+    meta = state_bag.session_meta.setdefault(session_id, {
+        "gap_questions_asked": 0,
+        "redirect_turn_tracker": {},
+    })
+    questions_so_far = meta["gap_questions_asked"]
 
     # ── 2. Intent classification (LLM) ────────────────────────────────────────
     intent_type, urgency = await intent_classifier.classify(request_body.message)
@@ -159,29 +197,43 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         intent_type=intent_type,
         questions_asked_so_far=questions_so_far,
         urgency=urgency,
-        language_str="EN",  # TODO: detect from user message in Phase 2
+        language_str=_detect_language(request_body.message),
     )
 
     # Propagate is_entity flag from Agent 1 to state so Compressor knows whether to run.
     agent_state.is_entity = agent_response.is_entity
+
+    # Update gap question counter using the LLM's flag (not ? counting).
+    if agent_response.asked_gap_question:
+        meta["gap_questions_asked"] += 1
 
     # ── 4. Guardrails ──────────────────────────────────────────────────────────
     guardrail_result = apply_guardrails(agent_response.message)
     final_reply = guardrail_result.reply
     was_guardrailed = guardrail_result.was_modified
 
-    # ── 4b. Build deeplink (runs after guardrails — reply is already clean) ────
-    deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary)
-    redirect_payload = (
-        RedirectPayload(
-            module=deeplink.module,
-            deep_link=deeplink.deep_link,
-            pre_populated_query=deeplink.pre_populated_query,
-            pet_summary=deeplink.pet_summary,
-            urgency=deeplink.urgency,
-        )
-        if deeplink else None
-    )
+    # ── 4b. Build deeplink with urgency gating ────────────────────────────────
+    # HIGH = always show redirect. MEDIUM = show with 3-message cooldown. LOW = never.
+    MEDIUM_COOLDOWN = 3  # skip N messages after showing a medium redirect
+
+    redirect_payload = None
+    if intent_type in (INTENT_HEALTH, INTENT_FOOD):
+        tracker = meta.setdefault("redirect_turn_tracker", {})
+        current_turn = len(session_messages) // 2  # count user messages so far
+
+        if urgency == URGENCY_HIGH:
+            deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary)
+            if deeplink:
+                redirect_payload = _to_redirect_payload(deeplink)
+
+        elif urgency == URGENCY_MEDIUM:
+            last_shown_turn = tracker.get("medium_last_shown")
+            if last_shown_turn is None or (current_turn - last_shown_turn) > MEDIUM_COOLDOWN:
+                deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary)
+                if deeplink:
+                    redirect_payload = _to_redirect_payload(deeplink)
+                    tracker["medium_last_shown"] = current_turn
+        # LOW → no redirect
 
     # ── 5. Save to session history ─────────────────────────────────────────────
     sessions[session_id].append({"role": "user",      "content": request_body.message})
@@ -212,6 +264,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         questions_asked_count=agent_response.questions_asked_count,
         was_guardrailed=was_guardrailed,
         is_entity=agent_response.is_entity,
+        asked_gap_question=agent_response.asked_gap_question,
         intent_type=intent_type,
         urgency=urgency,
         confidence_score=conf_score,
@@ -268,7 +321,7 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
 
         # ── Aggregator — merge high-confidence facts into active_profile ──
         if high and aggregator is not None:
-            await aggregator.run(high, state.session_id)
+            await aggregator.run(high, state.session_id, state_bag.active_profile)
 
     except Exception as exc:
         logger.error(

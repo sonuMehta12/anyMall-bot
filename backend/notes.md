@@ -454,11 +454,66 @@ speech quirks, question discipline, and redirect protocol.
 **Test results:** 22/24 e2e tests pass. 2 failures are pre-existing Compressor LLM flakes
 (multi-fact extraction), unrelated to prompt changes.
 
+### Reviewer Feedback v1 — 6 Issues Fixed (2026-03-12)
+
+Product team reviewed the build and sent `reviewer-feedback-v1-proposal.md` with 7 issues.
+We fixed 6 of them (Issue 6 was N/A — already handled by prompt v2).
+
+**Issue 2 — Response structure:** Rewrote the response policy section in Agent 1's prompt.
+Now says "End with exactly 1 gentle follow-up question" instead of leaving it ambiguous.
+
+**Issue 3 — Pet name as subject:** Added HARD RULE #5 to Agent 1: "Always use the pet's
+name as the explicit subject in examples and advice." Before: "Make sure to give plenty of
+water." After: "Make sure Luna-chan gets plenty of water!"
+
+**Issue 4 — asked_gap_question tracking:** Added `asked_gap_question: bool` to Agent 1's
+JSON output format. Replaces the old `?` counting heuristic (which broke on Japanese `？`
+and rhetorical questions). Agent 1 now explicitly signals whether it asked a gap question.
+
+**Issue 5 — Language detection:** Added `_detect_language()` in `chat.py` using Unicode
+range checks (Hiragana U+3040-309F, Katakana U+30A0-30FF, CJK U+4E00-9FFF). If >30% of
+non-ASCII chars are Japanese, returns "JA", else "EN". Replaces hardcoded `language_str="EN"`.
+
+**Issue 7 — Emoji discipline:** Changed emoji rule from "max 2 per reply" to "max 2 per
+reply, first mention only". Prevents emoji repetition within a single response.
+
+**Food urgency gating:** IntentClassifier now returns real urgency for food intents (was
+always "low"). `build_deeplink()` passes urgency through. In `chat.py`, LOW urgency food
+intents return no redirect. Medium urgency food gated by cooldown (once per 3 messages).
+
+**Files changed:** `conversation.py`, `intent_classifier.py`, `chat.py`, `deeplink.py`, `run_e2e.py`
+
+### In-Memory Profile Optimization (2026-03-12)
+
+Eliminated per-request disk I/O on the hot path. Before: every `/chat` request read
+`active_profile.json`, `pet_profile.json`, `user_profile.json` from disk. After: profiles
+loaded once at startup into `app.state`, all runtime reads come from memory.
+
+**How it works:**
+1. `load_profiles()` in `context_builder.py` — called once during `lifespan()` startup
+2. Returns `{"active": dict, "pet": dict, "user": dict}` — stored on `app.state`
+3. `build_context()` parameterized — accepts optional in-memory profiles
+4. When params are `None` → falls back to disk read (backward compatible)
+5. Aggregator receives `app.state.active_profile` by reference — mutations visible immediately
+6. After mutation, Aggregator writes through to disk for persistence (survives restarts)
+
+**Concurrency:** FastAPI single-threaded asyncio. Dict reads in `/chat` are synchronous
+(no `await`), always consistent. Aggregator's `asyncio.Lock` prevents concurrent mutations.
+
+**GET /confidence endpoint:** Dedicated `GET /confidence` in `main.py` so frontend can
+fetch score on mount without waiting for `/chat`. Reads from `app.state` (in-memory).
+Frontend calls `fetchConfidence()` on mount and 4s after each message.
+
+**Sticky redirect nudge:** Frontend changed from inline per-message redirect buttons to
+a single persistent nudge bar above the input field. Cleaner UX, doesn't clutter chat history.
+
+**Files changed:** `context_builder.py`, `main.py`, `chat.py`, `aggregator.py`, `api.js`, `Chat.jsx`, `Chat.css`
+
 ### What is pending after Phase 1B
 
 - **Clarification loop** — low_confidence_fields feed back to Agent 1 next turn (Phase 1C).
 - **Dead code cleanup** — remove unused regex constants from constants.py.
-- **Language detection** — `language_str` is hardcoded to "EN". Auto-detect from user message in Phase 2.
+- **4-second confidence delay** — three options identified: (A) cache score in _run_background, (B) SSE push, (C) accept delay. Tracked in progress.json future_tasks.
 
 ---
 

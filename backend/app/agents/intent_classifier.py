@@ -76,7 +76,11 @@ not breathing, poisoning, unconscious, pale gums
 - "medium": concerning but not emergency — limping, lethargy, not eating, swelling, \
 diarrhoea, unusual behaviour
 - "low"   : routine health question or check-in with no acute symptom
-For "food" and "general", always set urgency to "low".
+For "general", always set urgency to "low".
+For "food", use the same urgency scale: \
+"high" = toxic food emergency (e.g., chocolate, xylitol ingestion), \
+"medium" = feeding concern (e.g., refusal to eat, sudden diet change problems), \
+"low" = routine diet question (e.g., "what food is best?").
 
 Critical edge cases:
 - "Luna is NOT vomiting anymore" → general (negated / resolved)

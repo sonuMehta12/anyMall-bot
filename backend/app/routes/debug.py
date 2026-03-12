@@ -3,8 +3,11 @@
 # Debug endpoints — development only, remove in Phase 4.
 #
 # What lives here:
-#   - GET /debug/facts   — Compressor output (fact_log.json)
-#   - GET /debug/profile — Aggregator output (active_profile.json)
+#   - GET /debug/facts    — Compressor output (fact_log.json)
+#   - GET /debug/profile  — Aggregator output (active_profile.json)
+#
+# GET /confidence lives in main.py (must be defined directly on the app
+# to take priority over the catch-all frontend route).
 #
 # These endpoints read directly from JSON files — no shared state needed.
 
