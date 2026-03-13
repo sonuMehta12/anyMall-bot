@@ -61,6 +61,22 @@ def _detect_language(text: str) -> str:
 
 # ── Request / response models ──────────────────────────────────────────────────
 
+class PetContext(BaseModel):
+    """
+    Pet data sent by Flutter from the AALDA API.
+
+    Matches the AALDA GET /api/v1/pet/{pet_id} response shape.
+    All fields optional except pet_id and name — missing fields get safe defaults
+    so the pipeline never breaks.
+    """
+    pet_id: int | str
+    name: str
+    species: str = "unknown"
+    breed: str = "unknown"
+    birthday: str | None = None       # AALDA sends ISO datetime, we extract date
+    gender: str = "unknown"           # AALDA calls it gender, we map to sex
+
+
 class ChatRequest(BaseModel):
     """
     Body for POST /chat.
@@ -71,6 +87,10 @@ class ChatRequest(BaseModel):
                          description="The user's message.")
     session_id: str = Field(..., min_length=1, max_length=128,
                             description="Unique ID for this conversation session.")
+    pet_context: PetContext | None = Field(
+        default=None,
+        description="Pet data from AALDA API. If omitted, falls back to hardcoded Luna.",
+    )
 
 
 class RedirectPayload(BaseModel):
@@ -117,6 +137,37 @@ def _to_redirect_payload(deeplink) -> RedirectPayload:
     )
 
 
+# ── Pet context mapping ───────────────────────────────────────────────────────
+
+def _map_pet_context(ctx: PetContext) -> dict:
+    """
+    Convert AALDA's pet schema → our internal pet_profile shape.
+
+    AALDA fields:  pet_id (int), name, species, breed, birthday (ISO datetime), gender
+    Our fields:    pet_id (str), name, species, breed, date_of_birth (YYYY-MM-DD), sex
+
+    Returns a dict matching _DEFAULT_PET_PROFILE shape in context_builder.py.
+    Defensive: every field has a fallback so build_context() never crashes.
+    """
+    # Extract date portion from ISO datetime ("2026-03-13T05:17:12.981Z" → "2026-03-13")
+    dob = "unknown"
+    if ctx.birthday:
+        try:
+            dob = ctx.birthday[:10]  # "YYYY-MM-DD" from ISO string
+        except (TypeError, IndexError):
+            dob = "unknown"
+
+    return {
+        "pet_id": str(ctx.pet_id),
+        "name": ctx.name,
+        "species": ctx.species or "unknown",
+        "breed": ctx.breed if ctx.breed and ctx.breed != "string" else "unknown",
+        "date_of_birth": dob,
+        "sex": ctx.gender if ctx.gender and ctx.gender != "string" else "unknown",
+        "life_stage": "adult",  # default — no AALDA field for this yet
+    }
+
+
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @router.post("/chat", response_model=ChatResponse, summary="Send a message to Agent 1")
@@ -150,16 +201,23 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
     session_messages = sessions[session_id]
 
-    # ── 1b. Load pet context from in-memory profiles ─────────────────────────
-    # Reads from app.state (loaded once at startup, updated in-place by Aggregator).
+    # ── 1b. Load pet context ───────────────────────────────────────────────────
+    # If Flutter sent pet_context (real pet from AALDA API), use it.
+    # Otherwise fall back to hardcoded Luna from app.state.
+    if request_body.pet_context is not None:
+        pet_profile = _map_pet_context(request_body.pet_context)
+        logger.info("Using real pet context: %s (pet_id=%s)", pet_profile["name"], pet_profile["pet_id"])
+    else:
+        pet_profile = state_bag.pet_profile
+
     active_profile, gap_list, pet_summary, pet_history, relationship_context = build_context(
         active_profile_raw=state_bag.active_profile,
-        pet_profile=state_bag.pet_profile,
+        pet_profile=pet_profile,
         user_profile=state_bag.user_profile,
     )
 
     # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
-    conf_score = calculate_confidence_score(active_profile, state_bag.pet_profile)
+    conf_score = calculate_confidence_score(active_profile, pet_profile)
     conf_color = confidence_color(conf_score)
 
     # Build AgentState — shared context for the background pipeline.
