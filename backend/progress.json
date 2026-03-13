@@ -1,7 +1,7 @@
 {
   "project": "AnyMall-chan Backend",
   "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
-  "last_updated": "2026-03-08",
+  "last_updated": "2026-03-13",
   "state": "phase-1b-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
@@ -557,6 +557,48 @@
 
   ],
 
+  "deployment_dev": {
+    "id": "deploy-dev",
+    "name": "Development Deployment (Railway/Render) — TEMPORARY",
+    "description": "Dev deployment setup for testing. DevOps team will replace with production pipeline later.",
+    "status": "complete",
+    "cleanup_needed": true,
+    "features": [
+      {
+        "id": "dd-001",
+        "name": "nixpacks.toml — Railway Python detection",
+        "complete": true,
+        "tested": true,
+        "files": ["nixpacks.toml"],
+        "notes": "TEMPORARY. Added so Railway detects Python project. DevOps will replace."
+      },
+      {
+        "id": "dd-002",
+        "name": "Dockerfile — Railway/Render deployment",
+        "complete": true,
+        "tested": true,
+        "files": ["backend/Dockerfile"],
+        "notes": "TEMPORARY. COPY paths use backend/ prefix (repo-root build context). Port hardcoded to 8000. DevOps will replace with production Dockerfile."
+      },
+      {
+        "id": "dd-003",
+        "name": "OPENAI_API_KEY — manual key verification",
+        "complete": true,
+        "tested": true,
+        "files": [],
+        "notes": "TEMPORARY. Key added to .env for manual testing (2026-03-13, confirmed working). App uses Azure OpenAI, not direct OpenAI. Key not used by app code. Remove or wire into factory.py later."
+      },
+      {
+        "id": "dd-004",
+        "name": "demo/real-pet-context branch — merged to master",
+        "complete": true,
+        "tested": true,
+        "files": [],
+        "notes": "Branch added real pet data from AALDA API + Dockerfile fixes. Merged to master for deployment testing. 6 commits: nixpacks.toml, Dockerfile creation, Dockerfile fixes (3), real pet context feature."
+      }
+    ]
+  },
+
   "future_tasks": [
     {
       "id": "ft-001",
@@ -573,10 +615,10 @@
   ],
 
   "summary": {
-    "total_features": 54,
-    "complete": 39,
+    "total_features": 58,
+    "complete": 43,
     "in_progress": 0,
     "not_started": 15,
-    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22/22) = 39 complete. Phase 1B fully done: Aggregator, routes refactored, confidence calculator, prompt v2 (PRD-aligned), reviewer feedback v1 (6 issues), in-memory optimization, GET /confidence endpoint. 24 e2e tests. Next: Phase 1C (PostgreSQL)."
+    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22/22) + Dev Deployment (4) = 43 complete. Dev deployment is TEMPORARY — marked for cleanup by devops team. 24 e2e tests. Next: Phase 1C (PostgreSQL)."
   }
 }

@@ -517,6 +517,47 @@ a single persistent nudge bar above the input field. Cleaner UX, doesn't clutter
 
 ---
 
+## Temporary Code / Cleanup Needed (2026-03-13)
+
+Things added for development and testing that need to be cleaned up before production.
+DevOps team will handle production deployment config — these are placeholder/dev-only.
+
+### 1. Dockerfile — dev deployment paths (Railway/Render)
+
+`backend/Dockerfile` was modified to use `COPY backend/...` paths so it works when
+built from the **repo root** (Railway/Render build context). This is a dev workaround.
+
+**What to clean up:**
+- Dockerfile COPY paths assume repo-root build context — devops may restructure
+- `nixpacks.toml` in repo root — added for Railway Python detection
+- Port is hardcoded to 8000 in CMD — production may use different port strategy
+
+**Files:** `backend/Dockerfile`, `nixpacks.toml`
+
+### 2. OPENAI_API_KEY in .env — testing only
+
+Added `OPENAI_API_KEY` to `.env` to verify the key works (tested 2026-03-13, confirmed working).
+The app currently uses **Azure OpenAI** (`LLM_PROVIDER=azure`), not direct OpenAI.
+This key is not used by any application code — it was only for manual testing.
+
+**What to clean up:**
+- Remove `OPENAI_API_KEY` from `.env` once we decide if we're switching providers
+- Or: wire it into `app/llm/factory.py` if we add an `openai` provider option
+- Do NOT commit this key — `.env` is gitignored
+
+### 3. demo/real-pet-context branch work
+
+This branch (`demo/real-pet-context`) added real pet data acceptance from the AALDA API
+via `pet_context`. Being merged to master for deployment testing on Railway/Render.
+DevOps team will set up proper CI/CD pipeline later.
+
+**What to clean up:**
+- Review Dockerfile and deployment config with devops team
+- Replace Railway/Render dev setup with production deployment pipeline
+- Ensure all environment variables are properly configured in production
+
+---
+
 ## Running the project
 
 ```bash
