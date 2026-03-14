@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model_chat: str = "gpt-4o"
 
+    # ── Database (Phase 1C) ────────────────────────────────────────────────
+    # PostgreSQL connection string for async SQLAlchemy.
+    # The "+asyncpg" driver suffix is mandatory for async mode.
+    # Default None so tests without a database still instantiate Settings.
+    # Lifespan crashes with a clear error if this is None at runtime.
+    database_url: str | None = None
+
     # ── pydantic-settings configuration ──────────────────────────────────────
     # env_file: which file to read from disk.
     # env_file_encoding: always utf-8.

@@ -1,11 +1,15 @@
 # app/storage/file_store.py
 #
-# JSON file storage helpers for Phase 1B.
+# DEPRECATED — Phase 1C replaces this with app/db/repositories.py (PostgreSQL).
 #
-# Why file-based?
-#   Logic before infrastructure. Agent 2 and Agent 3 are proven here first.
-#   Phase 1C swaps these functions for PostgreSQL repository calls.
-#   The agent code (compressor.py, aggregator.py) does not change at all.
+# Kept for backward compatibility with:
+#   - aggregator.py fallback path (when get_session is None, e.g. tests)
+#   - load_profiles() fallback in context_builder.py
+#
+# Do NOT add new callers.  Will be deleted in a future cleanup PR.
+#
+# Original purpose (Phase 1B):
+#   JSON file storage helpers. Logic before infrastructure.
 #
 # Files managed:
 #   data/fact_log.json       — append-only list of every extracted fact

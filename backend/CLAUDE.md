@@ -31,10 +31,14 @@ We build the minimum that works at each phase. We do not add complexity until th
 simple version is working and understood. Every line of code is written with full
 understanding of what it does and why it is there.
 
-**Current goal: Phase 1B ✓ complete → Phase 1C (PostgreSQL) next.**
+**Current goal: Phase 1C ✓ complete → Phase 2 (Redis cache) next.**
 
-Phase 0 ✓. Phase 1A ✓. Phase 1B ✓ (Compressor + Aggregator + route refactor + confidence calculator + prompt v2 + reviewer feedback v1 + in-memory optimization).
-24 e2e tests. Next: Phase 1C — swap JSON files for PostgreSQL.
+Phase 0 ✓. Phase 1A ✓. Phase 1B ✓. Phase 1C ✓ (PostgreSQL replaces JSON files — Docker Compose + SQLAlchemy 2.0 async + Alembic migrations + repository pattern).
+30 e2e tests (29 pass, 1 LLM flake). Next: Phase 2 — add Redis cache (active_profile cache-aside).
+
+**Known gaps before production (tracked in progress.json future_tasks):**
+- `ft-002`: Cleanup — delete deprecated `file_store.py`, `app/models/context.py`, `data/` directory
+- `ft-003`: Wire `x-user-code` header — currently `DEFAULT_PET_ID="luna-001"` is hardcoded in aggregator.py and chat.py. `app.state.active_profile` is one dict (Luna only). Multi-user requires: read header → look up UserRepo → get real pet_id → pass through pipeline. Coordinate with Phase 2 Redis (which replaces in-memory profile store).
 
 ---
 
@@ -66,7 +70,7 @@ See `notes.md` Phase 1A section for full details.
 
 **All agents built and tested. Routes refactored. Confidence calculator added. Prompt v2 (PRD-aligned) deployed.**
 
-**Current pipeline (Phase 1B complete):**
+**Current pipeline (Phase 1C complete):**
 ```
 User message
     → IntentClassifier (LLM)      health / food / general + urgency
@@ -78,18 +82,18 @@ User message
     → Return response to user     (includes is_entity, intent_type, urgency, confidence)
     ↓  [fire-and-forget — user does NOT wait]
     → _run_background(AgentState)
-         → Compressor (LLM, temp=0.0)   → fact_log.json
-         → Aggregator (no LLM)          → app.state.active_profile (mutates in place) + write-through to disk
+         → Compressor (LLM, temp=0.0)   → PostgreSQL fact_log table
+         → Aggregator (no LLM)          → app.state.active_profile (mutates in place) + write-through to PostgreSQL
 ```
 
-**In-memory profile pattern:**
-- `load_profiles()` in `context_builder.py` called once at startup → loads into `app.state`
-- All runtime reads from `app.state` (no disk I/O on hot path)
-- Aggregator mutates `app.state.active_profile` by reference, writes through to disk for persistence
-- `build_context()` accepts optional in-memory profiles; `None` falls back to disk read
+**In-memory profile pattern (unchanged from Phase 1B):**
+- `load_profiles_from_db()` in `context_builder.py` called once at startup → loads into `app.state`
+- All runtime reads from `app.state` (no disk I/O or DB I/O on hot path)
+- Aggregator mutates `app.state.active_profile` by reference, writes through to PostgreSQL for persistence
+- `build_context()` accepts optional in-memory profiles; `None` falls back to disk read (deprecated path)
 - `GET /confidence` reads from `app.state` — frontend calls on mount + 4s after each message
 
-**File structure — current state (Phase 1B complete):**
+**File structure — current state (Phase 1C complete):**
 ```
 backend/
 |-- app/
@@ -98,30 +102,40 @@ backend/
 |   |   |-- intent_classifier.py     # IntentClassifier — Phase 1A
 |   |   |-- state.py                 # AgentState dataclass
 |   |   |-- compressor.py            # Agent 2 — fact extraction (LLM, temp=0.0)
-|   |   `-- aggregator.py            # Agent 3 — fact merge (no LLM, Rules 0-6)
+|   |   `-- aggregator.py            # Agent 3 — fact merge (no LLM, Rules 0-6), write-through to PostgreSQL
+|   |-- db/                          # Phase 1C — PostgreSQL layer
+|   |   |-- __init__.py
+|   |   |-- session.py               # init_db(), dispose_engine(), get_session() async context manager
+|   |   |-- models.py                # SQLAlchemy 2.0 ORM: Pet, User, ActiveProfile, FactLog
+|   |   `-- repositories.py          # PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo
 |   |-- routes/
 |   |   |-- __init__.py
 |   |   |-- chat.py                  # POST /chat + _run_background() + Pydantic models
-|   |   |-- debug.py                 # GET /debug/facts, GET /debug/profile
+|   |   |-- debug.py                 # GET /debug/facts, GET /debug/profile (reads from PostgreSQL)
 |   |   `-- simulator.py             # GET /health/chat, GET /food/chat (Phase 1 HTML)
 |   |-- services/
 |   |   |-- guardrails.py            # apply_guardrails() only
 |   |   |-- deeplink.py              # build_deeplink()
-|   |   |-- context_builder.py       # reads JSON files, returns 5 context values
+|   |   |-- context_builder.py       # load_profiles_from_db() + build_context() — returns 5 context values
 |   |   `-- confidence_calculator.py # confidence_score + confidence_color
 |   |-- storage/
 |   |   |-- __init__.py
-|   |   `-- file_store.py            # fact_log + pet/active/user profile read/write
+|   |   `-- file_store.py            # DEPRECATED — replaced by repositories.py. Scheduled for deletion (ft-002).
 |   |-- models/
 |   |   |-- __init__.py
-|   |   `-- context.py               # PetProfile, ActiveProfileEntry, UserProfile
+|   |   `-- context.py               # DEPRECATED — replaced by app/db/models.py. Scheduled for deletion (ft-002).
 |   |-- llm/
 |   |   |-- base.py                  # Abstract LLMProvider
 |   |   |-- azure_openai.py          # Azure implementation
 |   |   `-- factory.py               # creates provider from settings
 |   `-- core/
-|       `-- config.py                # reads .env -> Settings
+|       `-- config.py                # reads .env -> Settings (includes database_url)
 |-- constants.py                     # business logic constants + FULL_FIELD_LIST + GAP_PRIORITY_LADDER
+|-- docker-compose.yml               # PostgreSQL 16 Alpine container (port 5433:5432)
+|-- alembic.ini                      # Alembic migration config
+|-- migrations/                      # Alembic migration scripts
+|   |-- env.py                       # async runner, imports Base.metadata from app.db.models
+|   `-- versions/                    # auto-generated migration files
 |-- design-docs/                     # all design & architecture documents
 |   |-- aggregator-design.md         # Aggregator design doc
 |   |-- compressor-design.md         # Compressor design doc + decision log
@@ -131,24 +145,17 @@ backend/
 |   |-- system.md                    # PRD review notes
 |   |-- prompt-gap-analysis.md       # 17-gap comparison: current prompt vs PW1-PRD v0.2b
 |   `-- prompt-v2-proposal.md        # Approved prompt v2 design + review checklist
-|-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health
+|-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health, DB init
 |-- tests/
 |   `-- run_e2e.py                   # 24 automated end-to-end tests
-`-- data/                            # gitignored — created at runtime
-    |-- fact_log.json                # append-only extracted facts log
-    |-- pet_profile.json             # static pet identity (auto-seeded)
-    |-- active_profile.json          # dynamic facts per field (Aggregator writes here)
-    `-- user_profile.json            # owner relationship data (auto-seeded)
+`-- data/                            # gitignored — DEPRECATED (Phase 1B legacy, no longer written to)
 ```
-
-**Phase 1C (after Aggregator):** Swap JSON files for PostgreSQL.
-`context_builder.py` and `file_store.py` get PostgreSQL calls — agent code does not change.
 
 ---
 
 ## Pet Context (context_builder.py)
 
-`context_builder.py` reads JSON files from `data/` and returns 5 values every request:
+`build_context()` accepts in-memory dicts from `app.state` and returns 5 values every request:
 
 ```python
 active_profile: dict   # structured facts with confidence scores and source
@@ -158,7 +165,7 @@ pet_history: str       # "3 weeks ago: ear infection. Antibiotics prescribed..."
 relationship_context: str  # "Owner (Shara) tends to be anxious. Prefers short replies..."
 ```
 
-On first run, seeds Luna + Shara defaults to JSON files. Agent 1 never knows the source.
+On first run, `load_profiles_from_db()` seeds Luna + Shara defaults to PostgreSQL. Agent 1 never knows the source.
 
 ---
 
@@ -204,7 +211,7 @@ No side effects. No imports of global state.
 
 ### 3. Config comes from environment
 Never hardcode API keys or endpoints. Always from `.env` via pydantic-settings.
-Test data (Luna + Shara defaults) is seeded via `context_builder.py` into JSON files.
+Test data (Luna + Shara defaults) is seeded via `context_builder.py` into PostgreSQL on first startup.
 
 ---
 
@@ -260,14 +267,15 @@ Phase 0  (DONE): POST /chat → Agent 1 → response. Hardcoded pet context.
 Phase 1A (DONE): IntentClassifier (LLM) before Agent 1. Health/food redirect logic.
                  Removed regex entity pipeline. Deeplink payload in API response.
 
-Phase 1B (DONE): Agent 2 (Compressor) ✓ — extracts facts → fact_log.json.
-                  Agent 3 (Aggregator) ✓ — merges facts → active_profile.json.
+Phase 1B (DONE): Agent 2 (Compressor) ✓ — extracts facts → fact_log.
+                  Agent 3 (Aggregator) ✓ — merges facts → active_profile.
                   Data model + context_builder.py ✓. Route refactor ✓.
                   Confidence calculator ✓. Prompt v2 ✓. Reviewer feedback v1 ✓.
                   In-memory profile optimization ✓. GET /confidence endpoint ✓.
 
-Phase 1C:        Swap JSON files for real PostgreSQL.
-                 context_builder.py + file_store.py get PostgreSQL calls.
+Phase 1C (DONE): PostgreSQL replaces JSON files. Docker Compose + SQLAlchemy 2.0 async +
+                  Alembic migrations + repository pattern. Zero agent logic changes.
+                  file_store.py deprecated. All reads/writes go through app/db/ layer.
 
 Phase 2:         Add Redis cache (active_profile cache-aside)
 
@@ -280,19 +288,20 @@ Phase 5:         Tests + production deployment
 
 ---
 
-## Database Tables (For Reference — Phase 1C and Later)
+## Database Tables (Phase 1C — Live in PostgreSQL)
 
-| Table | Write Pattern | Purpose |
-|---|---|---|
-| `pets` | INSERT once | Pet identity: name, species, breed |
-| `fact_log` | APPEND only | Every extracted fact, full audit trail |
-| `active_profile` | UPSERT (one row per pet+key) | Current best-known value per field |
+| Table | Write Pattern | Purpose | ORM Model |
+|---|---|---|---|
+| `pets` | UPSERT | Pet identity: name, species, breed | `app.db.models.Pet` |
+| `users` | UPSERT | Owner relationship data | `app.db.models.User` |
+| `fact_log` | APPEND only | Every extracted fact, full audit trail | `app.db.models.FactLog` |
+| `active_profile` | DELETE+INSERT (per pet) | Current best-known value per field | `app.db.models.ActiveProfile` |
+
+**Note:** `_pet_history` is stored as a row in `active_profile` with `field_key="_pet_history"` and NULL metadata columns.
+
+Tables not yet created (future phases):
 | `conversation_log` | APPEND only | Every chat message |
 | `compressed_history` | APPEND (new row per compaction) | NL summaries of past sessions |
-
-During Phase 1B, these same structures exist as JSON files:
-- `data/fact_log.json` — append-only list
-- `data/active_profile.json` — dict keyed by field name
 
 ---
 
@@ -304,13 +313,22 @@ pip install -r requirements.txt
 
 # 2. Set up environment
 cp .env.example .env
-# Edit .env — fill in your Azure OpenAI credentials
+# Edit .env — fill in your Azure OpenAI credentials + DATABASE_URL
 
-# 3. Start server
+# 3. Start PostgreSQL (Docker required)
+docker compose up -d
+# Verify: docker exec -it anymall-postgres psql -U anymall -d anymallchan -c "\dt"
+
+# 4. Run database migrations
+alembic upgrade head
+
+# 5. Start server
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-# 4. Test
+# 6. Test
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Luna seems tired today", "session_id": "test-1"}'
 ```
+
+**Note:** PostgreSQL runs on port 5433 (not 5432) to avoid conflicts with any native PostgreSQL installation. The `DATABASE_URL` in `.env` already points to port 5433.

@@ -4,22 +4,24 @@
 #
 # What lives here:
 #   - App creation + CORS config
-#   - Lifespan: create agents + LLM provider once, store on app.state
+#   - Lifespan: connect DB, create LLM provider + agents, store on app.state
 #   - GET /health — liveness check (infrastructure, stays with the app)
+#   - GET /confidence — confidence bar score
 #   - include_router() calls to wire in route modules
 #
 # What does NOT live here:
 #   - Route handlers (app/routes/)
 #   - Business logic (agents/ and services/)
 #   - LLM credentials (core/config.py + .env)
-#   - Pet data (context_builder.py reads from data/*.json)
+#   - Pet data (context_builder.py reads from PostgreSQL at startup)
 #
-# Session state (Phase 0):
+# Session state:
 #   Simple in-memory dict: session_id -> list of messages.
 #   Stored on app.state.sessions. Resets on server restart.
 #   Phase 2 replaces this with Redis.
 
 # ── Standard library ───────────────────────────────────────────────────────────
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -39,8 +41,10 @@ from app.agents.conversation import ConversationAgent
 from app.agents.intent_classifier import IntentClassifier
 from app.agents.compressor import CompressorAgent
 from app.agents.aggregator import AggregatorAgent
-from app.services.context_builder import build_context, load_profiles
+from app.services.context_builder import build_context, load_profiles_from_db
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
+from app.db.session import init_db, dispose_engine, get_session
+from app.db.repositories import PetRepo, UserRepo, ActiveProfileRepo
 
 # ── Route modules ─────────────────────────────────────────────────────────────
 from app.routes.chat import router as chat_router
@@ -64,43 +68,66 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Startup (before yield): create LLM provider + agents, store on app.state.
-    Shutdown (after yield): nothing to clean up in Phase 0.
+    Startup (before yield): connect DB, create LLM provider + agents, store on app.state.
+    Shutdown (after yield): close DB connection pool.
 
     Route handlers access these via request.app.state.<name>.
     No module-level globals needed — everything flows through app.state.
     """
     logger.info("Starting up AnyMall-chan backend...")
 
+    # ── Database (Phase 1C) ───────────────────────────────────────────────
+    # Fail fast: if DATABASE_URL is not set, crash with a clear error.
+    if not settings.database_url:
+        raise RuntimeError(
+            "DATABASE_URL is not set in .env. "
+            "Phase 1C requires PostgreSQL. "
+            "Run: docker compose up -d  and set DATABASE_URL in .env"
+        )
+
+    await init_db(settings.database_url)
+
+    # Load profiles from PostgreSQL (seeds Luna + Shara defaults if empty).
+    async with get_session() as session:
+        profiles = await load_profiles_from_db(
+            pet_repo=PetRepo(session),
+            user_repo=UserRepo(session),
+            active_repo=ActiveProfileRepo(session),
+        )
+
+    app.state.active_profile = profiles["active"]
+    app.state.pet_profile = profiles["pet"]
+    app.state.user_profile = profiles["user"]
+
+    # ── LLM + Agents ─────────────────────────────────────────────────────
     llm = create_llm_provider(settings)
 
     app.state.llm_provider = llm
     app.state.agent = ConversationAgent(llm=llm)
     app.state.intent_classifier = IntentClassifier(llm=llm)
     app.state.compressor = CompressorAgent(llm=llm)
-    app.state.aggregator = AggregatorAgent()
+    app.state.aggregator = AggregatorAgent(get_session=get_session)
     app.state.sessions = {}   # session_id -> list of messages (Phase 0 in-memory)
     app.state.session_meta = {}   # session_id -> tracking metadata (gap questions, cooldowns)
-
-    # Load profiles from disk into memory (once).  All runtime reads come from
-    # app.state — disk is only for persistence (write-through by Aggregator).
-    profiles = load_profiles()
-    app.state.active_profile = profiles["active"]
-    app.state.pet_profile = profiles["pet"]
-    app.state.user_profile = profiles["user"]
 
     logger.info("Backend ready. LLM provider: %s", settings.llm_provider)
 
     yield
 
-    logger.info("Shutting down.")
+    # ── Shutdown ──────────────────────────────────────────────────────────
+    # Brief grace period so in-flight background tasks (Compressor/Aggregator)
+    # can finish their DB writes before the connection pool is disposed.
+    logger.info("Shutting down — waiting for background tasks...")
+    await asyncio.sleep(2)
+    await dispose_engine()
+    logger.info("Shutdown complete.")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="AnyMall-chan API",
-    description="Pet companion chat backend — Phase 0 MVP",
+    description="Pet companion chat backend — Phase 1C (PostgreSQL)",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -140,7 +167,7 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "llm_provider": settings.llm_provider,
         "llm_reachable": llm_ok,
-        "phase": "0",
+        "phase": "1C",
     }
 
 
@@ -152,7 +179,7 @@ async def get_confidence() -> dict[str, Any]:
     Called by the frontend on mount (before any chat messages) and after
     each chat response with a short delay (to pick up Aggregator writes).
 
-    No LLM — pure arithmetic on JSON file data. Sub-millisecond.
+    No LLM — pure arithmetic on in-memory profile data. Sub-millisecond.
     """
     active_profile, _gap_list, _pet_summary, _pet_history, _rel = build_context(
         active_profile_raw=app.state.active_profile,

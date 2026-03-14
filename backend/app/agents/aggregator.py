@@ -3,16 +3,21 @@
 # Agent 3 — the Aggregator.
 #
 # Runs fire-and-forget AFTER the Compressor inside _run_background().
-# Receives high-confidence facts (> 0.70) and merges them into active_profile.json.
+# Receives high-confidence facts (> 0.70) and merges them into active_profile.
 # Never talks to the user. Never calls an LLM. Pure deterministic logic.
 #
 # How this file is organised:
 #   1. AggregatorAgent       — the agent class with run() and _apply_rules()
 #   2. _build_entry          — converts an ExtractedFact into an active_profile entry dict
-#   3. _normalize_confidence — handles seed data integers (80 → 0.80)
+#   3. _normalize_confidence — handles legacy seed data integers (80 -> 0.80)
+#
+# Storage:
+#   - Constructor accepts get_session (async context manager factory) for DB writes.
+#   - run() writes through to PostgreSQL via ActiveProfileRepo.
+#   - _apply_rules() is COMPLETELY UNCHANGED — Rules 0-6 untouched.
 #
 # Design decisions (see design-docs/aggregator-design.md for full rationale):
-#   - Rules 0–6 applied per fact in priority order. First matching rule wins.
+#   - Rules 0-6 applied per fact in priority order. First matching rule wins.
 #   - updated_at uses datetime.now(UTC) at merge time — not fact.timestamp.
 #   - asyncio.Lock prevents concurrent read-modify-write races from rapid messages.
 #   - Keys starting with "_" (like _pet_history) are skipped — they are metadata.
@@ -23,7 +28,8 @@ import logging
 from datetime import datetime, timezone
 
 from app.agents.compressor import ExtractedFact
-from app.storage.file_store import read_active_profile, write_active_profile
+from app.db.repositories import ActiveProfileRepo
+from constants import DEFAULT_PET_ID
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +80,15 @@ class AggregatorAgent:
     """
     Pure rule-based fact aggregator. No LLM.
 
-    Merges high-confidence facts from the Compressor into active_profile.json.
+    Merges high-confidence facts from the Compressor into active_profile
+    (in-memory dict on app.state, written through to PostgreSQL).
     Each fact is compared against the current entry for that key. The first
     matching rule wins — remaining rules are not evaluated.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, get_session=None) -> None:
         self._lock = asyncio.Lock()
+        self._get_session = get_session  # async context manager for DB writes
         logger.info("AggregatorAgent initialised (no LLM).")
 
     async def run(
@@ -92,9 +100,8 @@ class AggregatorAgent:
         """
         Merge a list of high-confidence facts into active_profile.
 
-        When active_profile is provided (from app.state), mutates it in place
-        and writes through to disk for persistence.  When None, falls back to
-        reading from disk (backward compatible for tests).
+        Mutates active_profile in place (app.state reference) and writes
+        through to PostgreSQL for persistence.
 
         Acquires an asyncio lock around the entire read-apply-write cycle
         to prevent concurrent background tasks from racing.
@@ -102,13 +109,16 @@ class AggregatorAgent:
         Args:
             facts: High-confidence ExtractedFact objects (confidence > 0.70).
             session_id: Which conversation produced these facts.
-            active_profile: In-memory profile dict (from app.state). Optional.
+            active_profile: In-memory profile dict (from app.state).
 
         Returns:
             The updated active_profile dict after all merges.
         """
         async with self._lock:
-            profile = active_profile if active_profile is not None else (read_active_profile() or {})
+            if active_profile is None:
+                logger.warning(
+                    "Aggregator called without active_profile — using empty dict.")
+            profile = active_profile if active_profile is not None else {}
             changes = 0
 
             for fact in facts:
@@ -116,8 +126,10 @@ class AggregatorAgent:
                 if changed:
                     changes += 1
 
-            if changes > 0:
-                write_active_profile(profile)
+            if changes > 0 and self._get_session is not None:
+                async with self._get_session() as session:
+                    repo = ActiveProfileRepo(session)
+                    await repo.write_all(DEFAULT_PET_ID, profile)
 
             logger.info(
                 "Aggregator done — session=%s facts=%d changes=%d",
@@ -146,7 +158,8 @@ class AggregatorAgent:
         # ── Rule 0: time_scope gate ────────────────────────────────────────
         # Past facts belong in fact_log only, not in the current profile.
         if fact.time_scope == "past":
-            logger.debug("Rule 0 — skip past fact: key=%s value=%r", key, fact.value)
+            logger.debug(
+                "Rule 0 — skip past fact: key=%s value=%r", key, fact.value)
             return False
 
         current = profile.get(key)
@@ -154,7 +167,8 @@ class AggregatorAgent:
         # ── Rule 1: First-time key ─────────────────────────────────────────
         if current is None:
             profile[key] = _build_entry(fact, session_id, status="new")
-            logger.debug("Rule 1 — new key: %s = %r (conf=%.2f)", key, fact.value, fact.confidence)
+            logger.debug("Rule 1 — new key: %s = %r (conf=%.2f)",
+                         key, fact.value, fact.confidence)
             return True
 
         # From here, `current` is an existing entry dict.
@@ -164,7 +178,8 @@ class AggregatorAgent:
         if fact.source_rank == "user_correction":
             old_value = current.get("value", "")
             change = f"{old_value} → {fact.value}" if old_value != fact.value else ""
-            profile[key] = _build_entry(fact, session_id, status="updated", change_detected=change)
+            profile[key] = _build_entry(
+                fact, session_id, status="updated", change_detected=change)
             logger.info(
                 "Rule 2 — user correction: %s %r → %r (conf=%.2f)",
                 key, old_value, fact.value, fact.confidence,
@@ -197,7 +212,8 @@ class AggregatorAgent:
         if fact.confidence >= threshold:
             old_value = current.get("value", "")
             change = f"{old_value} → {fact.value}" if old_value != fact.value else ""
-            profile[key] = _build_entry(fact, session_id, status="updated", change_detected=change)
+            profile[key] = _build_entry(
+                fact, session_id, status="updated", change_detected=change)
             logger.info(
                 "Rule 5 — better fact: %s %r → %r (conf %.2f → %.2f)",
                 key, old_value, fact.value, current_conf, fact.confidence,
@@ -207,6 +223,7 @@ class AggregatorAgent:
         # ── Rule 6: True conflict (should rarely reach here) ──────────────
         logger.warning(
             "Rule 6 — true conflict (keeping current): key=%s current=%r (%.2f) vs new=%r (%.2f)",
-            key, current.get("value"), current_conf, fact.value, fact.confidence,
+            key, current.get(
+                "value"), current_conf, fact.value, fact.confidence,
         )
         return False

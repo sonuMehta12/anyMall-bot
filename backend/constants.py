@@ -441,7 +441,15 @@ GAP_LADDER_ALL_KEYS: list[str] = [
 ]
 
 
-# ── 10. Intent Type Constants ─────────────────────────────────────────────────
+# ── 10. Default IDs (Phase 1C — single pet, single user) ─────────────────────
+#
+# Hardcoded for Phase 1C. Multi-pet/multi-user support comes in Phase 4+.
+
+DEFAULT_PET_ID: str = "luna-001"
+DEFAULT_USER_ID: str = "shara-001"
+
+
+# ── 11. Intent Type Constants ─────────────────────────────────────────────────
 #
 # These strings identify what kind of message the user sent.
 # Used by classify_intent() and build_deeplink() to decide the routing.
@@ -454,7 +462,7 @@ INTENT_HEALTH: str  = "health"    # medical concern → redirect to Health modul
 INTENT_FOOD: str    = "food"      # diet / nutrition question → redirect to Food module
 
 
-# ── 11. Urgency Level Constants ───────────────────────────────────────────────
+# ── 12. Urgency Level Constants ───────────────────────────────────────────────
 #
 # Used inside the deeplink payload to tell the mobile app how urgently to
 # present the redirect button.
@@ -467,7 +475,7 @@ URGENCY_MEDIUM: str = "medium"
 URGENCY_LOW: str    = "low"
 
 
-# ── 12. Intent classification ─────────────────────────────────────────────────
+# ── 13. Intent classification ─────────────────────────────────────────────────
 #
 # Intent classification (health/food routing and urgency levels) is handled by
 # IntentClassifier (app/agents/intent_classifier.py) via LLM — no keyword lists

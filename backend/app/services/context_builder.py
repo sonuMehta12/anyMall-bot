@@ -1,40 +1,28 @@
 # app/services/context_builder.py
 #
-# Replaces dummy_context.py.
-#
-# Reads pet context from JSON files in data/ and returns the same 5 values
-# that Agent 1 needs on every request:
+# Builds the 5 context values Agent 1 needs on every request:
 #   (active_profile_dict, gap_list, pet_summary, pet_history, relationship_context)
 #
-# On first run (no JSON files exist), seeds with hardcoded Luna + Shara defaults
-# so the system works identically to the old dummy_context.py.
+# Two loaders:
+#   load_profiles_from_db()  — Phase 1C. Reads from PostgreSQL, seeds if empty.
+#   load_profiles()          — DEPRECATED (Phase 1B). Reads from JSON files.
+#                              Kept only for backward compatibility with older tests.
 #
-# Called every request — reads from disk, no caching.
-# Sub-millisecond for < 10 KB files. Cache invalidation complexity not worth it.
-#
-# Phase 1C: replace file reads with PostgreSQL queries. This module's public
-# interface (build_context) stays the same — callers don't change.
+# build_context() accepts in-memory dicts from app.state. No DB or disk I/O
+# on the hot path. Callers don't change.
 
 import logging
 from datetime import date
 
-from app.storage.file_store import (
-    read_pet_profile,
-    write_pet_profile,
-    read_active_profile,
-    write_active_profile,
-    read_user_profile,
-    write_user_profile,
-)
-from constants import FULL_FIELD_LIST
+from constants import DEFAULT_PET_ID, DEFAULT_USER_ID, FULL_FIELD_LIST
 
 logger = logging.getLogger(__name__)
 
 
 # ── Seed defaults ─────────────────────────────────────────────────────────────
 #
-# Same data that was in dummy_context.py. Written to JSON files on first run.
-# After that, JSON files are the source of truth.
+# Same data that was in dummy_context.py. Seeded to PostgreSQL on first startup.
+# After that, the database is the source of truth.
 
 _DEFAULT_PET_PROFILE: dict = {
     "pet_id": "luna-001",
@@ -54,23 +42,23 @@ _DEFAULT_ACTIVE_PROFILE: dict = {
     ),
     "diet_type": {
         "value": "raw food",
-        "confidence": 80,
+        "confidence": 0.80,
     },
     "medications": {
         "value": "antibiotics (ear infection)",
-        "confidence": 90,
+        "confidence": 0.90,
     },
     "energy_level": {
         "value": "moderate",
-        "confidence": 70,
+        "confidence": 0.70,
     },
     "neutered_spayed": {
         "value": "yes",
-        "confidence": 85,
+        "confidence": 0.85,
     },
     "chronic_illness": {
         "value": "none",
-        "confidence": 75,
+        "confidence": 0.75,
     },
 }
 
@@ -180,17 +168,22 @@ def _build_pet_summary(pet_profile: dict, active_entries: dict) -> str:
     return summary
 
 
-# ── Load profiles (called once at startup) ───────────────────────────────────
+# ── Load profiles from JSON (DEPRECATED — Phase 1B) ─────────────────────────
 
 def load_profiles() -> dict[str, dict]:
     """
-    Read all three profile files from disk, seeding defaults if needed.
+    DEPRECATED — Phase 1C uses load_profiles_from_db() instead.
+    Kept for backward compatibility with tests that don't use a database.
 
-    Called once at startup by lifespan() in main.py.  The returned dicts are
-    stored on app.state and used as the in-memory source of truth for the
-    entire server lifetime.  Disk is only read here — after this, all reads
-    come from memory.
+    Read all three profile files from disk, seeding defaults if needed.
+    Uses lazy import to avoid importing file_store at module level.
     """
+    from app.storage.file_store import (
+        read_pet_profile, write_pet_profile,
+        read_active_profile, write_active_profile,
+        read_user_profile, write_user_profile,
+    )
+
     pet = read_pet_profile()
     if pet is None:
         logger.info("pet_profile.json not found — seeding with Luna defaults.")
@@ -208,6 +201,45 @@ def load_profiles() -> dict[str, dict]:
         logger.info("user_profile.json not found — seeding with Shara defaults.")
         user = dict(_DEFAULT_USER_PROFILE)
         write_user_profile(user)
+
+    return {"active": active, "pet": pet, "user": user}
+
+
+# ── Load profiles from PostgreSQL (Phase 1C) ────────────────────────────────
+
+async def load_profiles_from_db(
+    pet_repo,
+    user_repo,
+    active_repo,
+) -> dict[str, dict]:
+    """
+    Read all profiles from PostgreSQL, seeding Luna + Shara defaults if empty.
+
+    Called once at startup by lifespan() in main.py.  Same contract as
+    load_profiles() — returns {"active": dict, "pet": dict, "user": dict}.
+
+    Args:
+        pet_repo: PetRepo instance (from app.db.repositories).
+        user_repo: UserRepo instance.
+        active_repo: ActiveProfileRepo instance.
+    """
+    pet = await pet_repo.read(DEFAULT_PET_ID)
+    if pet is None:
+        logger.info("No pet in DB — seeding Luna defaults.")
+        await pet_repo.upsert(_DEFAULT_PET_PROFILE)
+        pet = dict(_DEFAULT_PET_PROFILE)
+
+    active = await active_repo.read_all(DEFAULT_PET_ID)
+    if active is None:
+        logger.info("No active_profile in DB — seeding defaults.")
+        await active_repo.write_all(DEFAULT_PET_ID, _DEFAULT_ACTIVE_PROFILE)
+        active = dict(_DEFAULT_ACTIVE_PROFILE)
+
+    user = await user_repo.read(DEFAULT_USER_ID)
+    if user is None:
+        logger.info("No user in DB — seeding Shara defaults.")
+        await user_repo.upsert(_DEFAULT_USER_PROFILE)
+        user = dict(_DEFAULT_USER_PROFILE)
 
     return {"active": active, "pet": pet, "user": user}
 
@@ -237,7 +269,10 @@ def build_context(
     """
 
     # ── 1. Resolve pet_profile ───────────────────────────────────────────────
+    # In Phase 1C, profiles always come from app.state (populated from DB at
+    # startup). The None fallback is a deprecated path for old tests only.
     if pet_profile is None:
+        from app.storage.file_store import read_pet_profile, write_pet_profile
         pet_profile = read_pet_profile()
         if pet_profile is None:
             logger.info("pet_profile.json not found — seeding with Luna defaults.")
@@ -247,6 +282,7 @@ def build_context(
     # ── 2. Resolve active_profile ────────────────────────────────────────────
     active_raw = active_profile_raw
     if active_raw is None:
+        from app.storage.file_store import read_active_profile, write_active_profile
         active_raw = read_active_profile()
         if active_raw is None:
             logger.info("active_profile.json not found — seeding with defaults.")
@@ -255,6 +291,7 @@ def build_context(
 
     # ── 3. Resolve user_profile ──────────────────────────────────────────────
     if user_profile is None:
+        from app.storage.file_store import read_user_profile, write_user_profile
         user_profile = read_user_profile()
         if user_profile is None:
             logger.info("user_profile.json not found — seeding with Shara defaults.")

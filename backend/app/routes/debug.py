@@ -3,20 +3,22 @@
 # Debug endpoints — development only, remove in Phase 4.
 #
 # What lives here:
-#   - GET /debug/facts    — Compressor output (fact_log.json)
-#   - GET /debug/profile  — Aggregator output (active_profile.json)
+#   - GET /debug/facts    — Compressor output (fact_log table)
+#   - GET /debug/profile  — Aggregator output (active_profile table)
 #
 # GET /confidence lives in main.py (must be defined directly on the app
 # to take priority over the catch-all frontend route).
 #
-# These endpoints read directly from JSON files — no shared state needed.
+# Phase 1C: reads from PostgreSQL instead of JSON files.
 
 import logging
 from typing import Any
 
 from fastapi import APIRouter
 
-from app.storage.file_store import read_fact_log, read_active_profile
+from app.db.session import get_session
+from app.db.repositories import FactLogRepo, ActiveProfileRepo
+from constants import DEFAULT_PET_ID
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ async def debug_facts(
     limit: int = 20,
 ) -> dict[str, Any]:
     """
-    Returns the most recent entries from data/fact_log.json.
+    Returns the most recent entries from the fact_log table.
 
     Query params:
         session_id  — filter to one session (omit for all sessions)
@@ -40,31 +42,31 @@ async def debug_facts(
     is NOT in the /chat response — poll this endpoint instead.
     """
     limit = min(limit, 100)
-    all_facts = read_fact_log()
 
-    if session_id:
-        all_facts = [f for f in all_facts if f.get("session_id") == session_id]
-
-    recent = all_facts[-limit:]   # most recent N entries
-    recent.reverse()              # newest first
+    async with get_session() as session:
+        repo = FactLogRepo(session)
+        facts = await repo.read_recent(DEFAULT_PET_ID, session_id=session_id, limit=limit)
 
     return {
-        "count": len(recent),
+        "count": len(facts),
         "session_id_filter": session_id,
-        "facts": recent,
+        "facts": facts,
     }
 
 
 @router.get("/profile", summary="Active profile — current best-known facts")
 async def debug_profile() -> dict[str, Any]:
     """
-    Returns the current active_profile.json contents.
+    Returns the current active_profile from the database.
 
     This is how you see Agent 3 (Aggregator) output.
     After each /chat with extractable facts, the Aggregator merges
     high-confidence facts into the active profile.
     """
-    profile = read_active_profile()
+    async with get_session() as session:
+        repo = ActiveProfileRepo(session)
+        profile = await repo.read_all(DEFAULT_PET_ID)
+
     if profile is None:
         return {"status": "no_profile", "field_count": 0, "profile": {}}
 

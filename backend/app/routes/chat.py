@@ -27,8 +27,9 @@ from app.agents.state import AgentState
 from app.services.guardrails import apply_guardrails
 from app.services.deeplink import build_deeplink
 from app.services.context_builder import build_context
-from constants import INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM
-from app.storage.file_store import append_fact_log
+from constants import INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM, DEFAULT_PET_ID
+from app.db.session import get_session
+from app.db.repositories import FactLogRepo
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 
 logger = logging.getLogger(__name__)
@@ -337,7 +338,7 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
     Fire-and-forget coroutine launched by asyncio.create_task() after /chat returns.
 
     Runs the Compressor, splits facts by confidence threshold, and persists to
-    data/fact_log.json. User never waits for any of this.
+    PostgreSQL fact_log table. User never waits for any of this.
 
     Never raises — any exception is caught and logged. A crash here must not
     affect the user-facing response that was already sent.
@@ -370,7 +371,10 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
                 }
                 for f in facts
             ]
-            append_fact_log(to_log)
+            # Phase 1C: write to PostgreSQL instead of JSON file.
+            async with get_session() as session:
+                repo = FactLogRepo(session)
+                await repo.append(to_log, pet_id=DEFAULT_PET_ID)
 
         logger.info(
             "Compressor done — session=%s extracted=%d high=%d low=%d",

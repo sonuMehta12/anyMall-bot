@@ -2,12 +2,12 @@
   "project": "AnyMall-chan Backend",
   "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
   "last_updated": "2026-03-13",
-  "state": "phase-1b-complete",
+  "state": "phase-1c-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
-  "current_focus": "phase-1c-database (reviewer feedback v1 + in-memory optimization done)",
+  "current_focus": "phase-2-thread-management (Redis deferred — decision pending, see ft-005)",
 
-  "storage_strategy": "File-based JSON storage (data/ directory) until all agent logic is proven. PostgreSQL replaces it in Phase 1C. Agent 2 and Agent 3 code will not change when that swap happens.",
+  "storage_strategy": "PostgreSQL (Phase 1C complete). app/db/ layer — session.py, models.py, repositories.py. file_store.py deprecated, scheduled for cleanup. Agent code never changed. NOTE: conversation messages (app.state.sessions) are in-memory only — NOT persisted to PostgreSQL yet, lost on restart. Phase 2 (thread management) will add write-through persistence for messages.",
 
   "phases": [
 
@@ -385,89 +385,184 @@
       "name": "Real Database — Swap JSON Files for PostgreSQL",
       "description": "Replace file-based JSON storage with real PostgreSQL. context_builder.py already exists (reads JSON now, will read Postgres later). Agent 2 and Agent 3 code does not change.",
       "goal": "Profile facts extracted from conversation, stored in Postgres, loaded for next session.",
-      "status": "not-started",
+      "status": "complete",
       "features": [
         {
           "id": "p1c-001",
-          "name": "docker-compose.yml — Postgres + Redis",
-          "complete": false,
-          "tested": false,
+          "name": "docker-compose.yml — PostgreSQL container",
+          "complete": true,
+          "tested": true,
           "files": ["docker-compose.yml"],
-          "notes": "PostgreSQL 16 on port 5432. Redis 7 on port 6379."
+          "notes": "PostgreSQL 16 Alpine on port 5433 (not 5432 — avoids conflict with local installs). Named volume pgdata for persistence."
         },
         {
           "id": "p1c-002",
           "name": "Add DB packages to requirements.txt",
-          "complete": false,
-          "tested": false,
+          "complete": true,
+          "tested": true,
           "files": ["requirements.txt"],
-          "notes": "Add: sqlalchemy[asyncio], asyncpg, alembic, redis."
+          "notes": "Added: sqlalchemy[asyncio], asyncpg, alembic."
         },
         {
           "id": "p1c-003",
-          "name": "Add DATABASE_URL and REDIS_URL to config",
-          "complete": false,
-          "tested": false,
+          "name": "Add DATABASE_URL to config + env files",
+          "complete": true,
+          "tested": true,
           "files": [".env.example", "app/core/config.py"],
-          "notes": "DATABASE_URL format: postgresql+asyncpg://user:pass@localhost:5432/anymallchan"
+          "notes": "DATABASE_URL in Settings with default pointing to local Docker container. .env.example uses placeholder credentials."
         },
         {
           "id": "p1c-004",
-          "name": "app/db/ — ORM models + repositories",
-          "complete": false,
-          "tested": false,
-          "files": ["app/db/session.py", "app/db/models/", "app/db/repositories/"],
-          "notes": "Same interface as file_store.py. Swap in without changing agent code."
+          "name": "app/db/ — session, ORM models, repositories",
+          "complete": true,
+          "tested": true,
+          "files": ["app/db/__init__.py", "app/db/session.py", "app/db/models.py", "app/db/repositories.py"],
+          "notes": "4 tables: pets, users, active_profile, fact_log. Repository pattern — same dict interface as file_store.py. Agents unchanged."
         },
         {
           "id": "p1c-005",
-          "name": "Alembic setup + initial migration",
-          "complete": false,
-          "tested": false,
-          "files": ["alembic.ini", "migrations/"],
-          "notes": "Creates 5 tables: pets, fact_log, active_profile, conversation_log, compressed_history."
+          "name": "Alembic setup + migrations",
+          "complete": true,
+          "tested": true,
+          "files": ["alembic.ini", "migrations/env.py", "migrations/versions/"],
+          "notes": "Two migrations: initial tables + indexes/field_key widening (from review). alembic upgrade head creates all tables."
         },
         {
           "id": "p1c-006",
-          "name": "app/services/context_builder.py — swap JSON reads for PostgreSQL",
-          "complete": false,
-          "tested": false,
+          "name": "context_builder.py — load_profiles_from_db()",
+          "complete": true,
+          "tested": true,
           "files": ["app/services/context_builder.py"],
-          "notes": "context_builder.py already exists and reads JSON files. Phase 1C: change it to query PostgreSQL instead."
+          "notes": "New load_profiles_from_db() reads from PostgreSQL, seeds Luna+Shara defaults on first run. Old load_profiles() kept for backward compat but deprecated."
+        },
+        {
+          "id": "p1c-007",
+          "name": "main.py — DB init in lifespan + shutdown grace period",
+          "complete": true,
+          "tested": true,
+          "files": ["app/main.py"],
+          "notes": "init_db() at startup. asyncio.sleep(2) before dispose_engine() — lets background tasks finish writes. Aggregator receives get_session factory."
+        },
+        {
+          "id": "p1c-008",
+          "name": "aggregator.py — write-through to PostgreSQL",
+          "complete": true,
+          "tested": true,
+          "files": ["app/agents/aggregator.py"],
+          "notes": "Constructor receives get_session factory. After merging facts, writes active_profile to DB. Rules 0-6 unchanged."
+        },
+        {
+          "id": "p1c-009",
+          "name": "chat.py — FactLog writes to PostgreSQL",
+          "complete": true,
+          "tested": true,
+          "files": ["app/routes/chat.py"],
+          "notes": "_run_background() creates own session, appends facts to fact_log table via FactLogRepo."
+        },
+        {
+          "id": "p1c-010",
+          "name": "debug.py — reads from PostgreSQL",
+          "complete": true,
+          "tested": true,
+          "files": ["app/routes/debug.py"],
+          "notes": "GET /debug/facts and GET /debug/profile now query PostgreSQL via repositories."
+        },
+        {
+          "id": "p1c-011",
+          "name": "Code review + fixes (2 reviews combined)",
+          "complete": true,
+          "tested": true,
+          "files": ["alembic.ini", ".env.example", "app/db/models.py", "app/db/repositories.py", "app/agents/aggregator.py", "app/services/context_builder.py", "app/main.py", "constants.py"],
+          "notes": "Fixed: alembic.ini credentials, missing fact_log indexes, bulk insert, seed data float types, dead imports, stale docstrings, shutdown grace period, DEFAULT_PET_ID constant, __repr__ on models."
+        },
+        {
+          "id": "p1c-012",
+          "name": "e2e tests — updated for PostgreSQL (30 tests)",
+          "complete": true,
+          "tested": true,
+          "files": ["tests/run_e2e.py"],
+          "notes": "facts_for() now calls GET /debug/facts instead of reading fact_log.json. 6 new PostgreSQL-specific tests. 29/30 pass (1 LLM flake)."
         }
       ]
     },
 
     {
       "id": "phase-2",
-      "name": "Redis Cache",
-      "description": "Add Redis for fast profile retrieval. Cache-aside pattern.",
-      "goal": "Active profile loaded from Redis in <5ms instead of hitting Postgres every request.",
+      "name": "Thread & Conversation Management",
+      "description": "Implement conversation threads with 24-hour hard boundary. Persist every message to PostgreSQL (write-through). Replace the raw session dict in app.state.sessions with a proper Thread model. Redis/KeyVal deferred — decision pending (see ft-005).",
+      "goal": "Every message persisted to PostgreSQL. 24h thread boundary enforced. Server restart does not lose conversation history. Agent 1 still reads from in-memory hot storage (same pattern as active_profile).",
       "status": "not-started",
+      "decisions": [
+        "Thread = 24h hard deadline from started_at (not idle timeout). Thread closed at started_at + 24h regardless of activity.",
+        "Write-through pattern: append to app.state.sessions[thread_id] (memory) AND insert to thread_messages table (PostgreSQL) on every message.",
+        "Read from memory (app.state.sessions) — no DB hit on hot path.",
+        "On server restart: reload active thread messages from PostgreSQL back into memory (same pattern as active_profile reload).",
+        "Redis deferred — in-memory dict stays as hot storage for now. Redis replaces it later (ft-005)."
+      ],
       "features": [
         {
           "id": "p2-001",
-          "name": "app/db/redis_client.py — Redis connection",
+          "name": "threads ORM model + migration",
           "complete": false,
           "tested": false,
-          "files": ["app/db/redis_client.py"],
-          "notes": "Use redis.asyncio (built into redis-py 5+)"
+          "files": ["app/db/models.py", "migrations/versions/"],
+          "notes": "New Thread ORM model. Columns: id (SERIAL), thread_id (UUID, unique), pet_id, user_id, started_at, expires_at (started_at + 24h), status (active/expired), compaction_summary TEXT NULL (LLM summary of older messages — updated in place on each compaction, NULL if no compaction yet). Alembic migration."
         },
         {
           "id": "p2-002",
-          "name": "Cache-aside for active_profile",
+          "name": "thread_messages ORM model + migration",
           "complete": false,
           "tested": false,
-          "files": ["app/services/context_builder.py", "app/agents/aggregator.py"],
-          "notes": "Try Redis GET before hitting Postgres. On miss: load from Postgres, SET in Redis TTL=3600."
+          "files": ["app/db/models.py", "migrations/versions/"],
+          "notes": "New ThreadMessage ORM model. Columns: id (SERIAL), thread_id (FK), role (user/assistant), content (Text), timestamp. Index on thread_id for fast reads."
         },
         {
           "id": "p2-003",
-          "name": "Cache health_check result (60s TTL)",
+          "name": "ThreadRepo + ThreadMessageRepo",
           "complete": false,
           "tested": false,
-          "files": ["app/llm/azure_openai.py"],
-          "notes": "Stop making real Azure API calls on every /health ping."
+          "files": ["app/db/repositories.py"],
+          "notes": "ThreadRepo: create(), get_active(pet_id), expire(thread_id). ThreadMessageRepo: append(thread_id, role, content), read_thread(thread_id)."
+        },
+        {
+          "id": "p2-004",
+          "name": "Thread boundary logic in chat.py",
+          "complete": false,
+          "tested": false,
+          "files": ["app/routes/chat.py"],
+          "notes": "On each request: check if active thread exists and is within 24h. If expired or missing: create new thread. Write-through: append message to memory AND PostgreSQL. Return thread_id in ChatResponse."
+        },
+        {
+          "id": "p2-005",
+          "name": "Reload active thread on startup (main.py lifespan)",
+          "complete": false,
+          "tested": false,
+          "files": ["app/main.py"],
+          "notes": "On startup: query threads table for active threads (status=active, expires_at > now). Load their messages from thread_messages into app.state.sessions. Same pattern as load_profiles_from_db()."
+        },
+        {
+          "id": "p2-006",
+          "name": "Update session-management.md",
+          "complete": true,
+          "tested": true,
+          "files": ["design-docs/session-management.md"],
+          "notes": "Rewritten 2026-03-14. Thread terminology, 24h hard boundary, write-through pattern, no Redis (deferred), PostgreSQL cold storage, compaction strategy added."
+        },
+        {
+          "id": "p2-007",
+          "name": "Thread summarizer service",
+          "complete": false,
+          "tested": false,
+          "files": ["app/services/thread_summarizer.py"],
+          "notes": "Single LLM service handling two scenarios: (1) In-session compaction: triggered at THREAD_COMPACTION_THRESHOLD messages (default 50). Summarizes older messages, updates threads.compaction_summary in place. Clears old messages from app.state.sessions, keeps last THREAD_CONTEXT_WINDOW messages (default 20). (2) Cross-thread context: when new thread starts, load previous thread's compaction_summary and pass to Agent 1. Same service, same summary field. temperature=0.0. Fire-and-forget (does not block user response)."
+        },
+        {
+          "id": "p2-008",
+          "name": "Wire compaction_summary into Agent 1 context",
+          "complete": false,
+          "tested": false,
+          "files": ["app/services/context_builder.py", "app/agents/conversation.py"],
+          "notes": "build_context() loads compaction_summary from threads table for the active thread (or most recent expired thread for new threads). Passed to Agent 1 as a new context field: conversation_summary. Agent 1 prompt updated to include [CONVERSATION SUMMARY] section before recent messages."
         }
       ]
     },
@@ -601,6 +696,30 @@
 
   "future_tasks": [
     {
+      "id": "ft-002",
+      "name": "Cleanup — delete file_store.py and app/models/context.py",
+      "description": "Both files are deprecated since Phase 1C. file_store.py replaced by repositories.py. context.py replaced by db/models.py. Remove both once all import references are cleaned up. Also delete the data/ directory (old JSON files, no longer written to).",
+      "files": ["app/storage/file_store.py", "app/models/context.py", "data/"],
+      "status": "not-started",
+      "priority": "medium"
+    },
+    {
+      "id": "ft-003",
+      "name": "Wire x-user-code header — multi-user pet_id resolution",
+      "description": "Senior's requirement: Flutter sends x-user-code header with every request. THREE things must change together: (1) Read x-user-code header in chat.py, query UserRepo to get pet_id for that user. (2) Pass real pet_id down to _run_background() so FactLogRepo.append() and Aggregator.run() write to the correct pet rows — currently both hardcode DEFAULT_PET_ID='luna-001'. (3) app.state.active_profile is currently ONE dict (only Luna's profile). For multi-user it must become a dict-of-dicts keyed by pet_id, OR be replaced entirely by Redis (Phase 2). The repositories already accept pet_id as a parameter — only the wiring is missing. IMPORTANT: Do NOT implement this in isolation — coordinate with Phase 2 (Redis) since Redis is intended to replace the in-memory app.state profile store. The users table already exists with user_code column.",
+      "files": ["app/routes/chat.py", "app/agents/aggregator.py", "app/db/repositories.py", "app/main.py"],
+      "status": "not-started",
+      "priority": "high — required before real users can use the system. Coordinate with Phase 2 Redis design."
+    },
+    {
+      "id": "ft-005",
+      "name": "Redis/KeyVal hot storage — decision pending",
+      "description": "Decide on and implement hot storage technology for conversation threads and active profiles. Options: Redis, Valkey, or other KeyVal store. Currently: in-memory Python dict (app.state.sessions). Write-through to PostgreSQL already implemented in Phase 2. Redis would replace the in-memory dict as a shared hot store — enabling horizontal scaling and survivng restarts without DB reload. COORDINATE with ft-003 (multi-user) — both require restructuring app.state. Build AFTER Phase 2 thread management is stable.",
+      "files": ["app/db/redis_client.py", "app/services/context_builder.py", "app/agents/aggregator.py", "app/routes/chat.py"],
+      "status": "not-started",
+      "priority": "medium — required for horizontal scaling and production multi-user"
+    },
+    {
       "id": "ft-001",
       "name": "Eliminate 4-second confidence bar delay",
       "description": "After a chat message, the Aggregator runs in the background (fire-and-forget). Frontend polls GET /confidence 4s later to pick up the updated score. Three options identified:",
@@ -615,10 +734,10 @@
   ],
 
   "summary": {
-    "total_features": 58,
-    "complete": 43,
+    "total_features": 77,
+    "complete": 56,
     "in_progress": 0,
-    "not_started": 15,
-    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22/22) + Dev Deployment (4) = 43 complete. Dev deployment is TEMPORARY — marked for cleanup by devops team. 24 e2e tests. Next: Phase 1C (PostgreSQL)."
+    "not_started": 21,
+    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22) + Phase 1C (12) + Dev Deployment (4) + session-management.md rewrite (1) = 56 complete. 30 e2e tests (29 pass, 1 LLM flake). Next: Phase 2 (thread management — 7 features remaining). Redis deferred (ft-005). Multi-user deferred (ft-003)."
   }
 }

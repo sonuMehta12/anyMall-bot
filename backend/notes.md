@@ -580,3 +580,117 @@ Agent1.run — pet=Luna  gaps=5  questions_so_far=0
 Agent1 reply — length=120 chars  questions_this_turn=0
 Chat complete — session=... | intent=health | urgency=high | questions=0 | guardrailed=False
 ```
+
+---
+
+## Phase 1C — Completed ✓
+
+### What we built
+
+Replaced all JSON file storage with PostgreSQL. Zero changes to agent logic (Agents 1, 2, 3
+all unchanged). Only the storage layer changed.
+
+**What was stored in JSON files:**
+```
+data/pet_profile.json       → PostgreSQL `pets` table
+data/active_profile.json    → PostgreSQL `active_profile` table
+data/user_profile.json      → PostgreSQL `users` table
+data/fact_log.json          → PostgreSQL `fact_log` table
+```
+
+**New files added:**
+```
+docker-compose.yml              PostgreSQL 16 Alpine container (port 5433)
+alembic.ini                     Alembic migration config
+migrations/                     Migration scripts (version history of DB changes)
+app/db/session.py               Async engine + session factory + get_session()
+app/db/models.py                SQLAlchemy ORM models (4 tables)
+app/db/repositories.py          PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo
+```
+
+**Files modified:**
+```
+app/core/config.py              Added database_url setting
+app/main.py                     DB init in lifespan, shutdown grace period
+app/services/context_builder.py load_profiles_from_db() — reads from DB, seeds defaults
+app/agents/aggregator.py        Writes active_profile to DB after merging
+app/routes/chat.py              FactLog writes to DB via FactLogRepo
+app/routes/debug.py             Reads from DB instead of JSON files
+```
+
+**Files deprecated (not deleted yet — cleanup task ft-002):**
+```
+app/storage/file_store.py       Replaced by repositories.py
+app/models/context.py           Replaced by db/models.py
+data/                           Old JSON files — no longer written to
+```
+
+### The in-memory profile pattern (critical design decision)
+
+The app does NOT hit the database on every chat request. That would be slow.
+
+Instead:
+1. **Startup** — `load_profiles_from_db()` reads all profiles from PostgreSQL once, stores them in `app.state`
+2. **Every request** — reads from `app.state` (memory). Sub-millisecond. No DB hit.
+3. **After Aggregator runs** — `app.state.active_profile` is mutated in memory AND written through to PostgreSQL for persistence.
+
+This means: reads are instant (memory), writes are async (background task to DB), and data survives server restarts (PostgreSQL).
+
+```
+Startup:   PostgreSQL → app.state  (load once)
+Requests:  app.state → Agent 1     (read from memory, no DB)
+Aggregator: new fact → app.state + PostgreSQL  (write both)
+Restart:   PostgreSQL → app.state  (reload from DB — data survived)
+```
+
+### How the repository pattern works
+
+Repositories are the ONLY code that knows about SQLAlchemy. Everything above them
+(agents, services, routes) receives plain Python dicts — the same shape they always got
+from file_store.py. The agents never knew data came from JSON files before. They don't
+know it comes from PostgreSQL now either. That's the design.
+
+```
+PostgreSQL
+   ↓
+repositories.py    (only layer that knows SQL/ORM)
+   ↓  returns plain dicts
+context_builder, agents, routes  (just use dicts, know nothing about DB)
+```
+
+### Known gaps (tracked in future_tasks)
+
+**ft-002 — Cleanup:** `file_store.py` and `context.py` still exist but are dead code.
+Delete once confirmed nothing imports them.
+
+**ft-003 — x-user-code header:** Senior's requirement was to read `x-user-code` HTTP
+header from Flutter requests, look up the user in the `users` table, and use their
+`pet_id` instead of the hardcoded `DEFAULT_PET_ID = "luna-001"`. The `users` table
+exists, the repositories accept `pet_id` as a parameter, but the header reading and
+wiring was never done. Currently all facts are written to Luna's rows regardless of
+which user is chatting. Must be fixed before real multi-user deployment.
+
+### Key decisions made
+
+**Repository pattern over plain functions:**
+file_store.py used plain functions. We switched to classes because each repository
+needs a database session — passing it once to the constructor is cleaner than
+passing it to every method call.
+
+**DELETE+INSERT for active_profile (not UPSERT):**
+We delete all rows for a pet then insert fresh. This ensures the DB matches the
+in-memory dict exactly — including deletions. A per-field UPSERT would leave
+orphaned rows for fields that were removed from the profile.
+Tradeoff: a concurrent reader between DELETE and INSERT sees an empty profile for
+a fraction of a second. Acceptable in Phase 1C (single user, asyncio Lock prevents
+concurrent writes). Revisit in Phase 4 with multi-user.
+
+**Aggregator receives `get_session` factory, not a session:**
+The Aggregator is created once at startup but runs in background tasks — one per
+chat message. Each background task needs its own session. Passing the factory lets
+the Aggregator create a fresh session each time it writes, then close it.
+
+**`asyncio.sleep(2)` before dispose_engine() at shutdown:**
+Background tasks (Compressor + Aggregator) run after the user gets their reply.
+Without the sleep, shutting down the server while a background task is mid-write
+would kill the DB connection. 2 seconds gives in-flight writes time to finish.
