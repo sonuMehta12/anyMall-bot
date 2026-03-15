@@ -1,13 +1,13 @@
 {
   "project": "AnyMall-chan Backend",
   "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
-  "last_updated": "2026-03-13",
-  "state": "phase-1c-complete",
+  "last_updated": "2026-03-15",
+  "state": "phase-2-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
-  "current_focus": "phase-2-thread-management (Redis deferred — decision pending, see ft-005)",
+  "current_focus": "API handover prep (2026-03-16) → phase-2-review-fixes → remaining tasks",
 
-  "storage_strategy": "PostgreSQL (Phase 1C complete). app/db/ layer — session.py, models.py, repositories.py. file_store.py deprecated, scheduled for cleanup. Agent code never changed. NOTE: conversation messages (app.state.sessions) are in-memory only — NOT persisted to PostgreSQL yet, lost on restart. Phase 2 (thread management) will add write-through persistence for messages.",
+  "storage_strategy": "PostgreSQL (Phase 1C complete). Phase 2 adds write-through message persistence: app.state.sessions[thread_id] (in-memory) + thread_messages table (PostgreSQL). Active threads reloaded from DB on startup. Thread compaction via LLM summarizer at 50 messages. Redis deferred (ft-005).",
 
   "phases": [
 
@@ -491,7 +491,8 @@
       "name": "Thread & Conversation Management",
       "description": "Implement conversation threads with 24-hour hard boundary. Persist every message to PostgreSQL (write-through). Replace the raw session dict in app.state.sessions with a proper Thread model. Redis/KeyVal deferred — decision pending (see ft-005).",
       "goal": "Every message persisted to PostgreSQL. 24h thread boundary enforced. Server restart does not lose conversation history. Agent 1 still reads from in-memory hot storage (same pattern as active_profile).",
-      "status": "not-started",
+      "status": "complete",
+      "review": "design-docs/phase-2-review-report.md — 4 critical, 8 warnings, 5 suggestions. See ft-006.",
       "decisions": [
         "Thread = 24h hard deadline from started_at (not idle timeout). Thread closed at started_at + 24h regardless of activity.",
         "Write-through pattern: append to app.state.sessions[thread_id] (memory) AND insert to thread_messages table (PostgreSQL) on every message.",
@@ -502,67 +503,59 @@
       "features": [
         {
           "id": "p2-001",
-          "name": "threads ORM model + migration",
-          "complete": false,
-          "tested": false,
-          "files": ["app/db/models.py", "migrations/versions/"],
-          "notes": "New Thread ORM model. Columns: id (SERIAL), thread_id (UUID, unique), pet_id, user_id, started_at, expires_at (started_at + 24h), status (active/expired), compaction_summary TEXT NULL (LLM summary of older messages — updated in place on each compaction, NULL if no compaction yet). Alembic migration."
+          "name": "threads + thread_messages ORM models + migration",
+          "complete": true,
+          "tested": true,
+          "files": ["app/db/models.py", "migrations/versions/a3b7c2d4e5f6_add_threads_and_thread_messages_tables.py"],
+          "notes": "Thread model: thread_id (UUID unique), pet_id, user_id, started_at, expires_at, status, compaction_summary. ThreadMessage model: thread_id, role, content, timestamp. Both indexed. Hand-written migration (Docker wasn't running for autogenerate)."
         },
         {
           "id": "p2-002",
-          "name": "thread_messages ORM model + migration",
-          "complete": false,
-          "tested": false,
-          "files": ["app/db/models.py", "migrations/versions/"],
-          "notes": "New ThreadMessage ORM model. Columns: id (SERIAL), thread_id (FK), role (user/assistant), content (Text), timestamp. Index on thread_id for fast reads."
+          "name": "ThreadRepo + ThreadMessageRepo",
+          "complete": true,
+          "tested": true,
+          "files": ["app/db/repositories.py"],
+          "notes": "ThreadRepo: create(), get_active(), get_all_active(), expire(), update_compaction_summary(), get_latest_expired(). ThreadMessageRepo: append(), append_batch(), read_thread(). Same constructor injection pattern."
         },
         {
           "id": "p2-003",
-          "name": "ThreadRepo + ThreadMessageRepo",
-          "complete": false,
-          "tested": false,
-          "files": ["app/db/repositories.py"],
-          "notes": "ThreadRepo: create(), get_active(pet_id), expire(thread_id). ThreadMessageRepo: append(thread_id, role, content), read_thread(thread_id)."
+          "name": "Thread boundary logic + write-through + compaction in chat.py",
+          "complete": true,
+          "tested": true,
+          "files": ["app/routes/chat.py", "app/agents/state.py"],
+          "notes": "Thread boundary: create/reuse/expire threads per pet. Write-through: in-memory sync + DB async via _run_background(). Compaction: _run_compaction() at 50 messages. ChatResponse gains thread_id + new_thread. AgentState gains thread_id."
         },
         {
           "id": "p2-004",
-          "name": "Thread boundary logic in chat.py",
-          "complete": false,
-          "tested": false,
-          "files": ["app/routes/chat.py"],
-          "notes": "On each request: check if active thread exists and is within 24h. If expired or missing: create new thread. Write-through: append message to memory AND PostgreSQL. Return thread_id in ChatResponse."
+          "name": "Reload active threads on startup",
+          "complete": true,
+          "tested": true,
+          "files": ["app/main.py"],
+          "notes": "Startup: load active threads + messages from PostgreSQL into app.state.sessions. ThreadSummarizer initialized on app.state."
         },
         {
           "id": "p2-005",
-          "name": "Reload active thread on startup (main.py lifespan)",
-          "complete": false,
-          "tested": false,
-          "files": ["app/main.py"],
-          "notes": "On startup: query threads table for active threads (status=active, expires_at > now). Load their messages from thread_messages into app.state.sessions. Same pattern as load_profiles_from_db()."
+          "name": "Thread summarizer service",
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/thread_summarizer.py"],
+          "notes": "LLM summarizer (temp=0.0, max_tokens=400). Handles in-session compaction + cross-thread continuity. Fire-and-forget."
         },
         {
           "id": "p2-006",
-          "name": "Update session-management.md",
+          "name": "Wire conversation_summary into Agent 1",
           "complete": true,
           "tested": true,
-          "files": ["design-docs/session-management.md"],
-          "notes": "Rewritten 2026-03-14. Thread terminology, 24h hard boundary, write-through pattern, no Redis (deferred), PostgreSQL cold storage, compaction strategy added."
+          "files": ["app/services/context_builder.py", "app/agents/conversation.py"],
+          "notes": "build_context() returns 6 values (added conversation_summary pass-through). Agent 1 prompt injects CONVERSATION SUMMARY section before pet context."
         },
         {
           "id": "p2-007",
-          "name": "Thread summarizer service",
-          "complete": false,
-          "tested": false,
-          "files": ["app/services/thread_summarizer.py"],
-          "notes": "Single LLM service handling two scenarios: (1) In-session compaction: triggered at THREAD_COMPACTION_THRESHOLD messages (default 50). Summarizes older messages, updates threads.compaction_summary in place. Clears old messages from app.state.sessions, keeps last THREAD_CONTEXT_WINDOW messages (default 20). (2) Cross-thread context: when new thread starts, load previous thread's compaction_summary and pass to Agent 1. Same service, same summary field. temperature=0.0. Fire-and-forget (does not block user response)."
-        },
-        {
-          "id": "p2-008",
-          "name": "Wire compaction_summary into Agent 1 context",
-          "complete": false,
-          "tested": false,
-          "files": ["app/services/context_builder.py", "app/agents/conversation.py"],
-          "notes": "build_context() loads compaction_summary from threads table for the active thread (or most recent expired thread for new threads). Passed to Agent 1 as a new context field: conversation_summary. Agent 1 prompt updated to include [CONVERSATION SUMMARY] section before recent messages."
+          "name": "Debug endpoints + CLAUDE.md + tests",
+          "complete": true,
+          "tested": true,
+          "files": ["app/routes/debug.py", "CLAUDE.md", "tests/run_e2e.py", "design-docs/session-management.md"],
+          "notes": "GET /debug/threads + GET /debug/thread/{id}/messages. CLAUDE.md fully updated. 10 new e2e tests (Section 7). 38/40 pass (2 pre-existing LLM flakes)."
         }
       ]
     },
@@ -709,15 +702,24 @@
       "description": "Senior's requirement: Flutter sends x-user-code header with every request. THREE things must change together: (1) Read x-user-code header in chat.py, query UserRepo to get pet_id for that user. (2) Pass real pet_id down to _run_background() so FactLogRepo.append() and Aggregator.run() write to the correct pet rows — currently both hardcode DEFAULT_PET_ID='luna-001'. (3) app.state.active_profile is currently ONE dict (only Luna's profile). For multi-user it must become a dict-of-dicts keyed by pet_id, OR be replaced entirely by Redis (Phase 2). The repositories already accept pet_id as a parameter — only the wiring is missing. IMPORTANT: Do NOT implement this in isolation — coordinate with Phase 2 (Redis) since Redis is intended to replace the in-memory app.state profile store. The users table already exists with user_code column.",
       "files": ["app/routes/chat.py", "app/agents/aggregator.py", "app/db/repositories.py", "app/main.py"],
       "status": "not-started",
-      "priority": "high — required before real users can use the system. Coordinate with Phase 2 Redis design."
+      "priority": "high — required before real users can use the system. Coordinate with ft-005 (Valkey) and ft-008 (multi-pet)."
     },
     {
       "id": "ft-005",
-      "name": "Redis/KeyVal hot storage — decision pending",
-      "description": "Decide on and implement hot storage technology for conversation threads and active profiles. Options: Redis, Valkey, or other KeyVal store. Currently: in-memory Python dict (app.state.sessions). Write-through to PostgreSQL already implemented in Phase 2. Redis would replace the in-memory dict as a shared hot store — enabling horizontal scaling and survivng restarts without DB reload. COORDINATE with ft-003 (multi-user) — both require restructuring app.state. Build AFTER Phase 2 thread management is stable.",
-      "files": ["app/db/redis_client.py", "app/services/context_builder.py", "app/agents/aggregator.py", "app/routes/chat.py"],
+      "name": "Valkey hot storage — decision made (Valkey, not Redis)",
+      "description": "Implement Valkey as hot storage for conversation threads and active profiles. Valkey is a Redis-compatible open-source fork — any Redis client library (redis-py, aioredis) works unchanged. Replaces in-memory Python dict (app.state.sessions, app.state.active_profile). Write-through to PostgreSQL already implemented in Phase 2. COORDINATE with ft-003 (multi-user) — both require restructuring app.state.",
+      "files": ["app/db/valkey_client.py", "app/services/context_builder.py", "app/agents/aggregator.py", "app/routes/chat.py"],
       "status": "not-started",
-      "priority": "medium — required for horizontal scaling and production multi-user"
+      "priority": "high — required for horizontal scaling and production multi-user"
+    },
+    {
+      "id": "ft-006",
+      "name": "Phase 2 review fixes — 4 critical + 5 quick wins",
+      "description": "Fix issues found in Phase 2 code review (design-docs/phase-2-review-report.md). Split into two batches: (A) Fix now: C1 parse timestamps to datetime before comparing, C2 fix _run_compaction thread lookup, C3 add timestamp to in-memory message dicts, W4+W5 clean up sessions/session_meta on thread expiry. (B) Fix before production: C4 add FK constraint on thread_messages, W1 migrate to DateTime columns, W2 track background tasks for shutdown, W3 add compaction lock, W6 filter expired threads on reload, W8 handle compacted messages on reload.",
+      "files": ["app/routes/chat.py", "app/db/models.py", "app/db/repositories.py", "app/main.py"],
+      "status": "not-started",
+      "priority": "high — batch A before Phase 3, batch B before Phase 4/5",
+      "review_doc": "design-docs/phase-2-review-report.md"
     },
     {
       "id": "ft-001",
@@ -730,14 +732,46 @@
       ],
       "status": "not-started",
       "priority": "low"
+    },
+    {
+      "id": "ft-007",
+      "name": "API path/naming cleanup — match PRD before handover",
+      "description": "Current API routes (POST /chat, GET /confidence, GET /debug/*) may not match PRD naming convention. Review PRD, rename endpoints to match. Document final API contract: what frontend sends (user_id + pet_id only), what backend returns. Backend handles all lookups (user table, pet context, thread state, active profile).",
+      "files": ["app/routes/chat.py", "app/routes/debug.py", "app/main.py"],
+      "status": "not-started",
+      "priority": "URGENT — API handover 2026-03-16"
+    },
+    {
+      "id": "ft-008",
+      "name": "Multi-pet support — two pets per user simultaneously",
+      "description": "New requirement: system must support two pets per user at the same time. Currently DEFAULT_PET_ID is hardcoded, app.state.active_profile is a single dict (Luna only). Needs: (1) active_profile becomes dict-of-dicts keyed by pet_id, (2) threads already have pet_id column — just need to pass real pet_id, (3) frontend sends pet_id with each request. Ties into ft-003 (multi-user wiring) and ft-005 (Valkey).",
+      "files": ["app/routes/chat.py", "app/main.py", "app/services/context_builder.py", "app/agents/aggregator.py"],
+      "status": "not-started",
+      "priority": "high — new product requirement"
+    },
+    {
+      "id": "ft-009",
+      "name": "Multiple LLM providers — OpenAI + Claude/Anthropic",
+      "description": "Currently Azure OpenAI only. Add two new provider implementations: (1) OpenAI direct (not Azure), (2) Claude/Anthropic API. LLMProvider abstract class and factory pattern already exist — just need concrete implementations in app/llm/. Factory reads LLM_PROVIDER env var. Zero agent code changes needed.",
+      "files": ["app/llm/openai.py", "app/llm/anthropic.py", "app/llm/factory.py"],
+      "status": "not-started",
+      "priority": "medium"
+    },
+    {
+      "id": "ft-010",
+      "name": "Web frontend enhancements for staging",
+      "description": "Getting a web version of frontend for internal/staging testing. Current React frontend (frontend/) exists as a test UI. May need enhancements: auth flow, multi-pet switching, better UX for internal testers.",
+      "files": ["frontend/"],
+      "status": "not-started",
+      "priority": "medium"
     }
   ],
 
   "summary": {
-    "total_features": 77,
-    "complete": 56,
+    "total_features": 68,
+    "complete": 63,
     "in_progress": 0,
-    "not_started": 21,
-    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22) + Phase 1C (12) + Dev Deployment (4) + session-management.md rewrite (1) = 56 complete. 30 e2e tests (29 pass, 1 LLM flake). Next: Phase 2 (thread management — 7 features remaining). Redis deferred (ft-005). Multi-user deferred (ft-003)."
+    "not_started": 5,
+    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22) + Phase 1C (12) + Phase 2 (7) + Dev Deployment (4) + session-management.md (1) = 63 complete. 40 e2e tests (38 pass, 2 LLM flakes). Phase 2 review: design-docs/phase-2-review-report.md — fixes tracked in ft-006. Next: ft-006 batch A fixes → Phase 3 (nightly batch jobs)."
   }
 }

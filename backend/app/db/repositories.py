@@ -1,6 +1,6 @@
 # app/db/repositories.py
 #
-# Repository classes for Phase 1C PostgreSQL.
+# Repository classes for AnyMall-chan PostgreSQL layer.
 #
 # Why repositories?
 #   Repositories are the ONLY code that knows about SQLAlchemy models and
@@ -11,6 +11,9 @@
 # Each repository receives an AsyncSession via constructor injection.
 # The lifespan or get_session() creates the session, passes it down.
 # Repositories never create their own sessions.
+#
+# Phase 1C repos: PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo
+# Phase 2 repos:  ThreadRepo, ThreadMessageRepo
 
 import logging
 
@@ -18,7 +21,9 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.db.models import Pet, User, ActiveProfile, FactLog
+from app.db.models import (
+    Pet, User, ActiveProfile, FactLog, Thread, ThreadMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -288,4 +293,180 @@ class FactLogRepo:
         result = await self._session.execute(stmt)
         rows = result.scalars().all()
 
+        return [row.to_dict() for row in rows]
+
+
+# ── ThreadRepo ────────────────────────────────────────────────────────────────
+
+class ThreadRepo:
+    """
+    Thread lifecycle management (the `threads` table).
+
+    Threads are 24-hour conversation windows. Each pet has at most one
+    active thread at a time. Expired threads are kept for cross-thread
+    context (compaction_summary from the previous thread).
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(
+        self,
+        thread_id: str,
+        pet_id: str,
+        user_id: str,
+        started_at: str,
+        expires_at: str,
+    ) -> dict:
+        """Insert a new thread row.  Returns to_dict()."""
+        thread = Thread(
+            thread_id=thread_id,
+            pet_id=pet_id,
+            user_id=user_id,
+            started_at=started_at,
+            expires_at=expires_at,
+            status="active",
+        )
+        self._session.add(thread)
+        await self._session.commit()
+        logger.info("Thread created: thread_id=%s pet_id=%s", thread_id, pet_id)
+        return thread.to_dict()
+
+    async def get_active(self, pet_id: str) -> dict | None:
+        """
+        Get the active thread for a pet.
+
+        Returns to_dict() or None if no active thread exists.
+        Does NOT check expires_at — caller is responsible for expiry logic
+        so it can expire the thread explicitly before creating a new one.
+        """
+        stmt = (
+            select(Thread)
+            .where(Thread.pet_id == pet_id, Thread.status == "active")
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        thread = result.scalar_one_or_none()
+        return thread.to_dict() if thread else None
+
+    async def get_all_active(self) -> list[dict]:
+        """Get all active threads.  Used at startup to reload into memory."""
+        stmt = select(Thread).where(Thread.status == "active")
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
+        return [row.to_dict() for row in rows]
+
+    async def expire(self, thread_id: str) -> None:
+        """Mark a thread as expired."""
+        stmt = (
+            select(Thread)
+            .where(Thread.thread_id == thread_id)
+        )
+        result = await self._session.execute(stmt)
+        thread = result.scalar_one_or_none()
+        if thread:
+            thread.status = "expired"
+            await self._session.commit()
+            logger.info("Thread expired: thread_id=%s", thread_id)
+
+    async def update_compaction_summary(
+        self, thread_id: str, summary: str,
+    ) -> None:
+        """Store the LLM-generated compaction summary for a thread."""
+        stmt = select(Thread).where(Thread.thread_id == thread_id)
+        result = await self._session.execute(stmt)
+        thread = result.scalar_one_or_none()
+        if thread:
+            thread.compaction_summary = summary
+            await self._session.commit()
+            logger.debug("Compaction summary updated: thread_id=%s", thread_id)
+
+    async def get_latest_expired(self, pet_id: str) -> dict | None:
+        """
+        Get the most recently started expired thread for a pet.
+
+        Used for cross-thread context — when a new thread starts, we load
+        the previous thread's compaction_summary so Agent 1 has continuity.
+        """
+        stmt = (
+            select(Thread)
+            .where(Thread.pet_id == pet_id, Thread.status == "expired")
+            .order_by(Thread.started_at.desc())
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        thread = result.scalar_one_or_none()
+        return thread.to_dict() if thread else None
+
+
+# ── ThreadMessageRepo ─────────────────────────────────────────────────────────
+
+class ThreadMessageRepo:
+    """
+    Read/write individual messages within a thread (the `thread_messages` table).
+
+    Write-through pattern: messages are appended to app.state.sessions
+    in-memory first (synchronous), then persisted here in _run_background()
+    (fire-and-forget).
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def append(
+        self,
+        thread_id: str,
+        role: str,
+        content: str,
+        timestamp: str,
+    ) -> None:
+        """Insert a single message row."""
+        msg = ThreadMessage(
+            thread_id=thread_id,
+            role=role,
+            content=content,
+            timestamp=timestamp,
+        )
+        self._session.add(msg)
+        await self._session.commit()
+
+    async def append_batch(self, messages: list[dict]) -> None:
+        """
+        Insert multiple message rows in one transaction.
+
+        Each dict must have: thread_id, role, content, timestamp.
+        Used to write the user+assistant pair together in _run_background().
+        """
+        if not messages:
+            return
+
+        rows = [
+            ThreadMessage(
+                thread_id=msg["thread_id"],
+                role=msg["role"],
+                content=msg["content"],
+                timestamp=msg["timestamp"],
+            )
+            for msg in messages
+        ]
+        self._session.add_all(rows)
+        await self._session.commit()
+        logger.debug(
+            "thread_messages: appended %d messages to thread_id=%s",
+            len(rows), messages[0]["thread_id"],
+        )
+
+    async def read_thread(self, thread_id: str) -> list[dict]:
+        """
+        Read all messages for a thread, ordered by insertion order.
+
+        Returns list of {"role": ..., "content": ..., "timestamp": ...} dicts.
+        """
+        stmt = (
+            select(ThreadMessage)
+            .where(ThreadMessage.thread_id == thread_id)
+            .order_by(ThreadMessage.id.asc())
+        )
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
         return [row.to_dict() for row in rows]

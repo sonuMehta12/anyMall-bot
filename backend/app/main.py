@@ -15,10 +15,10 @@
 #   - LLM credentials (core/config.py + .env)
 #   - Pet data (context_builder.py reads from PostgreSQL at startup)
 #
-# Session state:
-#   Simple in-memory dict: session_id -> list of messages.
-#   Stored on app.state.sessions. Resets on server restart.
-#   Phase 2 replaces this with Redis.
+# Session state (Phase 2):
+#   In-memory dict: thread_id -> list of messages.
+#   Stored on app.state.sessions. Reloaded from PostgreSQL on restart.
+#   Write-through: every message persisted to thread_messages table.
 
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
@@ -44,7 +44,8 @@ from app.agents.aggregator import AggregatorAgent
 from app.services.context_builder import build_context, load_profiles_from_db
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 from app.db.session import init_db, dispose_engine, get_session
-from app.db.repositories import PetRepo, UserRepo, ActiveProfileRepo
+from app.db.repositories import PetRepo, UserRepo, ActiveProfileRepo, ThreadRepo, ThreadMessageRepo
+from app.services.thread_summarizer import ThreadSummarizer
 
 # ── Route modules ─────────────────────────────────────────────────────────────
 from app.routes.chat import router as chat_router
@@ -107,8 +108,23 @@ async def lifespan(app: FastAPI):
     app.state.intent_classifier = IntentClassifier(llm=llm)
     app.state.compressor = CompressorAgent(llm=llm)
     app.state.aggregator = AggregatorAgent(get_session=get_session)
-    app.state.sessions = {}   # session_id -> list of messages (Phase 0 in-memory)
-    app.state.session_meta = {}   # session_id -> tracking metadata (gap questions, cooldowns)
+    app.state.thread_summarizer = ThreadSummarizer(llm=llm)
+
+    # ── Phase 2: Reload active threads from PostgreSQL ─────────────────
+    # Same pattern as load_profiles_from_db — read from DB at startup,
+    # populate app.state so runtime reads are in-memory only.
+    async with get_session() as session:
+        thread_repo = ThreadRepo(session)
+        msg_repo = ThreadMessageRepo(session)
+        active_threads = await thread_repo.get_all_active()
+        sessions: dict[str, list] = {}
+        for thread in active_threads:
+            messages = await msg_repo.read_thread(thread["thread_id"])
+            sessions[thread["thread_id"]] = messages
+        app.state.sessions = sessions
+        logger.info("Loaded %d active thread(s) from database.", len(sessions))
+
+    app.state.session_meta = {}   # thread_id -> tracking metadata (gap questions, cooldowns)
 
     logger.info("Backend ready. LLM provider: %s", settings.llm_provider)
 
@@ -127,7 +143,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AnyMall-chan API",
-    description="Pet companion chat backend — Phase 1C (PostgreSQL)",
+    description="Pet companion chat backend — Phase 2 (Thread Management)",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -181,7 +197,7 @@ async def get_confidence() -> dict[str, Any]:
 
     No LLM — pure arithmetic on in-memory profile data. Sub-millisecond.
     """
-    active_profile, _gap_list, _pet_summary, _pet_history, _rel = build_context(
+    active_profile, _gap_list, _pet_summary, _pet_history, _rel, _conv = build_context(
         active_profile_raw=app.state.active_profile,
         pet_profile=app.state.pet_profile,
         user_profile=app.state.user_profile,

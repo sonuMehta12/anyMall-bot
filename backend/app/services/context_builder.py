@@ -1,7 +1,8 @@
 # app/services/context_builder.py
 #
-# Builds the 5 context values Agent 1 needs on every request:
-#   (active_profile_dict, gap_list, pet_summary, pet_history, relationship_context)
+# Builds the 6 context values Agent 1 needs on every request:
+#   (active_profile_dict, gap_list, pet_summary, pet_history,
+#    relationship_context, conversation_summary)
 #
 # Two loaders:
 #   load_profiles_from_db()  — Phase 1C. Reads from PostgreSQL, seeds if empty.
@@ -250,19 +251,24 @@ def build_context(
     active_profile_raw: dict | None = None,
     pet_profile: dict | None = None,
     user_profile: dict | None = None,
-) -> tuple[dict, list[str], str, str, str]:
+    conversation_summary: str | None = None,
+) -> tuple[dict, list[str], str, str, str, str]:
     """
-    Build the 5 context values Agent 1 needs on every request.
+    Build the 6 context values Agent 1 needs on every request.
 
     Parameters
     ----------
     active_profile_raw, pet_profile, user_profile : dict | None
         When provided (from app.state), used directly — no disk I/O.
         When None, falls back to reading from disk (backward compatible).
+    conversation_summary : str | None
+        Phase 2: compaction summary from the current or previous thread.
+        Passed through unchanged — no processing here.
 
     Returns
     -------
-    (active_profile_dict, gap_list, pet_summary, pet_history, relationship_context)
+    (active_profile_dict, gap_list, pet_summary, pet_history,
+     relationship_context, conversation_summary)
 
     The returned active_profile_dict matches the shape conversation.py expects:
         {"field_name": {"value": "...", "confidence": N}, ...}
@@ -353,4 +359,4 @@ def build_context(
         "relationship_summary", _DEFAULT_RELATIONSHIP_CONTEXT
     )
 
-    return merged, gap_list, pet_summary, pet_history, relationship_context
+    return merged, gap_list, pet_summary, pet_history, relationship_context, conversation_summary or ""

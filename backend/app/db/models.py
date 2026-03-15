@@ -1,12 +1,16 @@
 # app/db/models.py
 #
-# SQLAlchemy ORM models for Phase 1C.
+# SQLAlchemy ORM models for AnyMall-chan backend.
 #
-# Four tables, each mirroring one JSON file:
-#   Pet            → data/pet_profile.json     (static pet identity)
-#   User           → data/user_profile.json    (owner relationship data)
-#   ActiveProfile  → data/active_profile.json  (current best-known facts per field)
-#   FactLog        → data/fact_log.json        (append-only audit trail)
+# Phase 1C tables (mirroring original JSON files):
+#   Pet            → static pet identity
+#   User           → owner relationship data
+#   ActiveProfile  → current best-known facts per field
+#   FactLog        → append-only audit trail
+#
+# Phase 2 tables (thread & conversation management):
+#   Thread         → 24-hour conversation windows
+#   ThreadMessage  → individual messages within a thread
 #
 # Each model has a to_dict() or to_dict_entry() method that returns the
 # EXACT same dict shape the rest of the code expects.  Callers (agents,
@@ -184,7 +188,7 @@ class ActiveProfile(Base):
             "session_id": self.session_id or "",
             "status": self.status or "",
             "change_detected": self.change_detected or "",
-            "trend_flag": self.trenflag or "",
+            "trend_flag": self.trend_flag or "",
         }
 
 
@@ -240,4 +244,85 @@ class FactLog(Base):
             "needs_clarification": self.needs_clarification,
             "extracted_at": self.extracted_at,
             "session_id": self.session_id,
+        }
+
+
+# ── Thread ────────────────────────────────────────────────────────────────────
+
+class Thread(Base):
+    """
+    A 24-hour conversation window.
+
+    Each thread has a hard expiry (started_at + 24h). Pet facts persist
+    forever in active_profile; only conversation text resets at expiry.
+    The compaction_summary column stores an LLM-generated summary of
+    older messages after compaction runs.
+    """
+    __tablename__ = "threads"
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True)
+    thread_id: Mapped[str] = mapped_column(
+        String(128), unique=True, nullable=False)
+    pet_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active")
+    compaction_summary: Mapped[str | None] = mapped_column(
+        Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_threads_pet_id_status", "pet_id", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Thread thread_id={self.thread_id!r} status={self.status!r}>"
+
+    def to_dict(self) -> dict:
+        """Return all thread fields as a plain dict."""
+        return {
+            "thread_id": self.thread_id,
+            "pet_id": self.pet_id,
+            "user_id": self.user_id,
+            "started_at": self.started_at,
+            "expires_at": self.expires_at,
+            "status": self.status,
+            "compaction_summary": self.compaction_summary,
+        }
+
+
+# ── ThreadMessage ─────────────────────────────────────────────────────────────
+
+class ThreadMessage(Base):
+    """
+    A single message within a thread.
+
+    Append-only — one row per user or assistant message.
+    Write-through pattern: appended to app.state.sessions (in-memory)
+    synchronously, then INSERT'd to PostgreSQL in _run_background().
+    """
+    __tablename__ = "thread_messages"
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True)
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    timestamp: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    __table_args__ = (
+        Index("ix_thread_messages_thread_id", "thread_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ThreadMessage id={self.id} thread_id={self.thread_id!r} role={self.role!r}>"
+
+    def to_dict(self) -> dict:
+        """Return the message dict used by app.state.sessions lists."""
+        return {
+            "role": self.role,
+            "content": self.content,
+            "timestamp": self.timestamp,
         }

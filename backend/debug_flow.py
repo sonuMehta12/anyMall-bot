@@ -24,7 +24,7 @@ from app.agents.intent_classifier import IntentClassifier
 from app.agents.conversation import ConversationAgent
 from app.services.context_builder import build_context
 
-ACTIVE_PROFILE, GAP_LIST, PET_SUMMARY, PET_HISTORY, RELATIONSHIP_CONTEXT = build_context()
+ACTIVE_PROFILE, GAP_LIST, PET_SUMMARY, PET_HISTORY, RELATIONSHIP_CONTEXT, _CONV = build_context()
 
 DIVIDER = "-" * 60
 

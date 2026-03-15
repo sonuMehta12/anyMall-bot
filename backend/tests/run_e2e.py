@@ -1,6 +1,6 @@
 # tests/run_e2e.py
 #
-# End-to-end test suite for AnyMall-chan backend -- Phase 1C.
+# End-to-end test suite for AnyMall-chan backend -- Phase 2.
 #
 # Tests the full pipeline:
 #   POST /chat
@@ -160,6 +160,8 @@ def test_response_structure() -> bool:
         required = {
             "message": str,
             "session_id": str,
+            "thread_id": str,
+            "new_thread": bool,
             "questions_asked_count": int,
             "was_guardrailed": bool,
             "is_entity": bool,
@@ -882,11 +884,264 @@ def test_profile_from_db_has_seed_data() -> bool:
         return failed("Profile from DB", str(exc))
 
 
+# ── Section 7: Thread Management (Phase 2) ───────────────────────────────────
+#
+# NOTE: Threads are per-pet (not per-session). Since all tests use the same
+# pet (Luna / DEFAULT_PET_ID), threads are shared within a 24h window.
+# The first test run after server start creates a new thread; subsequent
+# requests (even with different session_ids) reuse it until it expires.
+
+def test_chat_returns_thread_id() -> bool:
+    """POST /chat response includes thread_id (string) and new_thread (bool)."""
+    sid = new_sid()
+    try:
+        data = post_chat("Hello!", sid)
+        if "thread_id" not in data:
+            return failed("Chat returns thread_id", "missing 'thread_id' field")
+        if not isinstance(data["thread_id"], str):
+            return failed("Chat returns thread_id", f"thread_id is {type(data['thread_id']).__name__}")
+        if not data["thread_id"]:
+            return failed("Chat returns thread_id", "thread_id is empty string")
+        if "new_thread" not in data:
+            return failed("Chat returns new_thread", "missing 'new_thread' field")
+        if not isinstance(data["new_thread"], bool):
+            return failed("Chat returns new_thread", f"new_thread is {type(data['new_thread']).__name__}")
+        return passed("Chat returns thread_id + new_thread", f"thread_id={data['thread_id'][:12]}...")
+    except Exception as exc:
+        return failed("Chat returns thread_id", str(exc))
+
+
+def test_thread_id_is_uuid_format() -> bool:
+    """thread_id looks like a valid UUID (36 chars with dashes)."""
+    sid = new_sid()
+    try:
+        data = post_chat("Hello!", sid)
+        tid = data.get("thread_id", "")
+        # UUID format: 8-4-4-4-12 = 36 chars
+        if len(tid) != 36 or tid.count("-") != 4:
+            return failed("thread_id UUID format", f"got {tid!r} (len={len(tid)})")
+        return passed("thread_id UUID format", f"{tid[:12]}...")
+    except Exception as exc:
+        return failed("thread_id UUID format", str(exc))
+
+
+def test_same_session_same_thread() -> bool:
+    """Multiple messages in same session use the same thread_id."""
+    sid = new_sid()
+    try:
+        r1 = post_chat("Hello", sid)
+        r2 = post_chat("How is Luna?", sid)
+        r3 = post_chat("She seems happy today", sid)
+
+        tid1 = r1.get("thread_id")
+        tid2 = r2.get("thread_id")
+        tid3 = r3.get("thread_id")
+
+        if not (tid1 == tid2 == tid3):
+            return failed(
+                "Same session same thread",
+                f"thread_ids differ: {tid1[:8]}... vs {tid2[:8]}... vs {tid3[:8]}...",
+            )
+        return passed("Same session same thread", f"3 messages, all thread_id={tid1[:12]}...")
+    except Exception as exc:
+        return failed("Same session same thread", str(exc))
+
+
+def test_different_sessions_share_thread() -> bool:
+    """Two different session_ids get the same thread_id (thread is per-pet, not per-session)."""
+    sid_a = new_sid()
+    sid_b = new_sid()
+    try:
+        r_a = post_chat("Hello from session A", sid_a)
+        r_b = post_chat("Hello from session B", sid_b)
+
+        tid_a = r_a.get("thread_id")
+        tid_b = r_b.get("thread_id")
+
+        if tid_a != tid_b:
+            return failed(
+                "Different sessions share thread",
+                f"thread_ids differ: {tid_a[:8]}... vs {tid_b[:8]}...",
+            )
+        return passed("Different sessions share thread", f"both use thread_id={tid_a[:12]}...")
+    except Exception as exc:
+        return failed("Different sessions share thread", str(exc))
+
+
+def test_session_id_still_echoed() -> bool:
+    """POST /chat response echoes back the original session_id (unchanged by thread logic)."""
+    sid = new_sid()
+    try:
+        data = post_chat("Hello!", sid)
+        if data.get("session_id") != sid:
+            return failed(
+                "session_id echo",
+                f"expected {sid!r}, got {data.get('session_id')!r}",
+            )
+        return passed("session_id still echoed correctly", f"session_id={sid[:12]}...")
+    except Exception as exc:
+        return failed("session_id echo", str(exc))
+
+
+def test_thread_messages_persisted() -> bool:
+    """Messages are persisted to PostgreSQL and readable via debug endpoint."""
+    sid = new_sid()
+    try:
+        r1 = post_chat("Luna ate her breakfast today", sid)
+        thread_id = r1.get("thread_id")
+        if not thread_id:
+            return failed("Thread messages persisted", "no thread_id in response")
+
+        # Wait for write-through in _run_background()
+        wait_background("thread message persistence")
+
+        resp = requests.get(
+            f"{BASE_URL}/debug/thread/{thread_id}/messages",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        messages = data.get("messages", [])
+
+        # Thread is shared across all tests, so there may be more messages
+        # from earlier tests. Just check we have at least one user+assistant pair.
+        if len(messages) < 2:
+            return failed(
+                "Thread messages persisted",
+                f"expected >= 2 messages (user+assistant), got {len(messages)}",
+            )
+        roles = [m.get("role") for m in messages]
+        if "user" not in roles or "assistant" not in roles:
+            return failed("Thread messages persisted", f"unexpected roles: {roles}")
+        return passed("Thread messages persisted", f"{len(messages)} messages in DB for this thread")
+    except Exception as exc:
+        return failed("Thread messages persisted", str(exc))
+
+
+def test_thread_message_schema() -> bool:
+    """Each persisted message has role, content, and timestamp fields."""
+    sid = new_sid()
+    try:
+        r1 = post_chat("Luna played fetch this morning", sid)
+        thread_id = r1.get("thread_id")
+        wait_background("thread message schema")
+
+        resp = requests.get(
+            f"{BASE_URL}/debug/thread/{thread_id}/messages",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        messages = resp.json().get("messages", [])
+
+        if not messages:
+            return failed("Thread message schema", "no messages returned")
+
+        for i, msg in enumerate(messages):
+            required = ["role", "content", "timestamp"]
+            missing = [f for f in required if f not in msg]
+            if missing:
+                return failed("Thread message schema", f"message {i} missing: {missing}")
+            if msg["role"] not in ("user", "assistant"):
+                return failed("Thread message schema", f"message {i} unexpected role: {msg['role']!r}")
+            if not msg["content"]:
+                return failed("Thread message schema", f"message {i} has empty content")
+            if not msg["timestamp"]:
+                return failed("Thread message schema", f"message {i} has empty timestamp")
+
+        return passed("Thread message schema", f"all {len(messages)} messages have correct schema")
+    except Exception as exc:
+        return failed("Thread message schema", str(exc))
+
+
+def test_debug_threads_endpoint() -> bool:
+    """GET /debug/threads returns active threads list with correct schema."""
+    try:
+        resp = requests.get(f"{BASE_URL}/debug/threads", timeout=10)
+        if resp.status_code != 200:
+            return failed("GET /debug/threads -- HTTP 200", f"got {resp.status_code}")
+        data = resp.json()
+        if "threads" not in data:
+            return failed("GET /debug/threads -- has 'threads' key", f"keys: {list(data.keys())}")
+        if "count" not in data:
+            return failed("GET /debug/threads -- has 'count' key", f"keys: {list(data.keys())}")
+        if not isinstance(data["threads"], list):
+            return failed("GET /debug/threads -- threads is list", f"got {type(data['threads']).__name__}")
+        if data["count"] < 1:
+            return failed("GET /debug/threads -- at least 1 active thread", f"got count={data['count']}")
+
+        # Check thread schema
+        thread = data["threads"][0]
+        required_fields = [
+            "thread_id", "pet_id", "user_id", "started_at",
+            "expires_at", "status", "compaction_summary",
+        ]
+        missing = [f for f in required_fields if f not in thread]
+        if missing:
+            return failed("GET /debug/threads -- thread schema", f"missing: {missing}")
+        if thread["status"] != "active":
+            return failed("GET /debug/threads -- status", f"expected 'active', got {thread['status']!r}")
+
+        return passed("GET /debug/threads", f"count={data['count']} schema=ok")
+    except Exception as exc:
+        return failed("GET /debug/threads", str(exc))
+
+
+def test_debug_thread_messages_endpoint() -> bool:
+    """GET /debug/thread/{id}/messages returns correct structure."""
+    sid = new_sid()
+    try:
+        r = post_chat("testing debug messages endpoint", sid)
+        thread_id = r.get("thread_id")
+        wait_background("debug messages endpoint")
+
+        resp = requests.get(
+            f"{BASE_URL}/debug/thread/{thread_id}/messages",
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return failed("Debug thread messages -- HTTP 200", f"got {resp.status_code}")
+
+        data = resp.json()
+        if "thread_id" not in data:
+            return failed("Debug thread messages -- has thread_id", f"keys: {list(data.keys())}")
+        if data["thread_id"] != thread_id:
+            return failed("Debug thread messages -- thread_id matches", f"got {data['thread_id']!r}")
+        if "count" not in data or "messages" not in data:
+            return failed("Debug thread messages -- has count+messages", f"keys: {list(data.keys())}")
+
+        return passed("Debug thread messages endpoint", f"count={data['count']}")
+    except Exception as exc:
+        return failed("Debug thread messages endpoint", str(exc))
+
+
+def test_compressor_still_works_with_threads() -> bool:
+    """Compressor fact extraction still works after Phase 2 thread changes (regression)."""
+    sid = new_sid()
+    try:
+        data = post_chat(
+            "The vet confirmed Luna weighs exactly 3.8 kg today",
+            sid,
+        )
+        # Verify thread_id is present (Phase 2 plumbing is active)
+        if not data.get("thread_id"):
+            return failed("Compressor + threads regression", "no thread_id in response")
+
+        wait_background("compressor regression")
+        facts = facts_for(sid)
+        if not facts:
+            return failed("Compressor + threads regression", "no facts extracted — pipeline broken?")
+
+        keys = [f.get("key", f.get("field_key")) for f in facts]
+        return passed("Compressor + threads regression", f"thread + {len(facts)} fact(s): {keys}")
+    except Exception as exc:
+        return failed("Compressor + threads regression", str(exc))
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     print(f"\n{BOLD}{'=' * 56}{RESET}")
-    print(f"{BOLD}  AnyMall-chan -- Phase 1C End-to-End Test Suite{RESET}")
+    print(f"{BOLD}  AnyMall-chan -- Phase 2 End-to-End Test Suite{RESET}")
     print(f"{BOLD}{'=' * 56}{RESET}")
     print(f"  Backend:   {BASE_URL}")
     print(f"  Storage:   PostgreSQL (via GET /debug/facts)")
@@ -950,6 +1205,19 @@ def main() -> None:
     results.append(test_facts_persist_in_db())
     results.append(test_confidence_in_chat_response())
     results.append(test_profile_from_db_has_seed_data())
+
+    # ── Section 7: Thread Management (Phase 2) ──────────────────────────────
+    section(f"7  Thread Management (Phase 2)  (some wait {BACKGROUND_WAIT}s)")
+    results.append(test_chat_returns_thread_id())
+    results.append(test_thread_id_is_uuid_format())
+    results.append(test_same_session_same_thread())
+    results.append(test_different_sessions_share_thread())
+    results.append(test_session_id_still_echoed())
+    results.append(test_thread_messages_persisted())
+    results.append(test_thread_message_schema())
+    results.append(test_debug_threads_endpoint())
+    results.append(test_debug_thread_messages_endpoint())
+    results.append(test_compressor_still_works_with_threads())
 
     # ── Summary ────────────────────────────────────────────────────────────────
     passed_count = sum(results)

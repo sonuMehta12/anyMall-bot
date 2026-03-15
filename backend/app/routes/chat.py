@@ -13,9 +13,10 @@
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
 import dataclasses
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
+from uuid import uuid4
 
 # ── Third-party ────────────────────────────────────────────────────────────────
 from fastapi import APIRouter, HTTPException, Request
@@ -27,9 +28,12 @@ from app.agents.state import AgentState
 from app.services.guardrails import apply_guardrails
 from app.services.deeplink import build_deeplink
 from app.services.context_builder import build_context
-from constants import INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM, DEFAULT_PET_ID
+from constants import (
+    INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM, DEFAULT_PET_ID,
+    THREAD_COMPACTION_THRESHOLD, THREAD_CONTEXT_WINDOW, THREAD_EXPIRY_HOURS,
+)
 from app.db.session import get_session
-from app.db.repositories import FactLogRepo
+from app.db.repositories import FactLogRepo, ThreadRepo, ThreadMessageRepo
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 
 logger = logging.getLogger(__name__)
@@ -113,6 +117,10 @@ class ChatResponse(BaseModel):
     message: str
     redirect: RedirectPayload | None = None   # present only for health/food intents
     session_id: str
+    # ── Phase 2: Thread management ─────────────────────────────────────────────
+    thread_id: str                # backend's thread UUID
+    new_thread: bool = False      # True if a new 24h thread was created this request
+    # ── Existing fields ────────────────────────────────────────────────────────
     questions_asked_count: int
     was_guardrailed: bool
     # ── Agent debug fields ─────────────────────────────────────────────────────
@@ -194,13 +202,55 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
     sessions: dict = state_bag.sessions
 
-    # ── 1. Session history ─────────────────────────────────────────────────────
+    # ── 1. Thread boundary logic (Phase 2) ─────────────────────────────────────
+    # Resolve session_id → thread_id. One session maps to one active thread per pet.
     session_id = request_body.session_id
-    if session_id not in sessions:
-        sessions[session_id] = []
-        logger.info("New session started: %s", session_id)
+    pet_id = DEFAULT_PET_ID  # ft-003 wires real pet_id from x-user-code header
+    user_id = "shara-001"    # ft-003 wires real user_id
 
-    session_messages = sessions[session_id]
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    new_thread = False
+    conversation_summary = ""
+
+    async with get_session() as db_session:
+        thread_repo = ThreadRepo(db_session)
+        existing = await thread_repo.get_active(pet_id)
+
+        if existing and existing["expires_at"] > now_iso:
+            # Active thread exists and hasn't expired — use it
+            thread_id = existing["thread_id"]
+            conversation_summary = existing.get("compaction_summary") or ""
+        else:
+            # Either no thread or expired — create a new one
+            if existing:
+                # Expire the old thread
+                await thread_repo.expire(existing["thread_id"])
+                logger.info("Thread expired: %s", existing["thread_id"])
+
+            # Load cross-thread context from the previous expired thread
+            prev = await thread_repo.get_latest_expired(pet_id)
+            if prev and prev.get("compaction_summary"):
+                conversation_summary = prev["compaction_summary"]
+
+            # Create new thread
+            thread_id = str(uuid4())
+            expires_at = (now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
+            await thread_repo.create(
+                thread_id=thread_id,
+                pet_id=pet_id,
+                user_id=user_id,
+                started_at=now_iso,
+                expires_at=expires_at,
+            )
+            new_thread = True
+            logger.info("New thread created: %s (session=%s)", thread_id, session_id)
+
+    # Initialize in-memory message list for new threads
+    if thread_id not in sessions:
+        sessions[thread_id] = []
+
+    session_messages = sessions[thread_id]
 
     # ── 1b. Load pet context ───────────────────────────────────────────────────
     # If Flutter sent pet_context (real pet from AALDA API), use it.
@@ -211,10 +261,11 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     else:
         pet_profile = state_bag.pet_profile
 
-    active_profile, gap_list, pet_summary, pet_history, relationship_context = build_context(
+    active_profile, gap_list, pet_summary, pet_history, relationship_context, conv_summary = build_context(
         active_profile_raw=state_bag.active_profile,
         pet_profile=pet_profile,
         user_profile=state_bag.user_profile,
+        conversation_summary=conversation_summary,
     )
 
     # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
@@ -225,6 +276,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     # Snapshot session_messages now (before this turn is appended).
     agent_state = AgentState(
         session_id=session_id,
+        thread_id=thread_id,
         user_message=request_body.message,
         pet_name=active_profile.get("name", {}).get("value", ""),
         pet_species=active_profile.get("species", {}).get("value", ""),
@@ -234,8 +286,9 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         recent_history=list(session_messages),  # snapshot before this turn
     )
 
-    # Track gap questions and redirect cooldowns per session.
-    meta = state_bag.session_meta.setdefault(session_id, {
+    # Track gap questions and redirect cooldowns per thread.
+    # Reset when a new thread starts (fresh 24h conversation).
+    meta = state_bag.session_meta.setdefault(thread_id, {
         "gap_questions_asked": 0,
         "redirect_turn_tracker": {},
     })
@@ -257,6 +310,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         questions_asked_so_far=questions_so_far,
         urgency=urgency,
         language_str=_detect_language(request_body.message),
+        conversation_summary=conv_summary,
     )
 
     # Propagate is_entity flag from Agent 1 to state so Compressor knows whether to run.
@@ -294,15 +348,15 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                     tracker["medium_last_shown"] = current_turn
         # LOW → no redirect
 
-    # ── 5. Save to session history ─────────────────────────────────────────────
-    sessions[session_id].append({"role": "user",      "content": request_body.message})
-    sessions[session_id].append({"role": "assistant",  "content": final_reply})
+    # ── 5. Save to session history (in-memory, keyed by thread_id) ────────────
+    sessions[thread_id].append({"role": "user",      "content": request_body.message})
+    sessions[thread_id].append({"role": "assistant",  "content": final_reply})
 
     # ── 6. Fire-and-forget Compressor ──────────────────────────────────────────
     # Update state with the final reply and the full history (now including this turn).
     # Then launch Compressor in the background — user already has their reply.
     agent_state.agent_reply = final_reply
-    agent_state.recent_history = list(sessions[session_id])
+    agent_state.recent_history = list(sessions[thread_id])
     asyncio.create_task(_run_background(agent_state, state_bag))
 
     # ── Log every request so you can see what happened in the terminal ─────────
@@ -320,6 +374,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         message=final_reply,
         redirect=redirect_payload,
         session_id=session_id,
+        thread_id=thread_id,
+        new_thread=new_thread,
         questions_asked_count=agent_response.questions_asked_count,
         was_guardrailed=was_guardrailed,
         is_entity=agent_response.is_entity,
@@ -346,10 +402,36 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
     compressor = state_bag.compressor
     aggregator = state_bag.aggregator
 
-    if compressor is None:
-        return
-
     try:
+        # ── Write-through: persist messages to PostgreSQL ────────────────
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with get_session() as db_session:
+            msg_repo = ThreadMessageRepo(db_session)
+            await msg_repo.append_batch([
+                {
+                    "thread_id": state.thread_id,
+                    "role": "user",
+                    "content": state.user_message,
+                    "timestamp": now_iso,
+                },
+                {
+                    "thread_id": state.thread_id,
+                    "role": "assistant",
+                    "content": state.agent_reply,
+                    "timestamp": now_iso,
+                },
+            ])
+
+        # ── Compaction trigger ──────────────────────────────────────────
+        sessions = state_bag.sessions
+        thread_messages = sessions.get(state.thread_id, [])
+        if len(thread_messages) >= THREAD_COMPACTION_THRESHOLD:
+            asyncio.create_task(_run_compaction(state.thread_id, state_bag))
+
+        # ── Compressor pipeline ─────────────────────────────────────────
+        if compressor is None:
+            return
+
         facts = await compressor.run(state)
 
         # Split by confidence threshold.
@@ -372,8 +454,8 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
                 for f in facts
             ]
             # Phase 1C: write to PostgreSQL instead of JSON file.
-            async with get_session() as session:
-                repo = FactLogRepo(session)
+            async with get_session() as db_session:
+                repo = FactLogRepo(db_session)
                 await repo.append(to_log, pet_id=DEFAULT_PET_ID)
 
         logger.info(
@@ -390,3 +472,48 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
             "Background pipeline failed — session=%s error=%s",
             state.session_id, exc,
         )
+
+
+async def _run_compaction(thread_id: str, state_bag: Any) -> None:
+    """
+    Fire-and-forget compaction task.
+
+    When message count exceeds THREAD_COMPACTION_THRESHOLD, summarize older
+    messages with an LLM, store the summary in threads.compaction_summary,
+    and trim the in-memory list to THREAD_CONTEXT_WINDOW recent messages.
+    """
+    try:
+        sessions = state_bag.sessions
+        messages = sessions.get(thread_id, [])
+        if len(messages) < THREAD_COMPACTION_THRESHOLD:
+            return
+
+        # Split: old messages to summarize, recent to keep
+        old_messages = messages[:-THREAD_CONTEXT_WINDOW]
+        recent_messages = messages[-THREAD_CONTEXT_WINDOW:]
+
+        # Get existing summary from DB
+        async with get_session() as db_session:
+            thread_repo = ThreadRepo(db_session)
+            thread = await thread_repo.get_active(DEFAULT_PET_ID)
+            existing_summary = thread.get("compaction_summary") if thread else None
+
+        # LLM summarize
+        summarizer = state_bag.thread_summarizer
+        new_summary = await summarizer.summarize(old_messages, existing_summary)
+
+        # Update DB
+        async with get_session() as db_session:
+            thread_repo = ThreadRepo(db_session)
+            await thread_repo.update_compaction_summary(thread_id, new_summary)
+
+        # Trim in-memory list
+        sessions[thread_id] = recent_messages
+
+        logger.info(
+            "Compaction done — thread=%s old=%d kept=%d",
+            thread_id, len(old_messages), len(recent_messages),
+        )
+
+    except Exception as exc:
+        logger.error("Compaction failed — thread=%s error=%s", thread_id, exc)

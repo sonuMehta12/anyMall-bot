@@ -480,3 +480,26 @@ URGENCY_LOW: str    = "low"
 # Intent classification (health/food routing and urgency levels) is handled by
 # IntentClassifier (app/agents/intent_classifier.py) via LLM — no keyword lists
 # needed here.
+
+
+# ── 14. Thread Compaction ────────────────────────────────────────────────────
+#
+# Phase 2 thread management — configurable constants for conversation window
+# management.  Model-agnostic: change the threshold to tune per LLM without
+# any code changes.
+#
+# THREAD_COMPACTION_THRESHOLD: when the in-memory message list reaches this
+#   count, trigger LLM summarization of older messages.
+#
+# THREAD_CONTEXT_WINDOW: after compaction, keep this many recent messages in
+#   memory.  Older messages are summarized and stored as compaction_summary
+#   on the threads table.
+#
+# THREAD_EXPIRY_HOURS: hard thread boundary.  A thread expires this many hours
+#   after started_at, regardless of activity.  New message after expiry creates
+#   a new thread.  Pet facts (active_profile) persist forever — only raw
+#   conversation text resets.
+
+THREAD_COMPACTION_THRESHOLD: int = 50
+THREAD_CONTEXT_WINDOW: int = 20
+THREAD_EXPIRY_HOURS: int = 24

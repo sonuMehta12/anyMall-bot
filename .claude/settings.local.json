@@ -17,7 +17,8 @@
       "Bash(powershell -Command \"netstat -ano | Select-String '':8000''\")",
       "Bash(powershell -Command \"Get-Process -Name python -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name uvicorn -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host done\")",
       "Bash(rm -f config.py main.py requirements.txt)",
-      "Bash(rm -rf __pycache__)"
+      "Bash(rm -rf __pycache__)",
+      "Bash(alembic revision:*)"
     ]
   }
 }

@@ -30,6 +30,7 @@ class AgentState:
 
     # ── Set at request start — never modified ────────────────────────────────
     session_id: str
+    thread_id: str     # Phase 2 — backend's thread UUID for DB writes
     user_message: str
     pet_name: str
     pet_species: str

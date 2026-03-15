@@ -405,6 +405,7 @@ class ConversationAgent:
         urgency: str = "none",
         questions_asked_so_far: int = 0,
         language_str: str = "EN",
+        conversation_summary: str = "",
     ) -> AgentResponse:
         """
         Process one user message and return an AgentResponse.
@@ -421,6 +422,7 @@ class ConversationAgent:
             urgency:               "high", "medium", "low", or "none".
             questions_asked_so_far: Gap questions already asked this session.
             language_str:          Preferred language code ("EN", "JA", etc.).
+            conversation_summary:  Phase 2: compaction summary from thread.
         """
         pet_name = active_profile.get("name", {}).get("value", "your pet")
         pet_species = active_profile.get("species", {}).get("value", "").lower()
@@ -443,6 +445,7 @@ class ConversationAgent:
             urgency=urgency,
             questions_asked_so_far=questions_asked_so_far,
             language_str=language_str,
+            conversation_summary=conversation_summary,
         )
 
         # Append the current message to history before sending to LLM
@@ -498,6 +501,7 @@ class ConversationAgent:
         urgency: str,
         questions_asked_so_far: int,
         language_str: str,
+        conversation_summary: str = "",
     ) -> str:
         """Fill in SYSTEM_PROMPT_TEMPLATE with the current context."""
         pet_suffix = self._build_pet_suffix(pet_sex, language_str)
@@ -510,7 +514,7 @@ class ConversationAgent:
 
         todays_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        return SYSTEM_PROMPT_TEMPLATE.format(
+        prompt = SYSTEM_PROMPT_TEMPLATE.format(
             pet_name=pet_name,
             pet_name_upper=pet_name.upper(),
             pet_suffix=pet_suffix,
@@ -525,6 +529,20 @@ class ConversationAgent:
             max_questions_per_message=MAX_QUESTIONS_PER_MESSAGE,
             max_questions_per_session=MAX_QUESTIONS_PER_SESSION,
         )
+
+        # Phase 2: inject conversation summary from thread compaction
+        if conversation_summary:
+            summary_section = (
+                "\nCONVERSATION SUMMARY (from earlier in this conversation):\n"
+                f"{conversation_summary}\n\n---\n"
+            )
+            # Insert before "ABOUT {pet_name}" so the LLM sees context first
+            marker = f"ABOUT {pet_name}"
+            idx = prompt.find(marker)
+            if idx != -1:
+                prompt = prompt[:idx] + summary_section + "\n" + prompt[idx:]
+
+        return prompt
 
     # ── Section builders ───────────────────────────────────────────────────────
 
