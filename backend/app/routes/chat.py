@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 
 
+# ── Task tracking (W8 — graceful shutdown) ────────────────────────────────────
+
+def _create_tracked_task(coro: Any, state_bag: Any) -> asyncio.Task:
+    """Create an asyncio task and register it for graceful shutdown tracking."""
+    task = asyncio.create_task(coro)
+    state_bag.background_tasks.add(task)
+    task.add_done_callback(state_bag.background_tasks.discard)
+    return task
+
+
 # ── Auth helper ───────────────────────────────────────────────────────────────
 
 def _require_user_code(request: Request) -> str:
@@ -73,7 +83,7 @@ def _detect_language(text: str) -> str:
         or '\u30a0' <= c <= '\u30ff'       # Katakana
         or '\u4e00' <= c <= '\u9fff'       # CJK Unified Ideographs
     )
-    return "JA" if ja_count >= 1 else "EN"
+    return "JA" if ja_count >= 3 else "EN"
 
 
 # ── Request / response models ──────────────────────────────────────────────────
@@ -228,11 +238,15 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
     # ── 2. Load active_profiles from DB (per pet) ────────────────────────────
     active_profiles_raw: list[dict | None] = []
-    async with get_session() as db_session:
-        ap_repo = ActiveProfileRepo(db_session)
-        for pid in pet_ids:
-            raw = await ap_repo.read_all(pid)
-            active_profiles_raw.append(raw)
+    try:
+        async with get_session() as db_session:
+            ap_repo = ActiveProfileRepo(db_session)
+            for pid in pet_ids:
+                raw = await ap_repo.read_all(pid)
+                active_profiles_raw.append(raw)
+    except Exception as db_exc:
+        logger.error("DB error loading active profiles: %s", db_exc)
+        raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
 
     # ── 3. Build context for each pet ─────────────────────────────────────────
     pet_contexts = []
@@ -263,120 +277,141 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     new_thread = False
     conversation_summary = ""
 
-    async with get_session() as db_session:
-        thread_repo = ThreadRepo(db_session)
-        existing = await thread_repo.get_active(primary_pet_id)
+    try:
+        async with get_session() as db_session:
+            thread_repo = ThreadRepo(db_session)
+            existing = await thread_repo.get_active(primary_pet_id)
 
-        if existing and existing["expires_at"] > now_iso:
-            thread_id = existing["thread_id"]
-            conversation_summary = existing.get("compaction_summary") or ""
-        else:
-            if existing:
-                await thread_repo.expire(existing["thread_id"])
-                logger.info("Thread expired: %s", existing["thread_id"])
+            if existing and datetime.fromisoformat(existing["expires_at"]) > now_utc:
+                thread_id = existing["thread_id"]
+                conversation_summary = existing.get("compaction_summary") or ""
+            else:
+                if existing:
+                    await thread_repo.expire(existing["thread_id"])
+                    # Clean up in-memory state for the expired thread (W4+W5)
+                    sessions.pop(existing["thread_id"], None)
+                    state_bag.session_meta.pop(existing["thread_id"], None)
+                    logger.info("Thread expired: %s", existing["thread_id"])
 
-            prev = await thread_repo.get_latest_expired(primary_pet_id)
-            if prev and prev.get("compaction_summary"):
-                conversation_summary = prev["compaction_summary"]
+                prev = await thread_repo.get_latest_expired(primary_pet_id)
+                if prev and prev.get("compaction_summary"):
+                    conversation_summary = prev["compaction_summary"]
 
-            thread_id = str(uuid4())
-            expires_at = (now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
-            await thread_repo.create(
-                thread_id=thread_id,
-                pet_id=primary_pet_id,
-                user_id=user_id,
-                started_at=now_iso,
-                expires_at=expires_at,
-            )
-            new_thread = True
-            logger.info("New thread created: %s (session=%s)", thread_id, session_id)
+                thread_id = str(uuid4())
+                expires_at = (now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
+                await thread_repo.create(
+                    thread_id=thread_id,
+                    pet_id=primary_pet_id,
+                    user_id=user_id,
+                    started_at=now_iso,
+                    expires_at=expires_at,
+                )
+                new_thread = True
+                logger.info("New thread created: %s (session=%s)", thread_id, session_id)
+    except HTTPException:
+        raise  # re-raise our own errors (shouldn't happen here, but defensive)
+    except Exception as db_exc:
+        logger.error("DB error in thread boundary: %s", db_exc)
+        raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
 
-    if thread_id not in sessions:
-        sessions[thread_id] = []
+    # ── Acquire per-thread lock (C2 — prevent concurrent session mutations) ──
+    thread_locks: dict[str, asyncio.Lock] = state_bag.thread_locks
+    thread_lock = thread_locks.setdefault(thread_id, asyncio.Lock())
 
-    session_messages = sessions[thread_id]
+    async with thread_lock:
+        if thread_id not in sessions:
+            sessions[thread_id] = []
 
-    # ── Build AgentState — shared context for the background pipeline ─────────
-    agent_state = AgentState(
-        session_id=session_id,
-        thread_id=thread_id,
-        user_message=request_body.message,
-        pet_id=primary_pet_id,
-        pet_name=primary_ctx["active_profile"].get("name", {}).get("value", ""),
-        pet_species=primary_ctx["active_profile"].get("species", {}).get("value", ""),
-        pet_age=primary_ctx["active_profile"].get("age", {}).get("value", ""),
-        pet_sex=primary_ctx["active_profile"].get("sex", {}).get("value", ""),
-        pet_weight=primary_ctx["active_profile"].get("weight", {}).get("value", ""),
-        recent_history=list(session_messages),
-    )
+        session_messages = sessions[thread_id]
 
-    # Track gap questions and redirect cooldowns per thread.
-    meta = state_bag.session_meta.setdefault(thread_id, {
-        "gap_questions_asked": 0,
-        "redirect_turn_tracker": {},
-    })
-    questions_so_far = meta["gap_questions_asked"]
+        # ── Build AgentState — shared context for the background pipeline ─────
+        agent_state = AgentState(
+            session_id=session_id,
+            thread_id=thread_id,
+            user_message=request_body.message,
+            pet_id=primary_pet_id,
+            pet_name=primary_ctx["active_profile"].get("name", {}).get("value", ""),
+            pet_species=primary_ctx["active_profile"].get("species", {}).get("value", ""),
+            pet_age=primary_ctx["active_profile"].get("age", {}).get("value", ""),
+            pet_sex=primary_ctx["active_profile"].get("sex", {}).get("value", ""),
+            pet_weight=primary_ctx["active_profile"].get("weight", {}).get("value", ""),
+            recent_history=list(session_messages),
+        )
 
-    # ── 5. Intent classification (LLM) ──────────────────────────────────────
-    intent_type, urgency = await intent_classifier.classify(request_body.message)
+        # Track gap questions and redirect cooldowns per thread.
+        meta = state_bag.session_meta.setdefault(thread_id, {
+            "gap_questions_asked": 0,
+            "redirect_turn_tracker": {},
+        })
+        questions_so_far = meta["gap_questions_asked"]
 
-    # ── 6. Agent 1 ───────────────────────────────────────────────────────────
-    pet_a_context = pet_contexts[0]
-    pet_b_context = pet_contexts[1] if len(pet_contexts) > 1 else None
+        # ── 5. Intent classification (LLM) ──────────────────────────────────
+        intent_type, urgency = await intent_classifier.classify(request_body.message)
 
-    agent_response: AgentResponse = await agent.run(
-        user_message=request_body.message,
-        session_messages=session_messages,
-        pet_a_context=pet_a_context,
-        pet_b_context=pet_b_context,
-        relationship_context=relationship_context,
-        intent_type=intent_type,
-        urgency=urgency,
-        questions_asked_so_far=questions_so_far,
-        language_str=request_body.language if request_body.language != "auto" else _detect_language(request_body.message),
-        conversation_summary=conversation_summary,
-    )
+        # ── 6. Agent 1 ──────────────────────────────────────────────────────
+        pet_a_context = pet_contexts[0]
+        pet_b_context = pet_contexts[1] if len(pet_contexts) > 1 else None
 
-    agent_state.is_entity = agent_response.is_entity
+        agent_response: AgentResponse = await agent.run(
+            user_message=request_body.message,
+            session_messages=list(session_messages[-THREAD_CONTEXT_WINDOW:]),
+            pet_a_context=pet_a_context,
+            pet_b_context=pet_b_context,
+            relationship_context=relationship_context,
+            intent_type=intent_type,
+            urgency=urgency,
+            questions_asked_so_far=questions_so_far,
+            language_str=request_body.language if request_body.language != "auto" else _detect_language(request_body.message),
+            conversation_summary=conversation_summary,
+        )
 
-    if agent_response.asked_gap_question:
-        meta["gap_questions_asked"] += 1
+        agent_state.is_entity = agent_response.is_entity
 
-    # ── 7. Guardrails ────────────────────────────────────────────────────────
-    guardrail_result = apply_guardrails(agent_response.message)
-    final_reply = guardrail_result.reply
-    was_guardrailed = guardrail_result.was_modified
+        # W7: Reset gap counter when the user provides a fact (entity) after
+        # we asked a gap question — the user is engaging, so we can ask more.
+        if agent_response.is_entity and meta.get("last_asked_gap", False):
+            meta["gap_questions_asked"] = 0
 
-    # ── 7b. Build deeplink with urgency gating ──────────────────────────────
-    MEDIUM_COOLDOWN = 3
+        meta["last_asked_gap"] = agent_response.asked_gap_question
 
-    redirect_payload = None
-    pet_summary_primary = primary_ctx["pet_summary"]
-    if intent_type in (INTENT_HEALTH, INTENT_FOOD):
-        tracker = meta.setdefault("redirect_turn_tracker", {})
-        current_turn = len(session_messages) // 2
+        if agent_response.asked_gap_question:
+            meta["gap_questions_asked"] += 1
 
-        if urgency == URGENCY_HIGH:
-            deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
-            if deeplink:
-                redirect_payload = _to_redirect_payload(deeplink)
+        # ── 7. Guardrails ───────────────────────────────────────────────────
+        guardrail_result = apply_guardrails(agent_response.message)
+        final_reply = guardrail_result.reply
+        was_guardrailed = guardrail_result.was_modified
 
-        elif urgency == URGENCY_MEDIUM:
-            last_shown_turn = tracker.get("medium_last_shown")
-            if last_shown_turn is None or (current_turn - last_shown_turn) > MEDIUM_COOLDOWN:
+        # ── 7b. Build deeplink with urgency gating ─────────────────────────
+        MEDIUM_COOLDOWN = 3
+
+        redirect_payload = None
+        pet_summary_primary = primary_ctx["pet_summary"]
+        if intent_type in (INTENT_HEALTH, INTENT_FOOD):
+            tracker = meta.setdefault("redirect_turn_tracker", {})
+            current_turn = len(session_messages) // 2
+
+            if urgency == URGENCY_HIGH:
                 deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
                 if deeplink:
                     redirect_payload = _to_redirect_payload(deeplink)
-                    tracker["medium_last_shown"] = current_turn
 
-    # ── 8. Save to session history (in-memory, keyed by thread_id) ──────────
-    sessions[thread_id].append({"role": "user",      "content": request_body.message})
-    sessions[thread_id].append({"role": "assistant",  "content": final_reply})
+            elif urgency == URGENCY_MEDIUM:
+                last_shown_turn = tracker.get("medium_last_shown")
+                if last_shown_turn is None or (current_turn - last_shown_turn) > MEDIUM_COOLDOWN:
+                    deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
+                    if deeplink:
+                        redirect_payload = _to_redirect_payload(deeplink)
+                        tracker["medium_last_shown"] = current_turn
 
-    # ── 9. Fire-and-forget Compressor ────────────────────────────────────────
-    agent_state.agent_reply = final_reply
-    agent_state.recent_history = list(sessions[thread_id])
-    asyncio.create_task(_run_background(agent_state, state_bag))
+        # ── 8. Save to session history (in-memory, keyed by thread_id) ────
+        sessions[thread_id].append({"role": "user",      "content": request_body.message, "timestamp": now_iso})
+        sessions[thread_id].append({"role": "assistant",  "content": final_reply, "timestamp": now_iso})
+
+        # ── 9. Fire-and-forget Compressor ─────────────────────────────────
+        agent_state.agent_reply = final_reply
+        agent_state.recent_history = list(sessions[thread_id])
+        _create_tracked_task(_run_background(agent_state, state_bag), state_bag)
 
     logger.info(
         "Chat complete — session=%s | intent=%s | urgency=%s | questions=%d | guardrailed=%s",
@@ -404,7 +439,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 # ── Confidence endpoint ────────────────────────────────────────────────────────
 
 @router.get("/confidence", summary="Current confidence bar score")
-async def get_confidence(request: Request, pet_id: int = 0) -> dict[str, Any]:
+async def get_confidence(request: Request, pet_id: int | None = None) -> dict[str, Any]:
     """
     Returns the current confidence score and color for a specific pet.
 
@@ -414,7 +449,7 @@ async def get_confidence(request: Request, pet_id: int = 0) -> dict[str, Any]:
     user_code = _require_user_code(request)
     pet_fetcher = request.app.state.pet_fetcher
 
-    if pet_id == 0:
+    if pet_id is None:
         raise HTTPException(status_code=400, detail="pet_id query parameter is required.")
 
     try:
@@ -443,10 +478,13 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
     """
     Fire-and-forget coroutine launched by asyncio.create_task() after /chat returns.
 
-    Runs the Compressor, splits facts by confidence threshold, and persists to
-    PostgreSQL fact_log table. User never waits for any of this.
+    Three responsibilities:
+      1. Write-through: persist user + assistant messages to thread_messages table.
+      2. Compaction trigger: if message count >= threshold, fire _run_compaction().
+      3. Compressor + Aggregator: extract facts, split by confidence, persist to
+         fact_log, then merge high-confidence facts into active_profile.
 
-    Never raises — any exception is caught and logged.
+    User never waits for any of this. Never raises — exceptions caught and logged.
     """
     compressor = state_bag.compressor
     aggregator = state_bag.aggregator
@@ -471,11 +509,16 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
                 },
             ])
 
-        # ── Compaction trigger ──────────────────────────────────────────
+        # ── Compaction trigger (guarded — W3) ─────────────────────────
         sessions = state_bag.sessions
         thread_messages = sessions.get(state.thread_id, [])
-        if len(thread_messages) >= THREAD_COMPACTION_THRESHOLD:
-            asyncio.create_task(_run_compaction(state.thread_id, state.pet_id, state_bag))
+        compacting = state_bag.compaction_in_progress
+        if (
+            len(thread_messages) >= THREAD_COMPACTION_THRESHOLD
+            and state.thread_id not in compacting
+        ):
+            compacting.add(state.thread_id)
+            _create_tracked_task(_run_compaction(state.thread_id, state.pet_id, state_bag), state_bag)
 
         # ── Compressor pipeline ─────────────────────────────────────────
         if compressor is None:
@@ -533,31 +576,50 @@ async def _run_compaction(thread_id: str, pet_id: int, state_bag: Any) -> None:
     """
     try:
         sessions = state_bag.sessions
-        messages = sessions.get(thread_id, [])
+        # Snapshot the list so mutations during LLM call don't affect us (Addendum)
+        messages = list(sessions.get(thread_id, []))
         if len(messages) < THREAD_COMPACTION_THRESHOLD:
             return
 
         old_messages = messages[:-THREAD_CONTEXT_WINDOW]
-        recent_messages = messages[-THREAD_CONTEXT_WINDOW:]
 
         async with get_session() as db_session:
             thread_repo = ThreadRepo(db_session)
-            thread = await thread_repo.get_active(pet_id)
+            thread = await thread_repo.get_by_thread_id(thread_id)
             existing_summary = thread.get("compaction_summary") if thread else None
 
         summarizer = state_bag.thread_summarizer
         new_summary = await summarizer.summarize(old_messages, existing_summary)
 
+        # Find the DB cutoff ID — messages up to this ID are now summarized (W12)
+        async with get_session() as db_session:
+            msg_repo = ThreadMessageRepo(db_session)
+            cutoff_id = await msg_repo.get_compaction_cutoff_id(
+                thread_id, THREAD_CONTEXT_WINDOW,
+            )
+
         async with get_session() as db_session:
             thread_repo = ThreadRepo(db_session)
-            await thread_repo.update_compaction_summary(thread_id, new_summary)
+            await thread_repo.update_compaction_summary(
+                thread_id, new_summary, compacted_before_id=cutoff_id,
+            )
 
-        sessions[thread_id] = recent_messages
+        # Acquire per-thread lock before replacing the session list (C2).
+        # Re-trim from the CURRENT list so messages appended during the
+        # LLM summarization call are not lost.
+        thread_lock = state_bag.thread_locks.setdefault(thread_id, asyncio.Lock())
+        async with thread_lock:
+            current = sessions.get(thread_id, [])
+            # Keep the last THREAD_CONTEXT_WINDOW messages from the CURRENT list
+            sessions[thread_id] = current[-THREAD_CONTEXT_WINDOW:]
+            trimmed = len(current) - THREAD_CONTEXT_WINDOW
 
         logger.info(
-            "Compaction done — thread=%s old=%d kept=%d",
-            thread_id, len(old_messages), len(recent_messages),
+            "Compaction done — thread=%s summarized=%d trimmed=%d kept=%d",
+            thread_id, len(old_messages), trimmed, THREAD_CONTEXT_WINDOW,
         )
 
     except Exception as exc:
         logger.error("Compaction failed — thread=%s error=%s", thread_id, exc)
+    finally:
+        state_bag.compaction_in_progress.discard(thread_id)

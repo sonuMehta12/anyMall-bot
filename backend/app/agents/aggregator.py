@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 from app.agents.compressor import ExtractedFact
 from app.db.repositories import ActiveProfileRepo
+from app.types import ActiveProfileEntry
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def _build_entry(
     session_id: str,
     status: str,
     change_detected: str = "",
-) -> dict:
+) -> ActiveProfileEntry:
     """
     Convert an ExtractedFact into the dict shape stored in active_profile.json.
 
@@ -94,9 +95,9 @@ class AggregatorAgent:
         self,
         facts: list[ExtractedFact],
         session_id: str,
-        active_profile: dict | None = None,
+        active_profile: dict[str, ActiveProfileEntry] | None = None,
         pet_id: int = 0,
-    ) -> dict:
+    ) -> dict[str, ActiveProfileEntry]:
         """
         Merge a list of high-confidence facts into active_profile.
 
@@ -140,7 +141,7 @@ class AggregatorAgent:
     def _apply_rules(
         self,
         fact: ExtractedFact,
-        profile: dict,
+        profile: dict[str, ActiveProfileEntry],
         session_id: str,
     ) -> bool:
         """

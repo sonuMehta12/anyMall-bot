@@ -9,7 +9,6 @@
 #   3. Agent 1 reply     — what does Agent 1 say?
 #
 # Run this while the server is stopped (it starts its own LLM connection).
-# Delete this file when debugging is done.
 
 import asyncio
 import os
@@ -25,19 +24,16 @@ from app.agents.conversation import ConversationAgent
 from app.services.context_builder import build_pet_context
 
 # Minimal dummy data for debug — replace with real AALDA data if needed
-_DUMMY_PROFILE = {"name": "Node", "species": "dog", "breed": "Toy Poodle", "date_of_birth": "2025-06-01", "sex": "male", "pet_id": 143}
+_DUMMY_PROFILE = {"name": "Node", "species": "dog", "breed": "Toy Poodle", "date_of_birth": "2025-06-01", "sex": "male", "pet_id": 149}
 _ctx = build_pet_context(_DUMMY_PROFILE, {}, None)
-ACTIVE_PROFILE = _ctx["active_profile"]
-GAP_LIST = _ctx["gap_list"]
-PET_SUMMARY = _ctx["pet_summary"]
 RELATIONSHIP_CONTEXT = "New user — no relationship data yet."
 
 DIVIDER = "-" * 60
 
 TEST_MESSAGES = [
-    "Luna has been vomiting since morning",
-    "What should Luna eat for better energy?",
-    "Luna seems happy today",
+    "Node has been vomiting since morning",
+    "What should Node eat for better energy?",
+    "Node seems happy today",
 ]
 
 
@@ -59,15 +55,14 @@ async def main() -> None:
         print(f"CLASSIFIER OUTPUT: intent={intent_type!r}  urgency={urgency!r}")
 
         # ── Step 2: Rendered system prompt ─────────────────────────────────
-        pet_name = ACTIVE_PROFILE.get("name", {}).get("value", "your pet")
         system_prompt = agent._build_system_prompt(
-            pet_name=pet_name,
-            pet_summary=PET_SUMMARY,
-            pet_history=PET_HISTORY,
-            gap_list=GAP_LIST,
+            pet_a_context=_ctx,
+            pet_b_context=None,
             relationship_context=RELATIONSHIP_CONTEXT,
             intent_type=intent_type,
+            urgency=urgency,
             questions_asked_so_far=0,
+            language_str="EN",
         )
         print("\nSYSTEM PROMPT (last 600 chars — flag section + rules):")
         print(system_prompt[-600:])
@@ -80,7 +75,9 @@ async def main() -> None:
             pet_b_context=None,
             relationship_context=RELATIONSHIP_CONTEXT,
             intent_type=intent_type,
+            urgency=urgency,
             questions_asked_so_far=0,
+            language_str="EN",
         )
         print(f"\nAGENT 1 REPLY:\n{response.message}")
         print(DIVIDER)

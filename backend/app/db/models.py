@@ -33,6 +33,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.types import ActiveProfileEntry
+
 
 # ── Base class ───────────────────────────────────────────────────────────────
 # All ORM models inherit from this.  Alembic uses Base.metadata to discover
@@ -167,7 +169,7 @@ class ActiveProfile(Base):
     def __repr__(self) -> str:
         return f"<ActiveProfile pet_id={self.pet_id!r} field_key={self.field_key!r}>"
 
-    def to_dict_entry(self) -> dict | str:
+    def to_dict_entry(self) -> ActiveProfileEntry | str:
         """
         Return the dict shape for a single entry in active_profile.
 
@@ -272,9 +274,12 @@ class Thread(Base):
         String(16), nullable=False, default="active")
     compaction_summary: Mapped[str | None] = mapped_column(
         Text, nullable=True)
+    compacted_before_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)
 
     __table_args__ = (
         Index("ix_threads_pet_id_status", "pet_id", "status"),
+        Index("ix_threads_user_id", "user_id"),
     )
 
     def __repr__(self) -> str:
@@ -290,6 +295,7 @@ class Thread(Base):
             "expires_at": self.expires_at,
             "status": self.status,
             "compaction_summary": self.compaction_summary,
+            "compacted_before_id": self.compacted_before_id,
         }
 
 

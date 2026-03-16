@@ -24,6 +24,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db.models import (
     Pet, User, ActiveProfile, FactLog, Thread, ThreadMessage,
 )
+from app.types import ActiveProfileEntry
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,7 @@ class ActiveProfileRepo:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def read_all(self, pet_id: int) -> dict | None:
+    async def read_all(self, pet_id: int) -> dict[str, ActiveProfileEntry | str] | None:
         """
         Read all active_profile entries for a pet.
 
@@ -150,7 +151,7 @@ class ActiveProfileRepo:
 
         return profile
 
-    async def write_all(self, pet_id: int, profile_dict: dict) -> None:
+    async def write_all(self, pet_id: int, profile_dict: dict[str, ActiveProfileEntry | str]) -> None:
         """
         Write the entire active_profile dict to the database.
 
@@ -349,6 +350,13 @@ class ThreadRepo:
         thread = result.scalar_one_or_none()
         return thread.to_dict() if thread else None
 
+    async def get_by_thread_id(self, thread_id: str) -> dict | None:
+        """Get a thread by its ID (any status). Used by compaction."""
+        stmt = select(Thread).where(Thread.thread_id == thread_id)
+        result = await self._session.execute(stmt)
+        thread = result.scalar_one_or_none()
+        return thread.to_dict() if thread else None
+
     async def get_all_active(self) -> list[dict]:
         """Get all active threads.  Used at startup to reload into memory."""
         stmt = select(Thread).where(Thread.status == "active")
@@ -371,15 +379,21 @@ class ThreadRepo:
 
     async def update_compaction_summary(
         self, thread_id: str, summary: str,
+        compacted_before_id: int | None = None,
     ) -> None:
-        """Store the LLM-generated compaction summary for a thread."""
+        """Store the LLM-generated compaction summary and trim marker for a thread."""
         stmt = select(Thread).where(Thread.thread_id == thread_id)
         result = await self._session.execute(stmt)
         thread = result.scalar_one_or_none()
         if thread:
             thread.compaction_summary = summary
+            if compacted_before_id is not None:
+                thread.compacted_before_id = compacted_before_id
             await self._session.commit()
-            logger.debug("Compaction summary updated: thread_id=%s", thread_id)
+            logger.debug(
+                "Compaction summary updated: thread_id=%s compacted_before_id=%s",
+                thread_id, compacted_before_id,
+            )
 
     async def get_latest_expired(self, pet_id: int) -> dict | None:
         """
@@ -456,17 +470,59 @@ class ThreadMessageRepo:
             len(rows), messages[0]["thread_id"],
         )
 
-    async def read_thread(self, thread_id: str) -> list[dict]:
+    async def read_thread(
+        self, thread_id: str, after_id: int | None = None,
+    ) -> list[dict]:
         """
-        Read all messages for a thread, ordered by insertion order.
+        Read messages for a thread, ordered by insertion order.
+
+        Args:
+            thread_id: The thread to read.
+            after_id: If set, only return messages with id > after_id.
+                      Used after compaction to skip summarized messages (W12).
 
         Returns list of {"role": ..., "content": ..., "timestamp": ...} dicts.
         """
         stmt = (
             select(ThreadMessage)
             .where(ThreadMessage.thread_id == thread_id)
-            .order_by(ThreadMessage.id.asc())
         )
+        if after_id is not None:
+            stmt = stmt.where(ThreadMessage.id > after_id)
+        stmt = stmt.order_by(ThreadMessage.id.asc())
+
         result = await self._session.execute(stmt)
         rows = result.scalars().all()
         return [row.to_dict() for row in rows]
+
+    async def get_compaction_cutoff_id(
+        self, thread_id: str, keep_count: int,
+    ) -> int | None:
+        """
+        Find the DB id of the last message to be compacted (W12).
+
+        Returns the id of the message just before the 'keep_count' most recent
+        messages. Returns None if not enough messages to compact.
+        """
+        from sqlalchemy import func
+        count_stmt = (
+            select(func.count())
+            .select_from(ThreadMessage)
+            .where(ThreadMessage.thread_id == thread_id)
+        )
+        total = (await self._session.execute(count_stmt)).scalar() or 0
+
+        if total <= keep_count:
+            return None
+
+        # The last message that belongs in the "old" group
+        offset = total - keep_count - 1
+        stmt = (
+            select(ThreadMessage.id)
+            .where(ThreadMessage.thread_id == thread_id)
+            .order_by(ThreadMessage.id.asc())
+            .offset(offset)
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()

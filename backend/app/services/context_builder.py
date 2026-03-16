@@ -3,7 +3,7 @@
 # Builds context values Agent 1 needs on every request.
 #
 # build_pet_context() — builds context for ONE pet:
-#   (active_profile, gap_list, pet_info_json, pet_summary)
+#   (active_profile, gap_list, pet_info_json, pet_summary, pet_history)
 #
 # Pet data comes from:
 #   - pet_profile: static identity from AALDA API (via pet_fetcher.py)
@@ -14,18 +14,15 @@
 
 import json
 import logging
-from datetime import date
-
 from constants import FULL_FIELD_LIST
 from app.services.pet_fetcher import compute_current_age
+from app.types import ActiveProfileEntry
 
 logger = logging.getLogger(__name__)
 
 
 # Fields that come from PetProfile (onboarding) — always known, not gaps.
 _IDENTITY_FIELDS: set[str] = {"name", "species", "breed", "age", "sex"}
-
-_DEFAULT_RELATIONSHIP_CONTEXT: str = "New user — no relationship data yet."
 
 
 # ── Age computation ───────────────────────────────────────────────────────────
@@ -34,31 +31,19 @@ def _compute_age_str(date_of_birth: str) -> str:
     """
     Compute a human-readable age string from an ISO date of birth.
 
-    Returns "unknown age" if date_of_birth is "unknown" or unparseable.
-    Returns "N months" if under 1 year, "N years" otherwise.
+    Delegates to compute_current_age() in pet_fetcher.py (the single
+    implementation) and strips the trailing " old" suffix so callers
+    can use it in "a {age_str}-old" constructions without doubling "old".
     """
-    if not date_of_birth or date_of_birth == "unknown":
-        return "unknown age"
-
-    try:
-        dob = date.fromisoformat(date_of_birth)
-    except (ValueError, TypeError):
-        return "unknown age"
-
-    age_days = (date.today() - dob).days
-    if age_days < 0:
-        return "unknown age"
-    if age_days < 365:
-        months = max(age_days // 30, 1)
-        return f"{months} months" if months > 1 else "1 month"
-
-    years = age_days // 365
-    return f"{years} years" if years > 1 else "1 year"
+    age = compute_current_age(date_of_birth)
+    if age.endswith(" old"):
+        return age[:-4]  # "9 months old" → "9 months"
+    return age
 
 
 # ── Pet summary template ─────────────────────────────────────────────────────
 
-def _build_pet_summary(pet_profile: dict, active_entries: dict) -> str:
+def _build_pet_summary(pet_profile: dict, active_entries: dict[str, ActiveProfileEntry]) -> str:
     """
     Build a natural-language summary of the pet from structured data.
 
@@ -106,7 +91,7 @@ def _build_pet_summary(pet_profile: dict, active_entries: dict) -> str:
 
 # ── Pet info JSON (for v0.3 prompt) ───────────────────────────────────────────
 
-def _build_pet_info_json(pet_profile: dict, aalda_facts: dict) -> str:
+def _build_pet_info_json(pet_profile: dict, aalda_facts: dict[str, ActiveProfileEntry]) -> str:
     """
     Build the pet_info JSON string for the v0.3 prompt template.
 
@@ -156,8 +141,8 @@ def _build_pet_info_json(pet_profile: dict, aalda_facts: dict) -> str:
 
 def build_pet_context(
     pet_profile: dict,
-    aalda_facts: dict,
-    active_profile_raw: dict | None,
+    aalda_facts: dict[str, ActiveProfileEntry],
+    active_profile_raw: dict[str, ActiveProfileEntry | str] | None,
 ) -> dict:
     """
     Build context for ONE pet.
@@ -173,19 +158,29 @@ def build_pet_context(
           gap_list: list of field names we don't know yet
           pet_info_json: JSON string for v0.3 prompt
           pet_summary: NL paragraph for deeplink context
+          pet_history: chronological narrative from _pet_history (or "")
     """
     active_raw = active_profile_raw or {}
 
-    # ── 1. Start with dynamic entries from DB (skip _-prefixed metadata)
+    # ── 0. Extract _pet_history (special key — raw string, not a fact dict)
+    pet_history = active_raw.get("_pet_history", "")
+    if not isinstance(pet_history, str):
+        pet_history = ""
+
+    # ── 1. Start with AALDA facts as BASE layer (registration data)
     merged: dict = {}
-    for key, entry in active_raw.items():
-        if key.startswith("_"):
-            continue
+    for key, entry in aalda_facts.items():
         if isinstance(entry, dict) and "value" in entry:
             merged[key] = entry
 
-    # ── 2. Layer AALDA facts on top (AALDA wins for overlapping fields)
-    for key, entry in aalda_facts.items():
+    # ── 2. Layer DB-learned facts on top (chat wins for overlapping fields)
+    #    The user told our bot something more recent than what AALDA has.
+    #    e.g. user says "switched to raw food" → DB has diet_type="raw food"
+    #         but AALDA still has diet_type="kibble" from months ago.
+    #    Chat-learned facts must take priority.
+    for key, entry in active_raw.items():
+        if key.startswith("_"):
+            continue
         if isinstance(entry, dict) and "value" in entry:
             merged[key] = entry
 
@@ -193,11 +188,11 @@ def build_pet_context(
     age_str = _compute_age_str(pet_profile.get("date_of_birth", "unknown"))
 
     static_fields = {
-        "name": {"value": pet_profile.get("name", ""), "confidence": 100},
-        "species": {"value": pet_profile.get("species", ""), "confidence": 100},
-        "breed": {"value": pet_profile.get("breed", ""), "confidence": 90},
-        "age": {"value": age_str, "confidence": 85},
-        "sex": {"value": pet_profile.get("sex", "unknown"), "confidence": 100},
+        "name": {"value": pet_profile.get("name", ""), "confidence": 1.0},
+        "species": {"value": pet_profile.get("species", ""), "confidence": 1.0},
+        "breed": {"value": pet_profile.get("breed", ""), "confidence": 0.95},
+        "age": {"value": age_str, "confidence": 0.90},
+        "sex": {"value": pet_profile.get("sex", "unknown"), "confidence": 1.0},
     }
 
     for key, entry in static_fields.items():
@@ -222,48 +217,5 @@ def build_pet_context(
         "gap_list": gap_list,
         "pet_info_json": pet_info_json,
         "pet_summary": pet_summary,
-    }
-
-
-def build_context(
-    pet_profiles: list[dict],
-    aalda_facts_list: list[dict],
-    active_profiles: list[dict | None],
-    user_profile: dict | None = None,
-    conversation_summary: str = "",
-) -> dict:
-    """
-    Build context for 1 or 2 pets.
-
-    Args:
-        pet_profiles: 1-2 pet profile dicts from AALDA
-        aalda_facts_list: 1-2 aalda_facts dicts from pet_fetcher
-        active_profiles: 1-2 active profile dicts from DB (None if no data yet)
-        user_profile: user profile dict from DB (None if new user)
-        conversation_summary: compaction summary from thread
-
-    Returns:
-        dict with keys:
-          pet_contexts: list of 1-2 pet context dicts
-          relationship_context: str
-          conversation_summary: str
-    """
-    pet_contexts = []
-    for i, pet_profile in enumerate(pet_profiles):
-        aalda_facts = aalda_facts_list[i] if i < len(aalda_facts_list) else {}
-        active_raw = active_profiles[i] if i < len(active_profiles) else None
-        ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
-        pet_contexts.append(ctx)
-
-    # Relationship context from user profile
-    relationship_context = _DEFAULT_RELATIONSHIP_CONTEXT
-    if user_profile:
-        relationship_context = user_profile.get(
-            "relationship_summary", _DEFAULT_RELATIONSHIP_CONTEXT
-        )
-
-    return {
-        "pet_contexts": pet_contexts,
-        "relationship_context": relationship_context,
-        "conversation_summary": conversation_summary,
+        "pet_history": pet_history,
     }

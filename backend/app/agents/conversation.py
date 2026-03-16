@@ -100,6 +100,8 @@ PET SUMMARY (PET A):
 
 {pet_summary_b_section}
 
+{pet_history_section}
+
 ---
 
 INFORMATION GAPS (PET A):
@@ -498,6 +500,22 @@ class ConversationAgent:
             asked_gap_question=asked_gap_question,
         )
 
+    # ── Prompt sanitization ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _sanitize_for_prompt(name: str) -> str:
+        """
+        Escape characters that would break .format() or JSON in the prompt.
+
+        - { } are Python format-string delimiters — doubled to escape
+        - " and \\ are escaped so the name is safe inside JSON strings
+        """
+        name = name.replace("\\", "\\\\")   # backslash first (avoid double-escape)
+        name = name.replace('"', '\\"')      # double quote
+        name = name.replace("{", "{{")       # format open brace
+        name = name.replace("}", "}}")       # format close brace
+        return name
+
     # ── System prompt builder ──────────────────────────────────────────────────
 
     def _build_system_prompt(
@@ -514,7 +532,9 @@ class ConversationAgent:
     ) -> str:
         """Fill in SYSTEM_PROMPT_TEMPLATE with the current context."""
         active_a = pet_a_context["active_profile"]
-        pet_name_a = active_a.get("name", {}).get("value", "your pet")
+        pet_name_a = self._sanitize_for_prompt(
+            active_a.get("name", {}).get("value", "your pet")
+        )
         pet_species_a = active_a.get("species", {}).get("value", "").lower()
         pet_sex_a = active_a.get("sex", {}).get("value", "").lower()
 
@@ -525,14 +545,30 @@ class ConversationAgent:
         pet_info_a = pet_a_context.get("pet_info_json", "{}")
         pet_summary_a = pet_a_context.get("pet_summary", "")
 
+        # Pet history (chronological narrative from HistoryBuilder)
+        pet_history_a = pet_a_context.get("pet_history", "")
+
         # Pet B info (or "unavailable")
         if pet_b_context:
             pet_info_b = pet_b_context.get("pet_info_json", "{}")
             pet_summary_b = pet_b_context.get("pet_summary", "")
             pet_summary_b_section = f"PET SUMMARY (PET B):\n{pet_summary_b}"
+            pet_history_b = pet_b_context.get("pet_history", "")
         else:
             pet_info_b = "unavailable"
             pet_summary_b_section = ""
+            pet_history_b = ""
+
+        # Build pet_history_section (only if at least one pet has history)
+        history_parts: list[str] = []
+        if pet_history_a:
+            history_parts.append(f"PET HISTORY (PET A — {pet_name_a}):\n{pet_history_a}")
+        if pet_history_b:
+            pet_b_label = self._sanitize_for_prompt(
+                pet_b_context["active_profile"].get("name", {}).get("value", "Pet B")
+            ) if pet_b_context else "Pet B"
+            history_parts.append(f"PET HISTORY (PET B — {pet_b_label}):\n{pet_history_b}")
+        pet_history_section = "\n\n".join(history_parts)
 
         # Gap sections
         gap_section_a = self._build_gap_section(
@@ -542,7 +578,9 @@ class ConversationAgent:
 
         if pet_b_context:
             active_b = pet_b_context["active_profile"]
-            pet_name_b = active_b.get("name", {}).get("value", "Pet B")
+            pet_name_b = self._sanitize_for_prompt(
+                active_b.get("name", {}).get("value", "Pet B")
+            )
             pet_sex_b = active_b.get("sex", {}).get("value", "").lower()
             pet_suffix_b = self._build_pet_suffix(pet_sex_b, language_str)
             gap_section_b = self._build_gap_section(
@@ -556,11 +594,17 @@ class ConversationAgent:
         flag_section = self._build_flag_section(intent_type, urgency)
         todays_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        # Extract last_answer from session history
+        # Extract last_answer from session history (S7: trim at word boundary)
         last_answer = ""
         msgs = session_messages or []
         if msgs and msgs[-1].get("role") == "assistant":
-            last_answer = msgs[-1]["content"][:200]
+            raw = msgs[-1]["content"]
+            if len(raw) <= 200:
+                last_answer = raw
+            else:
+                trimmed = raw[:200]
+                last_space = trimmed.rfind(" ")
+                last_answer = (trimmed[:last_space] if last_space > 100 else trimmed) + "…"
         if not last_answer:
             last_answer = "(first message in this conversation)"
 
@@ -580,6 +624,7 @@ class ConversationAgent:
             pet_info_b=pet_info_b,
             pet_summary_a=pet_summary_a,
             pet_summary_b_section=pet_summary_b_section,
+            pet_history_section=pet_history_section,
             gap_section_a=gap_section_a,
             gap_section_b_block=gap_section_b_block,
             relationship_context=relationship_context,

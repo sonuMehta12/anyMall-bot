@@ -9,7 +9,7 @@
 # Auth: X-User-Code header (same value Flutter sends to us).
 #
 # Caching: in-memory dict with 5-minute TTL.  One entry per (user_code, pet_id).
-# On cache miss: call AALDA API.  On AALDA failure: raise PetFetchError.
+# On cache miss: call AALDA API.  On AALDA failure: try expired cache, then DB.
 #
 # Returns TWO things per pet:
 #   pet_profile — static identity (pet_id, name, species, breed, date_of_birth, sex)
@@ -41,11 +41,28 @@ class PetFetcher:
     Closed at shutdown via close().
     """
 
-    def __init__(self, base_url: str) -> None:
+    CACHE_MAX_SIZE: int = 500  # evict oldest entries beyond this limit
+
+    def __init__(
+        self,
+        base_url: str,
+        db_fallback: Any | None = None,
+        db_persist: Any | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        """
+        Args:
+            base_url: AALDA API base URL.
+            db_fallback: async callback(pet_id) -> dict|None — reads from pets table.
+            db_persist: async callback(pet_profile) -> None — writes to pets table.
+            timeout: httpx timeout in seconds for AALDA API calls.
+        """
         self._base_url = base_url.rstrip("/")
         self._cache: dict[tuple[str, int], tuple[dict, float]] = {}
-        self._client = httpx.AsyncClient(timeout=10.0)
-        logger.info("PetFetcher initialised — base_url=%s", self._base_url)
+        self._client = httpx.AsyncClient(timeout=timeout)
+        self._db_fallback = db_fallback
+        self._db_persist = db_persist
+        logger.info("PetFetcher initialised — base_url=%s timeout=%.1fs", self._base_url, timeout)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -60,8 +77,12 @@ class PetFetcher:
             pet_profile: static identity dict for build_context().
             aalda_facts: dynamic facts dict to seed active_profile.
 
-        Raises:
-            PetFetchError: if AALDA is unreachable or returns an error.
+        Fallback chain (W1):
+            1. Fresh cache (TTL not expired)
+            2. AALDA API call
+            3. Expired cache entry (stale but usable)
+            4. DB fallback (via _db_fallback callback, if set)
+            5. PetFetchError (only if ALL above fail)
         """
         cache_key = (user_code, pet_id)
         cached = self._cache.get(cache_key)
@@ -70,44 +91,111 @@ class PetFetcher:
             if time.monotonic() - ts < CACHE_TTL_SECONDS:
                 logger.debug("PetFetcher cache hit — pet_id=%d", pet_id)
                 return result["pet_profile"], result["aalda_facts"]
-            # Expired — fall through to fetch
+            # Expired — fall through to AALDA, keep cached for fallback
 
-        url = f"{self._base_url}/pet-profile/{pet_id}"
-        headers = {"X-User-Code": user_code}
-
+        # ── Try AALDA API ────────────────────────────────────────────────────
         try:
-            resp = await self._client.get(url, headers=headers)
-        except httpx.HTTPError as exc:
-            raise PetFetchError(
-                f"AALDA API unreachable: {exc}"
-            ) from exc
+            pet_profile, aalda_facts = await self._fetch_from_aalda(user_code, pet_id)
+        except PetFetchError as exc:
+            logger.warning("AALDA fetch failed for pet_id=%d: %s", pet_id, exc)
 
-        if resp.status_code != 200:
-            raise PetFetchError(
-                f"AALDA API returned {resp.status_code}: {resp.text[:200]}"
-            )
+            # ── Fallback 1: expired cache entry ──────────────────────────────
+            if cached:
+                result, _ = cached
+                logger.info("Using expired cache for pet_id=%d (AALDA down)", pet_id)
+                return result["pet_profile"], result["aalda_facts"]
 
-        body = resp.json()
-        if not body.get("success"):
-            raise PetFetchError(
-                f"AALDA API error: {body.get('message', 'unknown error')}"
-            )
+            # ── Fallback 2: DB (pets table) ──────────────────────────────────
+            if self._db_fallback:
+                db_profile = await self._db_fallback(pet_id)
+                if db_profile:
+                    logger.info("Using DB fallback for pet_id=%d (AALDA down, no cache)", pet_id)
+                    return db_profile, {}  # no aalda_facts from DB — just identity
 
-        data = body["data"]
-        pet_profile = self._extract_pet_profile(data)
-        aalda_facts = self._extract_aalda_facts(data)
+            # ── All fallbacks exhausted ──────────────────────────────────────
+            raise
 
-        # Cache the result
-        self._cache[cache_key] = (
-            {"pet_profile": pet_profile, "aalda_facts": aalda_facts},
-            time.monotonic(),
-        )
+        # ── Success: cache + persist to DB (W10) ─────────────────────────────
+        self._cache_result(cache_key, pet_profile, aalda_facts)
+
+        if self._db_persist:
+            try:
+                await self._db_persist(pet_profile)
+            except Exception as db_exc:
+                logger.warning("Failed to persist pet_id=%d to DB: %s", pet_id, db_exc)
 
         logger.info(
             "PetFetcher fetched pet_id=%d name=%s from AALDA",
             pet_id, pet_profile.get("name"),
         )
         return pet_profile, aalda_facts
+
+    # ── AALDA HTTP call (extracted for fallback logic) ─────────────────────────
+
+    async def _fetch_from_aalda(
+        self, user_code: str, pet_id: int,
+    ) -> tuple[dict, dict]:
+        """Raw AALDA API call. Raises PetFetchError on any failure."""
+        url = f"{self._base_url}/pet-profile/{pet_id}"
+        headers = {"X-User-Code": user_code}
+
+        t0 = time.monotonic()
+        try:
+            resp = await self._client.get(url, headers=headers)
+        except httpx.HTTPError as exc:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            logger.warning("AALDA API unreachable — pet_id=%d elapsed=%.0fms", pet_id, elapsed_ms)
+            raise PetFetchError(
+                f"AALDA API unreachable: {exc}"
+            ) from exc
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        logger.info("AALDA API responded — pet_id=%d status=%d elapsed=%.0fms", pet_id, resp.status_code, elapsed_ms)
+
+        if resp.status_code != 200:
+            raise PetFetchError(
+                f"AALDA API returned {resp.status_code}: {resp.text[:200]}"
+            )
+
+        try:
+            body = resp.json()
+        except Exception as exc:
+            raise PetFetchError(
+                f"AALDA API returned non-JSON response for pet_id={pet_id}: {resp.text[:200]}"
+            ) from exc
+
+        if not body.get("success"):
+            raise PetFetchError(
+                f"AALDA API error: {body.get('message', 'unknown error')}"
+            )
+
+        data = body.get("data")
+        if not data:
+            raise PetFetchError(
+                f"AALDA API returned no 'data' field for pet_id={pet_id}"
+            )
+
+        return self._extract_pet_profile(data), self._extract_aalda_facts(data)
+
+    # ── Cache management ───────────────────────────────────────────────────────
+
+    def _cache_result(
+        self, cache_key: tuple[str, int], pet_profile: dict, aalda_facts: dict,
+    ) -> None:
+        """Store result in cache and prune if oversized."""
+        now = time.monotonic()
+        self._cache[cache_key] = (
+            {"pet_profile": pet_profile, "aalda_facts": aalda_facts},
+            now,
+        )
+        if len(self._cache) > self.CACHE_MAX_SIZE:
+            expired = [k for k, (_, ts) in self._cache.items() if now - ts >= CACHE_TTL_SECONDS]
+            for k in expired:
+                del self._cache[k]
+            if len(self._cache) > self.CACHE_MAX_SIZE:
+                by_age = sorted(self._cache.items(), key=lambda item: item[1][1])
+                for k, _ in by_age[: len(self._cache) - self.CACHE_MAX_SIZE]:
+                    del self._cache[k]
 
     async def fetch_user_pets(self, user_code: str) -> list[dict]:
         """
@@ -134,7 +222,13 @@ class PetFetcher:
                 f"AALDA API returned {resp.status_code}: {resp.text[:200]}"
             )
 
-        body = resp.json()
+        try:
+            body = resp.json()
+        except Exception as exc:
+            raise PetFetchError(
+                f"AALDA API returned non-JSON response for user pets: {resp.text[:200]}"
+            ) from exc
+
         if not body.get("success"):
             raise PetFetchError(
                 f"AALDA API error: {body.get('message', 'unknown error')}"

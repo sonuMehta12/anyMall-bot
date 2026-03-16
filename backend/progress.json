@@ -782,15 +782,35 @@
       "files": ["frontend/"],
       "status": "not-started",
       "priority": "medium"
+    },
+    {
+      "id": "ft-013",
+      "name": "HistoryBuilder — pet history narrative from fact_log",
+      "description": "New LLM-based service (app/services/history_builder.py) that reads fact_log rows for a pet and builds a chronological narrative stored as _pet_history in active_profile. Similar pattern to ThreadSummarizer. Runs in _run_background() after Aggregator writes new facts. Focus on events and changes: health events, medication changes, behavioral shifts, vet visits, and time_scope='past' facts (which the Aggregator skips but are exactly what history needs). Prompt plumbing already wired — build_pet_context() extracts _pet_history, conversation.py template has {pet_history_section}.",
+      "files": ["app/services/history_builder.py", "app/routes/chat.py", "app/services/context_builder.py"],
+      "status": "not-started",
+      "priority": "high",
+      "depends_on": [],
+      "notes": "Prompt wiring done (2026-03-16). Only the builder itself + trigger in _run_background() remain."
+    },
+    {
+      "id": "ft-014",
+      "name": "SSE compaction notifications + message queuing",
+      "description": "Use Server-Sent Events (SSE) to notify the frontend when compaction is running. While compaction is in progress for a thread, incoming messages for that thread are queued (not dropped, not blocked silently). Frontend shows a 'processing' state. Once compaction finishes, queued messages are processed and frontend is notified it can resume. This replaces the current pattern where the per-thread lock makes Request B wait silently during compaction.",
+      "files": ["app/routes/chat.py", "app/routes/events.py", "frontend/"],
+      "status": "not-started",
+      "priority": "medium",
+      "depends_on": ["ft-013"],
+      "notes": "Per-thread asyncio.Lock (C2) is the current safety mechanism. SSE is the UX improvement on top — user sees 'compacting...' instead of a slow response. Design: SSE endpoint per thread, frontend subscribes on mount, server pushes compaction_start/compaction_done events."
     }
   ],
 
   "summary": {
-    "total_features": 68,
+    "total_features": 70,
     "complete": 64,
     "in_progress": 0,
     "blocked": 2,
-    "not_started": 7,
-    "note": "Phase 0-2 complete (63 features). ft-007 (API v1) complete — ready for handover 2026-03-16. ft-003 and ft-011 blocked on Flutter team input. Next: ft-006 batch A → Phase 3."
+    "not_started": 9,
+    "note": "Phase 0-2 complete (63 features). ft-007 (API v1) complete — ready for handover 2026-03-16. ft-003 and ft-011 blocked on Flutter team input. ft-013 (HistoryBuilder) plumbing wired. ft-014 (SSE compaction UX) planned. Next: ft-006 batch A → Phase 3."
   }
 }

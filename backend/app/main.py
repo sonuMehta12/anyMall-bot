@@ -45,7 +45,7 @@ from app.agents.compressor import CompressorAgent
 from app.agents.aggregator import AggregatorAgent
 from app.services.pet_fetcher import PetFetcher
 from app.db.session import init_db, dispose_engine, get_session
-from app.db.repositories import ThreadRepo, ThreadMessageRepo
+from app.db.repositories import PetRepo, ThreadRepo, ThreadMessageRepo
 from app.services.thread_summarizer import ThreadSummarizer
 
 # ── Route modules ─────────────────────────────────────────────────────────────
@@ -90,7 +90,21 @@ async def lifespan(app: FastAPI):
     await init_db(settings.database_url)
 
     # ── AALDA API client (fetches real pet data per-request) ──────────────
-    app.state.pet_fetcher = PetFetcher(settings.aalda_api_url)
+    # DB callbacks for fallback (W1) and persistence (W10)
+    async def _pet_db_fallback(pet_id: int) -> dict | None:
+        async with get_session() as session:
+            return await PetRepo(session).read(pet_id)
+
+    async def _pet_db_persist(pet_profile: dict) -> None:
+        async with get_session() as session:
+            await PetRepo(session).upsert(pet_profile)
+
+    app.state.pet_fetcher = PetFetcher(
+        settings.aalda_api_url,
+        db_fallback=_pet_db_fallback,
+        db_persist=_pet_db_persist,
+        timeout=settings.aalda_timeout_seconds,
+    )
 
     # ── LLM + Agents ─────────────────────────────────────────────────────
     llm = create_llm_provider(settings)
@@ -111,22 +125,41 @@ async def lifespan(app: FastAPI):
         active_threads = await thread_repo.get_all_active()
         sessions: dict[str, list] = {}
         for thread in active_threads:
-            messages = await msg_repo.read_thread(thread["thread_id"])
+            # Only load messages after the compaction cutoff (W12)
+            after_id = thread.get("compacted_before_id")
+            messages = await msg_repo.read_thread(thread["thread_id"], after_id=after_id)
             sessions[thread["thread_id"]] = messages
         app.state.sessions = sessions
         logger.info("Loaded %d active thread(s) from database.", len(sessions))
 
     app.state.session_meta = {}   # thread_id -> tracking metadata (gap questions, cooldowns)
+    app.state.compaction_in_progress = set()  # thread_ids currently being compacted (W3)
+    app.state.thread_locks: dict[str, asyncio.Lock] = {}  # per-thread locks (C2 — concurrent session safety)
+    app.state.background_tasks: set[asyncio.Task] = set()  # tracked tasks for graceful shutdown (W8)
 
     logger.info("Backend ready. LLM provider: %s", settings.llm_provider)
 
     yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────
-    # Brief grace period so in-flight background tasks (Compressor/Aggregator)
-    # can finish their DB writes before the connection pool is disposed.
-    logger.info("Shutting down — waiting for background tasks...")
-    await asyncio.sleep(2)
+    # ── Shutdown (W8 — graceful task tracking) ────────────────────────────
+    # Wait for in-flight background tasks (Compressor/Aggregator/Compaction)
+    # to finish their DB writes before the connection pool is disposed.
+    pending = app.state.background_tasks
+    if pending:
+        logger.info("Shutting down — waiting for %d background task(s)...", len(pending))
+        done, timed_out = await asyncio.wait(pending, timeout=10)
+        if timed_out:
+            logger.warning(
+                "Shutdown: %d task(s) did not finish in 10s — cancelling.",
+                len(timed_out),
+            )
+            for task in timed_out:
+                task.cancel()
+            # Give cancelled tasks a moment to handle CancelledError
+            await asyncio.wait(timed_out, timeout=2)
+    else:
+        logger.info("Shutting down — no background tasks pending.")
+
     await app.state.pet_fetcher.close()
     await dispose_engine()
     logger.info("Shutdown complete.")

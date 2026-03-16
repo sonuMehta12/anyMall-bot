@@ -27,7 +27,7 @@ router = APIRouter(prefix="/api/v1/simulator", tags=["simulator"])
 async def health_simulator(
     query: str = "",
     urgency: str = "low",
-    pet_id: str = "",
+    pet_id: int | None = None,
     pet_summary: str = "",
 ) -> HTMLResponse:
     """Phase 1 simulator — shows the pre-filled query and pet context a real Health module would receive."""
@@ -39,7 +39,7 @@ async def health_simulator(
 <html>
 <body style="font-family:sans-serif;padding:2rem;max-width:640px;margin:auto">
   <h2>Health Assistant <span style="font-size:0.9rem;color:#888">(Phase 1 Simulator)</span></h2>
-  <p><b>Pet ID:</b> {_html.escape(pet_id) or '<i>not provided</i>'}</p>
+  <p><b>Pet ID:</b> {_html.escape(str(pet_id)) if pet_id else '<i>not provided</i>'}</p>
   <p><b>Urgency:</b> <span style="color:{color};font-weight:bold">{safe_urgency.upper()}</span></p>
   <p><b>Pre-filled query:</b></p>
   <div style="background:#f5f5f5;padding:1rem;border-radius:8px;margin-bottom:1rem">{safe_query}</div>
@@ -56,7 +56,7 @@ async def health_simulator(
 async def food_simulator(
     query: str = "",
     urgency: str = "low",
-    pet_id: str = "",
+    pet_id: int | None = None,
     pet_summary: str = "",
 ) -> HTMLResponse:
     """Phase 1 simulator — shows the pre-filled query and pet context a real Food module would receive."""
@@ -66,7 +66,7 @@ async def food_simulator(
 <html>
 <body style="font-family:sans-serif;padding:2rem;max-width:640px;margin:auto">
   <h2>Food Specialist <span style="font-size:0.9rem;color:#888">(Phase 1 Simulator)</span></h2>
-  <p><b>Pet ID:</b> {_html.escape(pet_id) or '<i>not provided</i>'}</p>
+  <p><b>Pet ID:</b> {_html.escape(str(pet_id)) if pet_id else '<i>not provided</i>'}</p>
   <p><b>Pre-filled query:</b></p>
   <div style="background:#f5f5f5;padding:1rem;border-radius:8px;margin-bottom:1rem">{safe_query}</div>
   <p><b>Pet context received:</b></p>
