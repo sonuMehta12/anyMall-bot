@@ -22,9 +22,15 @@ from app.core.config import settings
 from app.llm.factory import create_llm_provider
 from app.agents.intent_classifier import IntentClassifier
 from app.agents.conversation import ConversationAgent
-from app.services.context_builder import build_context
+from app.services.context_builder import build_pet_context
 
-ACTIVE_PROFILE, GAP_LIST, PET_SUMMARY, PET_HISTORY, RELATIONSHIP_CONTEXT, _CONV = build_context()
+# Minimal dummy data for debug — replace with real AALDA data if needed
+_DUMMY_PROFILE = {"name": "Node", "species": "dog", "breed": "Toy Poodle", "date_of_birth": "2025-06-01", "sex": "male", "pet_id": 143}
+_ctx = build_pet_context(_DUMMY_PROFILE, {}, None)
+ACTIVE_PROFILE = _ctx["active_profile"]
+GAP_LIST = _ctx["gap_list"]
+PET_SUMMARY = _ctx["pet_summary"]
+RELATIONSHIP_CONTEXT = "New user — no relationship data yet."
 
 DIVIDER = "-" * 60
 
@@ -70,10 +76,8 @@ async def main() -> None:
         response = await agent.run(
             user_message=message,
             session_messages=[],
-            active_profile=ACTIVE_PROFILE,
-            gap_list=GAP_LIST,
-            pet_summary=PET_SUMMARY,
-            pet_history=PET_HISTORY,
+            pet_a_context=_ctx,
+            pet_b_context=None,
             relationship_context=RELATIONSHIP_CONTEXT,
             intent_type=intent_type,
             questions_asked_so_far=0,

@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     # Lifespan crashes with a clear error if this is None at runtime.
     database_url: str | None = None
 
+    # ── AALDA API ──────────────────────────────────────────────────────────
+    # External API for real pet data (profiles, diets, vaccinations).
+    # Backend calls this on every chat request (cached in memory for 5 min).
+    aalda_api_url: str = "https://anymall-api.stagingapp.in/api/v1"
+
     # ── pydantic-settings configuration ──────────────────────────────────────
     # env_file: which file to read from disk.
     # env_file_encoding: always utf-8.

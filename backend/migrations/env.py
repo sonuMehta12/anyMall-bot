@@ -27,7 +27,11 @@ config = context.config
 # Override the URL from alembic.ini with our Settings value (reads .env).
 # This ensures alembic.ini doesn't need to be kept in sync manually.
 if settings.database_url:
-    config.set_main_option("sqlalchemy.url", settings.database_url)
+    db_url = settings.database_url
+    # Railway/Render provide postgresql:// but asyncpg needs postgresql+asyncpg://
+    if db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    config.set_main_option("sqlalchemy.url", db_url)
 
 # Set up Python logging from alembic.ini [loggers] section.
 if config.config_file_name is not None:

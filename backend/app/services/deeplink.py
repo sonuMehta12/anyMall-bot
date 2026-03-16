@@ -3,25 +3,14 @@
 # Builds the redirect payload when a health or food intent is detected.
 #
 # What lives here:
-#   - DeeplinkPayload  — a typed dataclass describing every field the mobile
-#                        app needs to navigate to the Health or Food module
-#   - build_deeplink() — pure function: IntentFlags + message → payload or None
+#   - DeeplinkPayload  — a typed dataclass describing the redirect data
+#   - build_deeplink() — pure function: intent + message → payload or None
 #
-# What does NOT live here:
-#   - Intent detection  (guardrails.py)
-#   - Response cleaning (guardrails.py)
-#   - HTTP routing      (main.py)
+# Design principle: Backend says WHAT (module, context), client decides HOW to navigate.
+# No URLs in the payload — Flutter uses screen routes, React opens simulator pages.
 #
-# Why a separate file?
-#   guardrails.py is about reading and cleaning text.
-#   deeplink.py is about building a navigation payload.
-#   Keeping them separate means each file has one clear job.
-#
-# Phase 1 note:
-#   pet_summary carries the full NL pet profile inline in the payload.
-#   In Phase 2 (Redis), this becomes a pet_context_key that the Health/Food
-#   module fetches itself — same information, different delivery mechanism.
-#   Changing that requires only a small edit to build_deeplink() here.
+# pet_summary is included BY DESIGN — the health/food module needs full pet context
+# to give good advice. This is intentional, not a hack.
 
 import logging
 from dataclasses import dataclass
@@ -29,7 +18,7 @@ from dataclasses import dataclass
 from constants import (
     INTENT_HEALTH,
     INTENT_FOOD,
-    URGENCY_LOW,
+    URGENCY_HIGH,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,19 +26,20 @@ logger = logging.getLogger(__name__)
 
 # ── DeeplinkPayload ────────────────────────────────────────────────────────────
 #
-# Every field the mobile app needs to:
-#   1. Navigate to the correct module (module + deep_link)
-#   2. Pre-fill the user's question (pre_populated_query)
-#   3. Give the module Luna's context (pet_summary)
-#   4. Style the button correctly (urgency)
+# Every field the client needs to:
+#   1. Navigate to the correct module (module)
+#   2. Show the redirect button (display_label, display_style)
+#   3. Pass context to the target module (query, pet_id, pet_summary)
 
 @dataclass
 class DeeplinkPayload:
-    module: str               # "health" | "food" — which module to open
-    deep_link: str            # full URL to navigate to (localhost in Phase 1)
-    pre_populated_query: str  # user's original message, pre-filled in the module's input
-    pet_summary: str          # NL pet profile — so health/food module knows about this pet
-    urgency: str              # "high" | "medium" | "low" — drives button colour + alert
+    module: str           # "health" | "food" — which module to navigate to
+    urgency: str          # "high" | "medium" — from IntentClassifier
+    display_label: str    # button text: "Talk to Health Assistant" etc.
+    display_style: str    # "urgent" (red) | "suggestion" (orange)
+    query: str            # user's original message, pre-filled in the module
+    pet_id: int           # which pet, so the module can fetch its own data
+    pet_summary: str      # full NL pet context — by design, module needs this
 
 
 # ── build_deeplink ─────────────────────────────────────────────────────────────
@@ -59,7 +49,7 @@ def build_deeplink(
     urgency: str,
     user_message: str,
     pet_summary: str,
-    base_url: str = "http://localhost:8000",
+    pet_id: int,
 ) -> DeeplinkPayload | None:
     """
     Build a redirect payload if the intent requires one. Returns None for general messages.
@@ -67,24 +57,25 @@ def build_deeplink(
     Args:
         intent_type:   Output of IntentClassifier — "health", "food", or "general".
         urgency:       Output of IntentClassifier — "high", "medium", or "low".
-        user_message:  The raw user message. Goes into pre_populated_query so the
-                       user doesn't have to retype it in the Health/Food module.
+        user_message:  The raw user message, pre-filled in the target module.
         pet_summary:   NL string describing the pet (from context_builder.py).
-                       Passed inline so the module has context without a Redis lookup.
-        base_url:      Root URL for the simulator links. Defaults to localhost:8000.
-                       In production: change to the real mobile deeplink scheme.
+        pet_id:        Which pet this conversation is about.
 
     Returns:
         DeeplinkPayload if intent is health or food.
         None if intent is general — no redirect needed.
     """
+    style = "urgent" if urgency == URGENCY_HIGH else "suggestion"
+
     if intent_type == INTENT_HEALTH:
         payload = DeeplinkPayload(
             module="health",
-            deep_link=f"{base_url}/health/chat",
-            pre_populated_query=user_message,
-            pet_summary=pet_summary,
             urgency=urgency,
+            display_label="Talk to Health Assistant",
+            display_style=style,
+            query=user_message,
+            pet_id=pet_id,
+            pet_summary=pet_summary,
         )
         logger.info("build_deeplink → health redirect built, urgency=%s", urgency)
         return payload
@@ -92,12 +83,14 @@ def build_deeplink(
     if intent_type == INTENT_FOOD:
         payload = DeeplinkPayload(
             module="food",
-            deep_link=f"{base_url}/food/chat",
-            pre_populated_query=user_message,
+            urgency=urgency,
+            display_label="Talk to Food Specialist",
+            display_style=style,
+            query=user_message,
+            pet_id=pet_id,
             pet_summary=pet_summary,
-            urgency=urgency,       # pass through classifier's urgency
         )
-        logger.info("build_deeplink → food redirect built")
+        logger.info("build_deeplink → food redirect built, urgency=%s", urgency)
         return payload
 
     # General message — no redirect

@@ -31,14 +31,17 @@ We build the minimum that works at each phase. We do not add complexity until th
 simple version is working and understood. Every line of code is written with full
 understanding of what it does and why it is there.
 
-**Current goal: Phase 2 ✓ complete → Phase 3 (nightly batch jobs) next.**
+**Current goal: Phase 2 ✓ complete, API v1 ✓ complete → Phase 3 (nightly batch jobs) next.**
 
 Phase 0 ✓. Phase 1A ✓. Phase 1B ✓. Phase 1C ✓ (PostgreSQL replaces JSON files).
 Phase 2 ✓ (Thread & Conversation Management — 24h thread windows, write-through message persistence, startup reload, LLM compaction, cross-thread continuity via conversation_summary).
+API v1 ✓ (versioned endpoints under `/api/v1/`, standardized error contract, restructured redirect payload, `pet_context` removed from request).
 
 **Known gaps before production (tracked in progress.json future_tasks):**
 - `ft-002`: Cleanup — delete deprecated `file_store.py`, `app/models/context.py`, `data/` directory
-- `ft-003`: Wire `x-user-code` header — currently `DEFAULT_PET_ID="luna-001"` is hardcoded in aggregator.py and chat.py. `app.state.active_profile` is one dict (Luna only). Multi-user requires: read header → look up UserRepo → get real pet_id → pass through pipeline. Coordinate with Phase 2 Redis (which replaces in-memory profile store).
+- `ft-003`: Wire `x-user-code` header — blocked on Flutter team clarification. Currently `DEFAULT_PET_ID="luna-001"` is hardcoded.
+- `ft-011`: AALDA API integration — backend should fetch pet data by `pet_id` instead of using defaults. Blocked on API details from Flutter team. See `design-docs/aalda-integration.md`.
+- `ft-012`: Remove DEFAULT_PET_ID/USER_ID fallbacks — after ft-011 and ft-003 are done.
 
 ---
 
@@ -58,7 +61,7 @@ See `notes.md` Phase 1A section for full details.
 **What Phase 1A added:**
 - `app/agents/intent_classifier.py` — LLM-based classifier runs before Agent 1 every request
 - `app/services/deeplink.py` — builds redirect payload for health/food intents
-- Simulator endpoints: `GET /health/chat` and `GET /food/chat`
+- Simulator endpoints: `GET /api/v1/simulator/health` and `GET /api/v1/simulator/food`
 
 **What Phase 1A removed:**
 - `IntentFlags` dataclass and `classify_intent()` from `guardrails.py` — replaced by LLM
@@ -82,7 +85,7 @@ User message
     → build_deeplink()            (food LOW urgency → no redirect)
     → confidence_calculator()     confidence_score + confidence_color (reads from app.state)
     → Append to app.state.sessions[thread_id]  (in-memory, keyed by thread_id)
-    → Return response to user     (includes thread_id, new_thread, is_entity, intent_type, urgency, confidence)
+    → Return response to user     (includes status, thread_id, new_thread, is_entity, intent_type, urgency, confidence)
     ↓  [fire-and-forget — user does NOT wait]
     → _run_background(AgentState)
          → Write-through messages   → PostgreSQL thread_messages table
@@ -98,7 +101,7 @@ User message
 - Aggregator mutates `app.state.active_profile` by reference, writes through to PostgreSQL for persistence
 - Messages appended to `app.state.sessions[thread_id]` synchronously, written through to `thread_messages` table in `_run_background()`
 - `build_context()` accepts optional in-memory profiles + `conversation_summary`; returns 6 values
-- `GET /confidence` reads from `app.state` — frontend calls on mount + 4s after each message
+- `GET /api/v1/confidence` reads from `app.state` — frontend calls on mount + 4s after each message
 
 **File structure — current state (Phase 2 complete):**
 ```
@@ -117,12 +120,12 @@ backend/
 |   |   `-- repositories.py          # PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
 |   |-- routes/
 |   |   |-- __init__.py
-|   |   |-- chat.py                  # POST /chat + thread boundary + _run_background() + _run_compaction()
-|   |   |-- debug.py                 # GET /debug/facts, /debug/profile, /debug/threads, /debug/thread/{id}/messages
-|   |   `-- simulator.py             # GET /health/chat, GET /food/chat (Phase 1 HTML)
+|   |   |-- chat.py                  # POST /api/v1/chat + GET /api/v1/confidence + thread boundary + _run_background()
+|   |   |-- debug.py                 # GET /api/v1/debug/facts, /profile, /threads, /thread/{id}/messages
+|   |   `-- simulator.py             # GET /api/v1/simulator/health, GET /api/v1/simulator/food
 |   |-- services/
 |   |   |-- guardrails.py            # apply_guardrails() only
-|   |   |-- deeplink.py              # build_deeplink()
+|   |   |-- deeplink.py              # build_deeplink() — returns data (module, display, context), no URLs
 |   |   |-- context_builder.py       # load_profiles_from_db() + build_context() — returns 6 context values
 |   |   |-- confidence_calculator.py # confidence_score + confidence_color
 |   |   `-- thread_summarizer.py     # Phase 2 — LLM summarization for thread compaction
@@ -153,10 +156,11 @@ backend/
 |   |-- system.md                    # PRD review notes
 |   |-- session-management.md        # Phase 2 design doc — thread lifecycle, compaction, write-through
 |   |-- prompt-gap-analysis.md       # 17-gap comparison: current prompt vs PW1-PRD v0.2b
-|   `-- prompt-v2-proposal.md        # Approved prompt v2 design + review checklist
-|-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health, DB init, thread reload
+|   |-- prompt-v2-proposal.md        # Approved prompt v2 design + review checklist
+|   `-- api-v1-design.md             # API v1 design doc — versioning, error contract, redirect structure
+|-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health, error handlers, DB init
 |-- tests/
-|   `-- run_e2e.py                   # e2e tests (includes Section 7: Thread Management)
+|   `-- run_e2e.py                   # e2e tests (8 sections: infra, intent, session, compressor, aggregator, DB, threads, API v1)
 `-- data/                            # gitignored — DEPRECATED (Phase 1B legacy, no longer written to)
 ```
 
@@ -194,7 +198,7 @@ npm run dev   (starts on http://localhost:5173)
 
 **Option 2 — curl:**
 ```bash
-curl -X POST http://localhost:8000/chat \
+curl -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Luna seems tired today", "session_id": "test-1"}'
 ```
@@ -274,6 +278,7 @@ Migration path: set `LLM_PROVIDER=openai` in `.env`. No agent code changes.
 
 ```
 Phase 0  (DONE): POST /chat → Agent 1 → response. Hardcoded pet context.
+                 (Note: /chat is now /api/v1/chat after API v1 migration)
 
 Phase 1A (DONE): IntentClassifier (LLM) before Agent 1. Health/food redirect logic.
                  Removed regex entity pipeline. Deeplink payload in API response.
@@ -293,6 +298,12 @@ Phase 2  (DONE): Thread & Conversation Management. 24h thread windows with hard 
                   active threads. LLM compaction (ThreadSummarizer) when messages exceed 50.
                   Cross-thread continuity via conversation_summary passed to Agent 1.
                   New tables: threads, thread_messages. New debug endpoints.
+
+API v1  (DONE):  All endpoints versioned under /api/v1/ (except /health).
+                  Standardized error contract: {"status":"error","error":{"code","message"}}.
+                  Redirect payload restructured: display{label,style} + context{query,pet_id,pet_summary}.
+                  pet_context removed from request — backend uses pet_id + DEFAULT_PET_ID fallback.
+                  See design-docs/api-v1-design.md for full specification.
 
 Phase 3:         Nightly batch jobs
 
@@ -339,7 +350,7 @@ alembic upgrade head
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 # 6. Test
-curl -X POST http://localhost:8000/chat \
+curl -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Luna seems tired today", "session_id": "test-1"}'
 ```

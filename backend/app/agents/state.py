@@ -32,6 +32,7 @@ class AgentState:
     session_id: str
     thread_id: str     # Phase 2 — backend's thread UUID for DB writes
     user_message: str
+    pet_id: int        # AALDA pet_id — used by background pipeline for DB writes
     pet_name: str
     pet_species: str
     pet_age: str

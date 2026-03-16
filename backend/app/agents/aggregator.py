@@ -29,7 +29,6 @@ from datetime import datetime, timezone
 
 from app.agents.compressor import ExtractedFact
 from app.db.repositories import ActiveProfileRepo
-from constants import DEFAULT_PET_ID
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +95,7 @@ class AggregatorAgent:
         facts: list[ExtractedFact],
         session_id: str,
         active_profile: dict | None = None,
+        pet_id: int = 0,
     ) -> dict:
         """
         Merge a list of high-confidence facts into active_profile.
@@ -129,7 +129,7 @@ class AggregatorAgent:
             if changes > 0 and self._get_session is not None:
                 async with self._get_session() as session:
                     repo = ActiveProfileRepo(session)
-                    await repo.write_all(DEFAULT_PET_ID, profile)
+                    await repo.write_all(pet_id, profile)
 
             logger.info(
                 "Aggregator done — session=%s facts=%d changes=%d",

@@ -1,94 +1,31 @@
 # app/services/context_builder.py
 #
-# Builds the 6 context values Agent 1 needs on every request:
-#   (active_profile_dict, gap_list, pet_summary, pet_history,
-#    relationship_context, conversation_summary)
+# Builds context values Agent 1 needs on every request.
 #
-# Two loaders:
-#   load_profiles_from_db()  — Phase 1C. Reads from PostgreSQL, seeds if empty.
-#   load_profiles()          — DEPRECATED (Phase 1B). Reads from JSON files.
-#                              Kept only for backward compatibility with older tests.
+# build_pet_context() — builds context for ONE pet:
+#   (active_profile, gap_list, pet_info_json, pet_summary)
 #
-# build_context() accepts in-memory dicts from app.state. No DB or disk I/O
-# on the hot path. Callers don't change.
+# Pet data comes from:
+#   - pet_profile: static identity from AALDA API (via pet_fetcher.py)
+#   - aalda_facts: dynamic facts from AALDA (nutrition, diet, vaccinations)
+#   - active_profile_raw: learned facts from DB (via Compressor/Aggregator pipeline)
+#
+# No defaults. No seeding. No fallbacks. If AALDA is down → error.
 
+import json
 import logging
 from datetime import date
 
-from constants import DEFAULT_PET_ID, DEFAULT_USER_ID, FULL_FIELD_LIST
+from constants import FULL_FIELD_LIST
+from app.services.pet_fetcher import compute_current_age
 
 logger = logging.getLogger(__name__)
 
 
-# ── Seed defaults ─────────────────────────────────────────────────────────────
-#
-# Same data that was in dummy_context.py. Seeded to PostgreSQL on first startup.
-# After that, the database is the source of truth.
-
-_DEFAULT_PET_PROFILE: dict = {
-    "pet_id": "luna-001",
-    "name": "Luna",
-    "species": "dog",
-    "breed": "Shiba Inu",
-    "date_of_birth": "2024-01-15",
-    "sex": "female",
-    "life_stage": "adult",
-}
-
-_DEFAULT_ACTIVE_PROFILE: dict = {
-    "_pet_history": (
-        "3 weeks ago: owner mentioned Luna had an ear infection; vet prescribed "
-        "antibiotics. Last session: owner said Luna seemed less energetic than "
-        "usual, but improving since starting the medication."
-    ),
-    "diet_type": {
-        "value": "raw food",
-        "confidence": 0.80,
-    },
-    "medications": {
-        "value": "antibiotics (ear infection)",
-        "confidence": 0.90,
-    },
-    "energy_level": {
-        "value": "moderate",
-        "confidence": 0.70,
-    },
-    "neutered_spayed": {
-        "value": "yes",
-        "confidence": 0.85,
-    },
-    "chronic_illness": {
-        "value": "none",
-        "confidence": 0.75,
-    },
-}
-
-_DEFAULT_USER_PROFILE: dict = {
-    "user_id": "shara-001",
-    "pet_id": "luna-001",
-    "session_count": 7,
-    "relationship_summary": (
-        "Owner (Shara) tends to be anxious. Prefers short replies. "
-        "7 sessions total. Usually chats in evenings."
-    ),
-    "updated_at": "2025-01-01T00:00:00+00:00",
-}
-
 # Fields that come from PetProfile (onboarding) — always known, not gaps.
-# These are merged into active_profile as high-confidence entries but excluded
-# from gap_list computation because they are never "missing".
 _IDENTITY_FIELDS: set[str] = {"name", "species", "breed", "age", "sex"}
 
-_DEFAULT_PET_HISTORY: str = (
-    "3 weeks ago: owner mentioned Luna had an ear infection; vet prescribed "
-    "antibiotics. Last session: owner said Luna seemed less energetic than "
-    "usual, but improving since starting the medication."
-)
-
-_DEFAULT_RELATIONSHIP_CONTEXT: str = (
-    "Owner (Shara) tends to be anxious. Prefers short replies. "
-    "7 sessions total. Usually chats in evenings."
-)
+_DEFAULT_RELATIONSHIP_CONTEXT: str = "New user — no relationship data yet."
 
 
 # ── Age computation ───────────────────────────────────────────────────────────
@@ -100,7 +37,7 @@ def _compute_age_str(date_of_birth: str) -> str:
     Returns "unknown age" if date_of_birth is "unknown" or unparseable.
     Returns "N months" if under 1 year, "N years" otherwise.
     """
-    if date_of_birth == "unknown":
+    if not date_of_birth or date_of_birth == "unknown":
         return "unknown age"
 
     try:
@@ -125,8 +62,7 @@ def _build_pet_summary(pet_profile: dict, active_entries: dict) -> str:
     """
     Build a natural-language summary of the pet from structured data.
 
-    No LLM — pure f-string template. Matches the shape of the old PET_SUMMARY
-    from dummy_context.py.
+    No LLM — pure f-string template.
     """
     name = pet_profile.get("name", "the pet")
     age_str = _compute_age_str(pet_profile.get("date_of_birth", "unknown"))
@@ -164,158 +100,83 @@ def _build_pet_summary(pet_profile: dict, active_entries: dict) -> str:
     if energy:
         parts.append(f"generally has {energy} energy level")
 
-    # Join with periods
     summary = ". ".join(parts) + "."
     return summary
 
 
-# ── Load profiles from JSON (DEPRECATED — Phase 1B) ─────────────────────────
+# ── Pet info JSON (for v0.3 prompt) ───────────────────────────────────────────
 
-def load_profiles() -> dict[str, dict]:
+def _build_pet_info_json(pet_profile: dict, aalda_facts: dict) -> str:
     """
-    DEPRECATED — Phase 1C uses load_profiles_from_db() instead.
-    Kept for backward compatibility with tests that don't use a database.
+    Build the pet_info JSON string for the v0.3 prompt template.
 
-    Read all three profile files from disk, seeding defaults if needed.
-    Uses lazy import to avoid importing file_store at module level.
+    The prompt expects a JSON object with fields like name, species, breed,
+    sex, current_age, is_neutered, activity_level, diet, vaccinations, etc.
     """
-    from app.storage.file_store import (
-        read_pet_profile, write_pet_profile,
-        read_active_profile, write_active_profile,
-        read_user_profile, write_user_profile,
-    )
+    dob = pet_profile.get("date_of_birth", "unknown")
+    current_age = compute_current_age(dob)
 
-    pet = read_pet_profile()
-    if pet is None:
-        logger.info("pet_profile.json not found — seeding with Luna defaults.")
-        pet = dict(_DEFAULT_PET_PROFILE)
-        write_pet_profile(pet)
+    info = {
+        "name": pet_profile.get("name", ""),
+        "species": pet_profile.get("species", ""),
+        "breed": pet_profile.get("breed", ""),
+        "sex": pet_profile.get("sex", "unknown"),
+        "current_age": current_age,
+    }
 
-    active = read_active_profile()
-    if active is None:
-        logger.info("active_profile.json not found — seeding with defaults.")
-        active = dict(_DEFAULT_ACTIVE_PROFILE)
-        write_active_profile(active)
+    # Add AALDA facts if available
+    neutered = aalda_facts.get("neutered_spayed", {})
+    if neutered:
+        info["is_neutered"] = neutered.get("value", "") == "yes"
 
-    user = read_user_profile()
-    if user is None:
-        logger.info("user_profile.json not found — seeding with Shara defaults.")
-        user = dict(_DEFAULT_USER_PROFILE)
-        write_user_profile(user)
+    activity = aalda_facts.get("activity_level", {})
+    if activity:
+        info["activity_level"] = activity.get("value", "")
 
-    return {"active": active, "pet": pet, "user": user}
+    bcs = aalda_facts.get("body_condition_score", {})
+    if bcs:
+        info["body_condition_score"] = bcs.get("value", "")
 
+    diet = aalda_facts.get("diet_type", {})
+    if diet:
+        info["diet"] = diet.get("value", "")
 
-# ── Load profiles from PostgreSQL (Phase 1C) ────────────────────────────────
+    food_brand = aalda_facts.get("food_brand", {})
+    if food_brand:
+        info["food_brand"] = food_brand.get("value", "")
 
-async def load_profiles_from_db(
-    pet_repo,
-    user_repo,
-    active_repo,
-) -> dict[str, dict]:
-    """
-    Read all profiles from PostgreSQL, seeding Luna + Shara defaults if empty.
+    vaccinations = aalda_facts.get("vaccinations", {})
+    if vaccinations:
+        info["vaccinations"] = vaccinations.get("value", "")
 
-    Called once at startup by lifespan() in main.py.  Same contract as
-    load_profiles() — returns {"active": dict, "pet": dict, "user": dict}.
-
-    Args:
-        pet_repo: PetRepo instance (from app.db.repositories).
-        user_repo: UserRepo instance.
-        active_repo: ActiveProfileRepo instance.
-    """
-    pet = await pet_repo.read(DEFAULT_PET_ID)
-    if pet is None:
-        logger.info("No pet in DB — seeding Luna defaults.")
-        await pet_repo.upsert(_DEFAULT_PET_PROFILE)
-        pet = dict(_DEFAULT_PET_PROFILE)
-
-    active = await active_repo.read_all(DEFAULT_PET_ID)
-    if active is None:
-        logger.info("No active_profile in DB — seeding defaults.")
-        await active_repo.write_all(DEFAULT_PET_ID, _DEFAULT_ACTIVE_PROFILE)
-        active = dict(_DEFAULT_ACTIVE_PROFILE)
-
-    user = await user_repo.read(DEFAULT_USER_ID)
-    if user is None:
-        logger.info("No user in DB — seeding Shara defaults.")
-        await user_repo.upsert(_DEFAULT_USER_PROFILE)
-        user = dict(_DEFAULT_USER_PROFILE)
-
-    return {"active": active, "pet": pet, "user": user}
+    return json.dumps(info, ensure_ascii=False, indent=2)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def build_context(
-    active_profile_raw: dict | None = None,
-    pet_profile: dict | None = None,
-    user_profile: dict | None = None,
-    conversation_summary: str | None = None,
-) -> tuple[dict, list[str], str, str, str, str]:
+def build_pet_context(
+    pet_profile: dict,
+    aalda_facts: dict,
+    active_profile_raw: dict | None,
+) -> dict:
     """
-    Build the 6 context values Agent 1 needs on every request.
+    Build context for ONE pet.
 
-    Parameters
-    ----------
-    active_profile_raw, pet_profile, user_profile : dict | None
-        When provided (from app.state), used directly — no disk I/O.
-        When None, falls back to reading from disk (backward compatible).
-    conversation_summary : str | None
-        Phase 2: compaction summary from the current or previous thread.
-        Passed through unchanged — no processing here.
+    Args:
+        pet_profile: static identity from AALDA (name, species, breed, etc.)
+        aalda_facts: dynamic facts from AALDA (neutered, diet, vaccinations)
+        active_profile_raw: learned facts from DB (Compressor/Aggregator output)
 
-    Returns
-    -------
-    (active_profile_dict, gap_list, pet_summary, pet_history,
-     relationship_context, conversation_summary)
-
-    The returned active_profile_dict matches the shape conversation.py expects:
-        {"field_name": {"value": "...", "confidence": N}, ...}
+    Returns:
+        dict with keys:
+          active_profile: merged dict of all known facts
+          gap_list: list of field names we don't know yet
+          pet_info_json: JSON string for v0.3 prompt
+          pet_summary: NL paragraph for deeplink context
     """
+    active_raw = active_profile_raw or {}
 
-    # ── 1. Resolve pet_profile ───────────────────────────────────────────────
-    # In Phase 1C, profiles always come from app.state (populated from DB at
-    # startup). The None fallback is a deprecated path for old tests only.
-    if pet_profile is None:
-        from app.storage.file_store import read_pet_profile, write_pet_profile
-        pet_profile = read_pet_profile()
-        if pet_profile is None:
-            logger.info("pet_profile.json not found — seeding with Luna defaults.")
-            pet_profile = dict(_DEFAULT_PET_PROFILE)
-            write_pet_profile(pet_profile)
-
-    # ── 2. Resolve active_profile ────────────────────────────────────────────
-    active_raw = active_profile_raw
-    if active_raw is None:
-        from app.storage.file_store import read_active_profile, write_active_profile
-        active_raw = read_active_profile()
-        if active_raw is None:
-            logger.info("active_profile.json not found — seeding with defaults.")
-            active_raw = dict(_DEFAULT_ACTIVE_PROFILE)
-            write_active_profile(active_raw)
-
-    # ── 3. Resolve user_profile ──────────────────────────────────────────────
-    if user_profile is None:
-        from app.storage.file_store import read_user_profile, write_user_profile
-        user_profile = read_user_profile()
-        if user_profile is None:
-            logger.info("user_profile.json not found — seeding with Shara defaults.")
-            user_profile = dict(_DEFAULT_USER_PROFILE)
-            write_user_profile(user_profile)
-
-    # ── 4. Merge pet_profile static fields into active_profile ───────────────
-    #
-    # Agent 1 expects a single dict with ALL known facts — both static (name,
-    # breed) and dynamic (diet, medications). We merge pet_profile fields as
-    # high-confidence entries so the combined dict matches what Agent 1 has
-    # always received from dummy_context.py.
-    #
-    # Read _pet_history via .get() — do NOT mutate active_raw.
-    pet_history_raw = active_raw.get("_pet_history", _DEFAULT_PET_HISTORY)
-    pet_history_str = pet_history_raw if isinstance(pet_history_raw, str) else _DEFAULT_PET_HISTORY
-
-    # Start with active_profile dynamic entries (skip _-prefixed metadata keys)
+    # ── 1. Start with dynamic entries from DB (skip _-prefixed metadata)
     merged: dict = {}
     for key, entry in active_raw.items():
         if key.startswith("_"):
@@ -323,7 +184,12 @@ def build_context(
         if isinstance(entry, dict) and "value" in entry:
             merged[key] = entry
 
-    # Add pet_profile static fields as high-confidence entries
+    # ── 2. Layer AALDA facts on top (AALDA wins for overlapping fields)
+    for key, entry in aalda_facts.items():
+        if isinstance(entry, dict) and "value" in entry:
+            merged[key] = entry
+
+    # ── 3. Add pet_profile static fields as high-confidence entries
     age_str = _compute_age_str(pet_profile.get("date_of_birth", "unknown"))
 
     static_fields = {
@@ -338,25 +204,66 @@ def build_context(
         if entry["value"] and entry["value"] != "unknown":
             merged[key] = entry
 
-    # ── 5. Compute gap_list ──────────────────────────────────────────────────
-    #
-    # FULL_FIELD_LIST minus keys present in merged dict.
-    # Exclude identity fields — they are always known from onboarding.
+    # ── 4. Compute gap_list
     present_keys = set(merged.keys())
     gap_list = [
         field for field in FULL_FIELD_LIST
         if field not in present_keys and field not in _IDENTITY_FIELDS
     ]
 
-    # ── 6. Compute pet_summary ───────────────────────────────────────────────
+    # ── 5. Build pet_summary (for deeplink context)
     pet_summary = _build_pet_summary(pet_profile, merged)
 
-    # ── 7. Read pet_history ──────────────────────────────────────────────────
-    pet_history = pet_history_str
+    # ── 6. Build pet_info JSON (for v0.3 prompt)
+    pet_info_json = _build_pet_info_json(pet_profile, aalda_facts)
 
-    # ── 8. Read relationship_context ─────────────────────────────────────────
-    relationship_context = user_profile.get(
-        "relationship_summary", _DEFAULT_RELATIONSHIP_CONTEXT
-    )
+    return {
+        "active_profile": merged,
+        "gap_list": gap_list,
+        "pet_info_json": pet_info_json,
+        "pet_summary": pet_summary,
+    }
 
-    return merged, gap_list, pet_summary, pet_history, relationship_context, conversation_summary or ""
+
+def build_context(
+    pet_profiles: list[dict],
+    aalda_facts_list: list[dict],
+    active_profiles: list[dict | None],
+    user_profile: dict | None = None,
+    conversation_summary: str = "",
+) -> dict:
+    """
+    Build context for 1 or 2 pets.
+
+    Args:
+        pet_profiles: 1-2 pet profile dicts from AALDA
+        aalda_facts_list: 1-2 aalda_facts dicts from pet_fetcher
+        active_profiles: 1-2 active profile dicts from DB (None if no data yet)
+        user_profile: user profile dict from DB (None if new user)
+        conversation_summary: compaction summary from thread
+
+    Returns:
+        dict with keys:
+          pet_contexts: list of 1-2 pet context dicts
+          relationship_context: str
+          conversation_summary: str
+    """
+    pet_contexts = []
+    for i, pet_profile in enumerate(pet_profiles):
+        aalda_facts = aalda_facts_list[i] if i < len(aalda_facts_list) else {}
+        active_raw = active_profiles[i] if i < len(active_profiles) else None
+        ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
+        pet_contexts.append(ctx)
+
+    # Relationship context from user profile
+    relationship_context = _DEFAULT_RELATIONSHIP_CONTEXT
+    if user_profile:
+        relationship_context = user_profile.get(
+            "relationship_summary", _DEFAULT_RELATIONSHIP_CONTEXT
+        )
+
+    return {
+        "pet_contexts": pet_contexts,
+        "relationship_context": relationship_context,
+        "conversation_summary": conversation_summary,
+    }

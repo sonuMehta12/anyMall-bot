@@ -441,12 +441,11 @@ GAP_LADDER_ALL_KEYS: list[str] = [
 ]
 
 
-# ── 10. Default IDs (Phase 1C — single pet, single user) ─────────────────────
+# ── 10. Default IDs — REMOVED ─────────────────────────────────────────────────
 #
-# Hardcoded for Phase 1C. Multi-pet/multi-user support comes in Phase 4+.
-
-DEFAULT_PET_ID: str = "luna-001"
-DEFAULT_USER_ID: str = "shara-001"
+# DEFAULT_PET_ID and DEFAULT_USER_ID were removed in the AALDA integration sprint.
+# Pet data comes from the AALDA API. User identity comes from the X-User-Code header.
+# Missing X-User-Code → 401.  Invalid pet_id → 400.
 
 
 # ── 11. Intent Type Constants ─────────────────────────────────────────────────

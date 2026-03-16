@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ChatBubble from '../components/ChatBubble.jsx'
 import ConfidenceBar from '../components/ConfidenceBar.jsx'
-import { sendMessage, fetchConfidence } from '../api.js'
+import { sendMessage, fetchConfidence, BASE } from '../api.js'
 import './Chat.css'
 
 const SPECIES_EMOJI = { dog: '🐕', cat: '🐱' }
@@ -11,7 +11,7 @@ function makeSessionId() {
   return `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-export default function Chat({ pet, parentName }) {
+export default function Chat({ selectedPets, userCode, onBack }) {
   const [sessionId] = useState(makeSessionId)   // created once, never changes
   const [messages, setMessages] = useState([])
   const [inputText, setInputText] = useState('')
@@ -23,14 +23,19 @@ export default function Chat({ pet, parentName }) {
   const messagesEndRef = useRef(null)
   const textareaRef = useRef(null)
 
+  const petIds = selectedPets.map(p => p.pet_id)
+  const primaryPet = selectedPets[0]
+  const petNames = selectedPets.map(p => p.name).join(' & ')
+
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isTyping])
 
-  // Fetch confidence score on mount (before any chat messages)
+  // Fetch confidence score on mount (for primary pet)
   useEffect(() => {
-    fetchConfidence()
+    if (!primaryPet) return
+    fetchConfidence(primaryPet.pet_id, userCode)
       .then(data => {
         setConfidenceScore(data.confidence_score ?? 0)
         setConfidenceColor(data.confidence_color ?? 'red')
@@ -40,27 +45,29 @@ export default function Chat({ pet, parentName }) {
 
   // Show opening greeting when chat first mounts
   useEffect(() => {
-    setMessages([{
-      id: 1,
-      text: `Hi ${parentName}! How's ${pet.name} doing today? 🐾`,
-      isUser: false,
-    }])
-  }, [])   // empty array = runs once on mount
+    const greeting = selectedPets.length === 1
+      ? `Hi! How's ${primaryPet.name} doing today? 🐾`
+      : `Hi! How are ${petNames} doing today? 🐾`
+    setMessages([{ id: 1, text: greeting, isUser: false }])
+  }, [])
 
   async function handleSend() {
     const text = inputText.trim()
     if (!text || isTyping) return
 
     setInputText('')
-    // Reset textarea height after send
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
-    // Show user message immediately
     setMessages(prev => [...prev, { id: Date.now(), text, isUser: true }])
     setIsTyping(true)
 
     try {
-      const data = await sendMessage({ sessionId, message: text })
+      const data = await sendMessage({
+        sessionId,
+        message: text,
+        petIds,
+        userCode,
+      })
 
       setConfidenceScore(data.confidence_score ?? 0)
       setConfidenceColor(data.confidence_color ?? 'red')
@@ -79,14 +86,14 @@ export default function Chat({ pet, parentName }) {
         isUser: false,
       }])
 
-      // Refresh confidence after background pipeline finishes (~3s for Compressor + Aggregator)
+      // Refresh confidence after background pipeline finishes
       setTimeout(() => {
-        fetchConfidence()
+        fetchConfidence(primaryPet.pet_id, userCode)
           .then(fresh => {
             setConfidenceScore(fresh.confidence_score ?? data.confidence_score)
             setConfidenceColor(fresh.confidence_color ?? data.confidence_color)
           })
-          .catch(() => {})  // silent — chat score is already set above
+          .catch(() => {})
       }, 4000)
     } catch (err) {
       setIsTyping(false)
@@ -105,17 +112,20 @@ export default function Chat({ pet, parentName }) {
     }
   }
 
-  const petEmoji = SPECIES_EMOJI[pet.species] || '🐾'
+  const petEmoji = SPECIES_EMOJI[primaryPet?.species] || '🐾'
 
   return (
     <div className="chat">
       {/* ── Header ── */}
       <div className="chat-header">
+        <button className="chat-back-btn" onClick={onBack}>←</button>
         <div className="chat-header-pet">
           <div className="chat-pet-avatar">{petEmoji}</div>
           <div>
-            <div className="chat-pet-name">{pet.name}</div>
-            <div className="chat-pet-meta">{pet.breed}</div>
+            <div className="chat-pet-name">{petNames}</div>
+            <div className="chat-pet-meta">
+              {selectedPets.map(p => p.breed).join(' & ')}
+            </div>
           </div>
         </div>
         <ConfidenceBar score={confidenceScore} label={confidenceColor} variant="compact" />
@@ -143,17 +153,18 @@ export default function Chat({ pet, parentName }) {
             className="redirect-sticky-btn"
             onClick={() => {
               const params = new URLSearchParams({
-                query: activeRedirect.pre_populated_query,
+                query: activeRedirect.context.query,
+                pet_id: activeRedirect.context.pet_id,
+                pet_summary: activeRedirect.context.pet_summary,
                 urgency: activeRedirect.urgency,
-                pet_summary: activeRedirect.pet_summary,
               })
-              window.open(`${activeRedirect.deep_link}?${params}`, '_blank')
+              window.open(`${BASE}/api/v1/simulator/${activeRedirect.module}?${params}`, '_blank')
             }}
             style={{
-              background: activeRedirect.urgency === 'high' ? '#ef4444' : '#f97316',
+              background: activeRedirect.display.style === 'urgent' ? '#ef4444' : '#f97316',
             }}
           >
-            {activeRedirect.module === 'food' ? '🍖 Food Specialist →' : '🏥 Health Assistant →'}
+            {activeRedirect.display.label} →
           </button>
           <button className="redirect-dismiss" onClick={() => setActiveRedirect(null)}>✕</button>
         </div>
@@ -165,11 +176,10 @@ export default function Chat({ pet, parentName }) {
           <textarea
             ref={textareaRef}
             className="chat-input"
-            placeholder={`Message about ${pet.name}...`}
+            placeholder={`Message about ${petNames}...`}
             value={inputText}
             onChange={e => {
               setInputText(e.target.value)
-              // Auto-resize: reset to 1 row, then grow to fit content
               const ta = e.target
               ta.style.height = 'auto'
               ta.style.height = `${ta.scrollHeight}px`

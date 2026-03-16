@@ -699,10 +699,26 @@
     {
       "id": "ft-003",
       "name": "Wire x-user-code header — multi-user pet_id resolution",
-      "description": "Senior's requirement: Flutter sends x-user-code header with every request. THREE things must change together: (1) Read x-user-code header in chat.py, query UserRepo to get pet_id for that user. (2) Pass real pet_id down to _run_background() so FactLogRepo.append() and Aggregator.run() write to the correct pet rows — currently both hardcode DEFAULT_PET_ID='luna-001'. (3) app.state.active_profile is currently ONE dict (only Luna's profile). For multi-user it must become a dict-of-dicts keyed by pet_id, OR be replaced entirely by Redis (Phase 2). The repositories already accept pet_id as a parameter — only the wiring is missing. IMPORTANT: Do NOT implement this in isolation — coordinate with Phase 2 (Redis) since Redis is intended to replace the in-memory app.state profile store. The users table already exists with user_code column.",
+      "description": "X-User-Code header required on all endpoints. chat.py extracts it for AALDA auth and user identity. pet_ids (integer list) in ChatRequest. All DEFAULT_PET_ID removed. Aggregator receives pet_id per request.",
       "files": ["app/routes/chat.py", "app/agents/aggregator.py", "app/db/repositories.py", "app/main.py"],
-      "status": "not-started",
-      "priority": "high — required before real users can use the system. Coordinate with ft-005 (Valkey) and ft-008 (multi-pet)."
+      "status": "complete",
+      "completed_date": "2026-03-16"
+    },
+    {
+      "id": "ft-011",
+      "name": "AALDA API integration — backend fetches pet data",
+      "description": "PetFetcher calls AALDA API (GET /api/v1/pet-profile/{pet_id}) with X-User-Code auth. Maps AALDA fields to internal schema. In-memory TTL cache (5 min). Returns pet_profile + aalda_facts. New endpoint GET /api/v1/pets lists user's pets.",
+      "files": ["app/services/pet_fetcher.py", "app/routes/chat.py", "app/core/config.py"],
+      "status": "complete",
+      "completed_date": "2026-03-16"
+    },
+    {
+      "id": "ft-012",
+      "name": "Remove DEFAULT_PET_ID and DEFAULT_USER_ID fallbacks",
+      "description": "All DEFAULT_PET_ID and DEFAULT_USER_ID removed from constants.py, chat.py, debug.py, aggregator.py. pet_ids required in ChatRequest. X-User-Code header required (401 if missing). pet_id is integer everywhere.",
+      "files": ["app/routes/chat.py", "constants.py", "app/routes/debug.py", "app/agents/aggregator.py"],
+      "status": "complete",
+      "completed_date": "2026-03-16"
     },
     {
       "id": "ft-005",
@@ -735,19 +751,21 @@
     },
     {
       "id": "ft-007",
-      "name": "API path/naming cleanup — match PRD before handover",
-      "description": "Current API routes (POST /chat, GET /confidence, GET /debug/*) may not match PRD naming convention. Review PRD, rename endpoints to match. Document final API contract: what frontend sends (user_id + pet_id only), what backend returns. Backend handles all lookups (user table, pet context, thread state, active profile).",
-      "files": ["app/routes/chat.py", "app/routes/debug.py", "app/main.py"],
-      "status": "not-started",
-      "priority": "URGENT — API handover 2026-03-16"
+      "name": "API v1 — versioning, error contract, redirect restructure",
+      "description": "Implement design-docs/api-v1-design.md. (1) Add /api/v1 prefix to all routers. (2) Remove pet_context from ChatRequest, add pet_id with DEFAULT_PET_ID fallback for dev. (3) Restructure RedirectPayload — remove deep_link URL, add display{label,style} + context{query,pet_id,pet_summary}. (4) Add custom error handler — all errors return {status:'error',error:{code,message}}. (5) Add status:'ok' to all success responses. (6) Update React frontend URLs + redirect handling. (7) Update tests + CLAUDE.md.",
+      "files": ["app/routes/chat.py", "app/routes/debug.py", "app/routes/simulator.py", "app/main.py", "app/services/deeplink.py", "frontend/src/api.js", "frontend/src/screens/Chat.jsx"],
+      "status": "complete",
+      "priority": "URGENT — API handover 2026-03-16",
+      "design_doc": "design-docs/api-v1-design.md",
+      "completed_date": "2026-03-15"
     },
     {
       "id": "ft-008",
       "name": "Multi-pet support — two pets per user simultaneously",
-      "description": "New requirement: system must support two pets per user at the same time. Currently DEFAULT_PET_ID is hardcoded, app.state.active_profile is a single dict (Luna only). Needs: (1) active_profile becomes dict-of-dicts keyed by pet_id, (2) threads already have pet_id column — just need to pass real pet_id, (3) frontend sends pet_id with each request. Ties into ft-003 (multi-user wiring) and ft-005 (Valkey).",
-      "files": ["app/routes/chat.py", "app/main.py", "app/services/context_builder.py", "app/agents/aggregator.py"],
-      "status": "not-started",
-      "priority": "high — new product requirement"
+      "description": "ChatRequest accepts pet_ids: list[int] (1-2 pets). Dual-pet context pipeline: parallel AALDA fetch, per-pet active_profile from DB, per-pet gap sections. Prompt v0.3 with PET A / PET B sections. Frontend PetSelect with multi-select (max 2). Conversation agent updated for dual-pet.",
+      "files": ["app/routes/chat.py", "app/agents/conversation.py", "app/services/context_builder.py", "frontend/src/screens/PetSelect.jsx"],
+      "status": "complete",
+      "completed_date": "2026-03-16"
     },
     {
       "id": "ft-009",
@@ -769,9 +787,10 @@
 
   "summary": {
     "total_features": 68,
-    "complete": 63,
+    "complete": 64,
     "in_progress": 0,
-    "not_started": 5,
-    "note": "Phase 0 (12) + Phase 1A (5) + Phase 1B (22) + Phase 1C (12) + Phase 2 (7) + Dev Deployment (4) + session-management.md (1) = 63 complete. 40 e2e tests (38 pass, 2 LLM flakes). Phase 2 review: design-docs/phase-2-review-report.md — fixes tracked in ft-006. Next: ft-006 batch A fixes → Phase 3 (nightly batch jobs)."
+    "blocked": 2,
+    "not_started": 7,
+    "note": "Phase 0-2 complete (63 features). ft-007 (API v1) complete — ready for handover 2026-03-16. ft-003 and ft-011 blocked on Flutter team input. Next: ft-006 batch A → Phase 3."
   }
 }

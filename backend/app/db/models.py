@@ -2,19 +2,19 @@
 #
 # SQLAlchemy ORM models for AnyMall-chan backend.
 #
-# Phase 1C tables (mirroring original JSON files):
-#   Pet            → static pet identity
-#   User           → owner relationship data
+# Tables:
+#   Pet            → static pet identity (pet_id is Integer from AALDA)
+#   User           → owner relationship data (user_id is x-user-code string)
 #   ActiveProfile  → current best-known facts per field
 #   FactLog        → append-only audit trail
-#
-# Phase 2 tables (thread & conversation management):
 #   Thread         → 24-hour conversation windows
 #   ThreadMessage  → individual messages within a thread
 #
+# pet_id is Integer everywhere — matches AALDA API (e.g. 143, 149).
+# user_id is String(64) — stores x-user-code (e.g. "3AOU9K1PWH").
+#
 # Each model has a to_dict() or to_dict_entry() method that returns the
-# EXACT same dict shape the rest of the code expects.  Callers (agents,
-# services, routes) never know the data came from PostgreSQL.
+# EXACT same dict shape the rest of the code expects.
 #
 # The _pet_history special key:
 #   Stored as a row in active_profile with field_key="_pet_history".
@@ -49,15 +49,15 @@ class Pet(Base):
     """
     Static pet identity — set at onboarding, rarely changes.
 
-    Maps to data/pet_profile.json.  One row per pet.
-    Phase 1C has one pet (Luna).  Multi-pet support comes in Phase 4+.
+    pet_id is the integer ID from the AALDA API (e.g. 143).
+    One row per pet.  Multi-pet supported via AALDA integration.
     """
     __tablename__ = "pets"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
-    pet_id: Mapped[str] = mapped_column(
-        String(64), unique=True, nullable=False)
+    pet_id: Mapped[int] = mapped_column(
+        Integer, unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     species: Mapped[str] = mapped_column(
         String(32), nullable=False, default="dog")
@@ -92,8 +92,8 @@ class User(Base):
     """
     Owner relationship data.
 
-    Maps to data/user_profile.json.  One row per user.
-    Phase 1C has one user (Shara).  Multi-user comes with JWT auth (Phase 4).
+    user_id stores the x-user-code string (e.g. "3AOU9K1PWH").
+    pet_id is the integer ID from AALDA (e.g. 143).
     """
     __tablename__ = "users"
 
@@ -101,7 +101,7 @@ class User(Base):
         Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(
         String(64), unique=True, nullable=False)
-    pet_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
     session_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0)
     relationship_summary: Mapped[str] = mapped_column(
@@ -141,7 +141,7 @@ class ActiveProfile(Base):
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
-    pet_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
     field_key: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # The fact value — always a string (even for _pet_history).
@@ -206,7 +206,7 @@ class FactLog(Base):
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
-    pet_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
     session_id: Mapped[str] = mapped_column(String(128), nullable=False)
     field_key: Mapped[str] = mapped_column(String(128), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
@@ -264,7 +264,7 @@ class Thread(Base):
         Integer, primary_key=True, autoincrement=True)
     thread_id: Mapped[str] = mapped_column(
         String(128), unique=True, nullable=False)
-    pet_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False)
     started_at: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[str] = mapped_column(String(64), nullable=False)

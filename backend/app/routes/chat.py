@@ -1,12 +1,17 @@
 # app/routes/chat.py
 #
-# POST /chat — the core endpoint.
+# POST /api/v1/chat — the core endpoint.
+# GET  /api/v1/pets — list user's pets from AALDA.
+# GET  /api/v1/confidence — confidence bar score.
 #
 # What lives here:
 #   - Pydantic request/response models (ChatRequest, ChatResponse, RedirectPayload)
-#   - POST /chat route
+#   - POST /api/v1/chat route
+#   - GET /api/v1/pets route (fetches from AALDA)
+#   - GET /api/v1/confidence route
 #   - _run_background() — fire-and-forget Compressor + Aggregator pipeline
 #
+# Auth: every request must include X-User-Code header.
 # Shared state (agents, sessions) is accessed via request.app.state,
 # which is populated by lifespan() in main.py. No module-level globals.
 
@@ -27,18 +32,29 @@ from app.agents.conversation import AgentResponse
 from app.agents.state import AgentState
 from app.services.guardrails import apply_guardrails
 from app.services.deeplink import build_deeplink
-from app.services.context_builder import build_context
+from app.services.context_builder import build_pet_context
+from app.services.pet_fetcher import PetFetchError
 from constants import (
-    INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM, DEFAULT_PET_ID,
+    INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM,
     THREAD_COMPACTION_THRESHOLD, THREAD_CONTEXT_WINDOW, THREAD_EXPIRY_HOURS,
 )
 from app.db.session import get_session
-from app.db.repositories import FactLogRepo, ThreadRepo, ThreadMessageRepo
+from app.db.repositories import ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(prefix="/api/v1", tags=["chat"])
+
+
+# ── Auth helper ───────────────────────────────────────────────────────────────
+
+def _require_user_code(request: Request) -> str:
+    """Extract X-User-Code header or raise 401."""
+    user_code = request.headers.get("x-user-code")
+    if not user_code:
+        raise HTTPException(status_code=401, detail="Missing X-User-Code header")
+    return user_code
 
 
 # ── Language detection ───────────────────────────────────────────────────────
@@ -50,10 +66,6 @@ def _detect_language(text: str) -> str:
     Checks for Hiragana (U+3040-309F), Katakana (U+30A0-30FF), and CJK
     Unified Ideographs (U+4E00-9FFF).  Returns "JA" if any Japanese character
     is found, "EN" otherwise.
-
-    Used to select the correct language for gap-question hints in Agent 1's
-    system prompt.  The LLM itself adapts reply language from the user's input,
-    but the gap hints are built in code and need the right language key.
     """
     ja_count = sum(
         1 for c in text
@@ -66,54 +78,53 @@ def _detect_language(text: str) -> str:
 
 # ── Request / response models ──────────────────────────────────────────────────
 
-class PetContext(BaseModel):
-    """
-    Pet data sent by Flutter from the AALDA API.
-
-    Matches the AALDA GET /api/v1/pet/{pet_id} response shape.
-    All fields optional except pet_id and name — missing fields get safe defaults
-    so the pipeline never breaks.
-    """
-    pet_id: int | str
-    name: str
-    species: str = "unknown"
-    breed: str = "unknown"
-    birthday: str | None = None       # AALDA sends ISO datetime, we extract date
-    gender: str = "unknown"           # AALDA calls it gender, we map to sex
-
-
 class ChatRequest(BaseModel):
     """
-    Body for POST /chat.
+    Body for POST /api/v1/chat.
+
     session_id maintains conversation history across messages.
-    Use a fixed string in Postman. Flutter generates a UUID per conversation.
+    Flutter generates a UUID per conversation.
+    pet_ids identifies which pet(s) — 1 or 2.
     """
     message: str = Field(..., min_length=1, max_length=4000,
                          description="The user's message.")
     session_id: str = Field(..., min_length=1, max_length=128,
                             description="Unique ID for this conversation session.")
-    pet_context: PetContext | None = Field(
-        default=None,
-        description="Pet data from AALDA API. If omitted, falls back to hardcoded Luna.",
+    pet_ids: list[int] = Field(
+        ..., min_length=1, max_length=2,
+        description="1 or 2 pet IDs to chat about.",
     )
+
+
+class RedirectDisplay(BaseModel):
+    """How the client should render the redirect button."""
+    label: str    # "Talk to Health Assistant" | "Talk to Food Specialist"
+    style: str    # "urgent" (red) | "suggestion" (orange)
+
+
+class RedirectContext(BaseModel):
+    """Data the target module needs to function."""
+    query: str        # user's original message, pre-filled in the module
+    pet_id: int       # which pet, so the module can fetch its own data
+    pet_summary: str  # full NL pet context — by design, module needs this
 
 
 class RedirectPayload(BaseModel):
     """
-    Deeplink payload included in ChatResponse when a health or food intent is detected.
+    Redirect payload included in ChatResponse when a health or food intent is detected.
 
-    The mobile app reads this to navigate the user to the correct specialist module.
-    In Phase 1, pet_summary is passed inline. Phase 2 replaces it with a Redis key.
+    Backend says WHAT (module + context), client decides HOW to navigate.
+    No URLs — Flutter uses screen routes, React opens simulator pages.
     """
-    module: str               # "health" | "food"
-    deep_link: str            # URL to open (localhost simulator in Phase 1)
-    pre_populated_query: str  # user's original message, pre-filled in the module
-    pet_summary: str          # Luna's full context so the module needs no extra lookup
-    urgency: str              # "high" | "medium" | "low"
+    module: str                # "health" | "food"
+    urgency: str               # "high" | "medium"
+    display: RedirectDisplay   # how to render the button
+    context: RedirectContext    # data for the target module
 
 
 class ChatResponse(BaseModel):
-    """Body returned by POST /chat."""
+    """Body returned by POST /api/v1/chat."""
+    status: str = "ok"
     message: str
     redirect: RedirectPayload | None = None   # present only for health/food intents
     session_id: str
@@ -124,8 +135,6 @@ class ChatResponse(BaseModel):
     questions_asked_count: int
     was_guardrailed: bool
     # ── Agent debug fields ─────────────────────────────────────────────────────
-    # These expose Agent 1 + IntentClassifier internals so the UI can display them.
-    # Agent 2 (Compressor) output is available via GET /debug/facts?session_id=...
     is_entity: bool       # Agent 1: did the user message contain extractable pet facts?
     asked_gap_question: bool = False  # Agent 1: did the reply ask a gap-filling question?
     intent_type: str      # IntentClassifier: "health" | "food" | "general"
@@ -139,42 +148,38 @@ def _to_redirect_payload(deeplink) -> RedirectPayload:
     """Convert a DeeplinkPayload dataclass to the Pydantic RedirectPayload."""
     return RedirectPayload(
         module=deeplink.module,
-        deep_link=deeplink.deep_link,
-        pre_populated_query=deeplink.pre_populated_query,
-        pet_summary=deeplink.pet_summary,
         urgency=deeplink.urgency,
+        display=RedirectDisplay(
+            label=deeplink.display_label,
+            style=deeplink.display_style,
+        ),
+        context=RedirectContext(
+            query=deeplink.query,
+            pet_id=deeplink.pet_id,
+            pet_summary=deeplink.pet_summary,
+        ),
     )
 
 
-# ── Pet context mapping ───────────────────────────────────────────────────────
+# ── List user's pets ─────────────────────────────────────────────────────────
 
-def _map_pet_context(ctx: PetContext) -> dict:
+@router.get("/pets", summary="List user's pets from AALDA")
+async def list_pets(request: Request) -> dict[str, Any]:
     """
-    Convert AALDA's pet schema → our internal pet_profile shape.
+    Fetch all pets for the user from the AALDA API.
 
-    AALDA fields:  pet_id (int), name, species, breed, birthday (ISO datetime), gender
-    Our fields:    pet_id (str), name, species, breed, date_of_birth (YYYY-MM-DD), sex
-
-    Returns a dict matching _DEFAULT_PET_PROFILE shape in context_builder.py.
-    Defensive: every field has a fallback so build_context() never crashes.
+    Requires X-User-Code header.
+    Returns: {"status": "ok", "pets": [...]}
     """
-    # Extract date portion from ISO datetime ("2026-03-13T05:17:12.981Z" → "2026-03-13")
-    dob = "unknown"
-    if ctx.birthday:
-        try:
-            dob = ctx.birthday[:10]  # "YYYY-MM-DD" from ISO string
-        except (TypeError, IndexError):
-            dob = "unknown"
+    user_code = _require_user_code(request)
+    pet_fetcher = request.app.state.pet_fetcher
 
-    return {
-        "pet_id": str(ctx.pet_id),
-        "name": ctx.name,
-        "species": ctx.species or "unknown",
-        "breed": ctx.breed if ctx.breed and ctx.breed != "string" else "unknown",
-        "date_of_birth": dob,
-        "sex": ctx.gender if ctx.gender and ctx.gender != "string" else "unknown",
-        "life_stage": "adult",  # default — no AALDA field for this yet
-    }
+    try:
+        pets = await pet_fetcher.fetch_user_pets(user_code)
+    except PetFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    return {"status": "ok", "pets": pets}
 
 
 # ── Route ─────────────────────────────────────────────────────────────────────
@@ -182,31 +187,72 @@ def _map_pet_context(ctx: PetContext) -> dict:
 @router.post("/chat", response_model=ChatResponse, summary="Send a message to Agent 1")
 async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     """
-    Core endpoint for Phase 0.
+    Core chat endpoint.
 
     Flow:
-      1. Retrieve or create the session message history.
-      2. IntentClassifier.classify() — LLM: intent_type + urgency (health/food/general).
-      3. Agent 1                     — build prompt from context + intent, call LLM.
-      4. apply_guardrails()          — regex: strip blocked jargon + preachy phrases.
-      5. build_deeplink()            — build redirect payload if health or food intent.
-      6. Save both messages to session history.
-      7. Return ChatResponse.
+      1. Auth — extract X-User-Code header.
+      2. Fetch pet data from AALDA (parallel for 2 pets).
+      3. Thread boundary — resolve session_id → thread_id (24h windows).
+      4. IntentClassifier — LLM: intent_type + urgency (health/food/general).
+      5. Agent 1          — build prompt from context + intent, call LLM.
+      6. apply_guardrails  — regex: strip blocked jargon + preachy phrases.
+      7. build_deeplink    — build redirect payload if health or food intent.
+      8. Save to session history + fire-and-forget background pipeline.
+      9. Return ChatResponse.
     """
+    user_code = _require_user_code(request)
     state_bag = request.app.state
     agent = state_bag.agent
     intent_classifier = state_bag.intent_classifier
+    pet_fetcher = state_bag.pet_fetcher
 
     if agent is None or intent_classifier is None:
         raise HTTPException(status_code=503, detail="Agent not initialised yet.")
 
     sessions: dict = state_bag.sessions
+    pet_ids = request_body.pet_ids
 
-    # ── 1. Thread boundary logic (Phase 2) ─────────────────────────────────────
-    # Resolve session_id → thread_id. One session maps to one active thread per pet.
+    # ── 1. Fetch pet data from AALDA (parallel for 2 pets) ────────────────────
+    try:
+        fetch_tasks = [pet_fetcher.fetch_pet_profile(user_code, pid) for pid in pet_ids]
+        pet_results = await asyncio.gather(*fetch_tasks)
+    except PetFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    pet_profiles = [r[0] for r in pet_results]       # list of pet_profile dicts
+    aalda_facts_list = [r[1] for r in pet_results]    # list of aalda_facts dicts
+
+    # ── 2. Load active_profiles from DB (per pet) ────────────────────────────
+    active_profiles_raw: list[dict | None] = []
+    async with get_session() as db_session:
+        ap_repo = ActiveProfileRepo(db_session)
+        for pid in pet_ids:
+            raw = await ap_repo.read_all(pid)
+            active_profiles_raw.append(raw)
+
+    # ── 3. Build context for each pet ─────────────────────────────────────────
+    pet_contexts = []
+    for i, pet_profile in enumerate(pet_profiles):
+        aalda_facts = aalda_facts_list[i]
+        active_raw = active_profiles_raw[i]
+        ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
+        pet_contexts.append(ctx)
+
+    # Primary pet (index 0) used for thread lookup, confidence, deeplink
+    primary_ctx = pet_contexts[0]
+    primary_pet_id = pet_ids[0]
+    primary_profile = pet_profiles[0]
+
+    # Relationship context (default for now — no AALDA user API yet)
+    relationship_context = "New user — no relationship data yet."
+
+    # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
+    conf_score = calculate_confidence_score(primary_ctx["active_profile"], primary_profile)
+    conf_color = confidence_color(conf_score)
+
+    # ── 4. Thread boundary logic (Phase 2) ────────────────────────────────────
     session_id = request_body.session_id
-    pet_id = DEFAULT_PET_ID  # ft-003 wires real pet_id from x-user-code header
-    user_id = "shara-001"    # ft-003 wires real user_id
+    user_id = user_code
 
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()
@@ -215,30 +261,25 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
     async with get_session() as db_session:
         thread_repo = ThreadRepo(db_session)
-        existing = await thread_repo.get_active(pet_id)
+        existing = await thread_repo.get_active(primary_pet_id)
 
         if existing and existing["expires_at"] > now_iso:
-            # Active thread exists and hasn't expired — use it
             thread_id = existing["thread_id"]
             conversation_summary = existing.get("compaction_summary") or ""
         else:
-            # Either no thread or expired — create a new one
             if existing:
-                # Expire the old thread
                 await thread_repo.expire(existing["thread_id"])
                 logger.info("Thread expired: %s", existing["thread_id"])
 
-            # Load cross-thread context from the previous expired thread
-            prev = await thread_repo.get_latest_expired(pet_id)
+            prev = await thread_repo.get_latest_expired(primary_pet_id)
             if prev and prev.get("compaction_summary"):
                 conversation_summary = prev["compaction_summary"]
 
-            # Create new thread
             thread_id = str(uuid4())
             expires_at = (now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
             await thread_repo.create(
                 thread_id=thread_id,
-                pet_id=pet_id,
+                pet_id=primary_pet_id,
                 user_id=user_id,
                 started_at=now_iso,
                 expires_at=expires_at,
@@ -246,130 +287,99 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             new_thread = True
             logger.info("New thread created: %s (session=%s)", thread_id, session_id)
 
-    # Initialize in-memory message list for new threads
     if thread_id not in sessions:
         sessions[thread_id] = []
 
     session_messages = sessions[thread_id]
 
-    # ── 1b. Load pet context ───────────────────────────────────────────────────
-    # If Flutter sent pet_context (real pet from AALDA API), use it.
-    # Otherwise fall back to hardcoded Luna from app.state.
-    if request_body.pet_context is not None:
-        pet_profile = _map_pet_context(request_body.pet_context)
-        logger.info("Using real pet context: %s (pet_id=%s)", pet_profile["name"], pet_profile["pet_id"])
-    else:
-        pet_profile = state_bag.pet_profile
-
-    active_profile, gap_list, pet_summary, pet_history, relationship_context, conv_summary = build_context(
-        active_profile_raw=state_bag.active_profile,
-        pet_profile=pet_profile,
-        user_profile=state_bag.user_profile,
-        conversation_summary=conversation_summary,
-    )
-
-    # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
-    conf_score = calculate_confidence_score(active_profile, pet_profile)
-    conf_color = confidence_color(conf_score)
-
-    # Build AgentState — shared context for the background pipeline.
-    # Snapshot session_messages now (before this turn is appended).
+    # ── Build AgentState — shared context for the background pipeline ─────────
     agent_state = AgentState(
         session_id=session_id,
         thread_id=thread_id,
         user_message=request_body.message,
-        pet_name=active_profile.get("name", {}).get("value", ""),
-        pet_species=active_profile.get("species", {}).get("value", ""),
-        pet_age=active_profile.get("age", {}).get("value", ""),
-        pet_sex=active_profile.get("sex", {}).get("value", ""),
-        pet_weight=active_profile.get("weight", {}).get("value", ""),
-        recent_history=list(session_messages),  # snapshot before this turn
+        pet_id=primary_pet_id,
+        pet_name=primary_ctx["active_profile"].get("name", {}).get("value", ""),
+        pet_species=primary_ctx["active_profile"].get("species", {}).get("value", ""),
+        pet_age=primary_ctx["active_profile"].get("age", {}).get("value", ""),
+        pet_sex=primary_ctx["active_profile"].get("sex", {}).get("value", ""),
+        pet_weight=primary_ctx["active_profile"].get("weight", {}).get("value", ""),
+        recent_history=list(session_messages),
     )
 
     # Track gap questions and redirect cooldowns per thread.
-    # Reset when a new thread starts (fresh 24h conversation).
     meta = state_bag.session_meta.setdefault(thread_id, {
         "gap_questions_asked": 0,
         "redirect_turn_tracker": {},
     })
     questions_so_far = meta["gap_questions_asked"]
 
-    # ── 2. Intent classification (LLM) ────────────────────────────────────────
+    # ── 5. Intent classification (LLM) ──────────────────────────────────────
     intent_type, urgency = await intent_classifier.classify(request_body.message)
 
-    # ── 3. Agent 1 ─────────────────────────────────────────────────────────────
+    # ── 6. Agent 1 ───────────────────────────────────────────────────────────
+    pet_a_context = pet_contexts[0]
+    pet_b_context = pet_contexts[1] if len(pet_contexts) > 1 else None
+
     agent_response: AgentResponse = await agent.run(
         user_message=request_body.message,
         session_messages=session_messages,
-        active_profile=active_profile,
-        gap_list=gap_list,
-        pet_summary=pet_summary,
-        pet_history=pet_history,
+        pet_a_context=pet_a_context,
+        pet_b_context=pet_b_context,
         relationship_context=relationship_context,
         intent_type=intent_type,
-        questions_asked_so_far=questions_so_far,
         urgency=urgency,
+        questions_asked_so_far=questions_so_far,
         language_str=_detect_language(request_body.message),
-        conversation_summary=conv_summary,
+        conversation_summary=conversation_summary,
     )
 
-    # Propagate is_entity flag from Agent 1 to state so Compressor knows whether to run.
     agent_state.is_entity = agent_response.is_entity
 
-    # Update gap question counter using the LLM's flag (not ? counting).
     if agent_response.asked_gap_question:
         meta["gap_questions_asked"] += 1
 
-    # ── 4. Guardrails ──────────────────────────────────────────────────────────
+    # ── 7. Guardrails ────────────────────────────────────────────────────────
     guardrail_result = apply_guardrails(agent_response.message)
     final_reply = guardrail_result.reply
     was_guardrailed = guardrail_result.was_modified
 
-    # ── 4b. Build deeplink with urgency gating ────────────────────────────────
-    # HIGH = always show redirect. MEDIUM = show with 3-message cooldown. LOW = never.
-    MEDIUM_COOLDOWN = 3  # skip N messages after showing a medium redirect
+    # ── 7b. Build deeplink with urgency gating ──────────────────────────────
+    MEDIUM_COOLDOWN = 3
 
     redirect_payload = None
+    pet_summary_primary = primary_ctx["pet_summary"]
     if intent_type in (INTENT_HEALTH, INTENT_FOOD):
         tracker = meta.setdefault("redirect_turn_tracker", {})
-        current_turn = len(session_messages) // 2  # count user messages so far
+        current_turn = len(session_messages) // 2
 
         if urgency == URGENCY_HIGH:
-            deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary)
+            deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
             if deeplink:
                 redirect_payload = _to_redirect_payload(deeplink)
 
         elif urgency == URGENCY_MEDIUM:
             last_shown_turn = tracker.get("medium_last_shown")
             if last_shown_turn is None or (current_turn - last_shown_turn) > MEDIUM_COOLDOWN:
-                deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary)
+                deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
                 if deeplink:
                     redirect_payload = _to_redirect_payload(deeplink)
                     tracker["medium_last_shown"] = current_turn
-        # LOW → no redirect
 
-    # ── 5. Save to session history (in-memory, keyed by thread_id) ────────────
+    # ── 8. Save to session history (in-memory, keyed by thread_id) ──────────
     sessions[thread_id].append({"role": "user",      "content": request_body.message})
     sessions[thread_id].append({"role": "assistant",  "content": final_reply})
 
-    # ── 6. Fire-and-forget Compressor ──────────────────────────────────────────
-    # Update state with the final reply and the full history (now including this turn).
-    # Then launch Compressor in the background — user already has their reply.
+    # ── 9. Fire-and-forget Compressor ────────────────────────────────────────
     agent_state.agent_reply = final_reply
     agent_state.recent_history = list(sessions[thread_id])
     asyncio.create_task(_run_background(agent_state, state_bag))
 
-    # ── Log every request so you can see what happened in the terminal ─────────
     logger.info(
         "Chat complete — session=%s | intent=%s | urgency=%s | questions=%d | guardrailed=%s",
-        session_id,
-        intent_type,
-        urgency,
-        agent_response.questions_asked_count,
-        was_guardrailed,
+        session_id, intent_type, urgency, agent_response.questions_asked_count, was_guardrailed,
     )
 
-    # ── 7. Return ──────────────────────────────────────────────────────────────
+    # ── 10. Return ───────────────────────────────────────────────────────────
     return ChatResponse(
         message=final_reply,
         redirect=redirect_payload,
@@ -387,6 +397,42 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     )
 
 
+# ── Confidence endpoint ────────────────────────────────────────────────────────
+
+@router.get("/confidence", summary="Current confidence bar score")
+async def get_confidence(request: Request, pet_id: int = 0) -> dict[str, Any]:
+    """
+    Returns the current confidence score and color for a specific pet.
+
+    Requires X-User-Code header and pet_id query param.
+    Called by the frontend on mount and after each chat response.
+    """
+    user_code = _require_user_code(request)
+    pet_fetcher = request.app.state.pet_fetcher
+
+    if pet_id == 0:
+        raise HTTPException(status_code=400, detail="pet_id query parameter is required.")
+
+    try:
+        pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pet_id)
+    except PetFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    async with get_session() as db_session:
+        ap_repo = ActiveProfileRepo(db_session)
+        active_raw = await ap_repo.read_all(pet_id)
+
+    ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
+    score = calculate_confidence_score(ctx["active_profile"], pet_profile)
+    color = confidence_color(score)
+
+    return {
+        "status": "ok",
+        "confidence_score": score,
+        "confidence_color": color,
+    }
+
+
 # ── Background pipeline ────────────────────────────────────────────────────────
 
 async def _run_background(state: AgentState, state_bag: Any) -> None:
@@ -396,8 +442,7 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
     Runs the Compressor, splits facts by confidence threshold, and persists to
     PostgreSQL fact_log table. User never waits for any of this.
 
-    Never raises — any exception is caught and logged. A crash here must not
-    affect the user-facing response that was already sent.
+    Never raises — any exception is caught and logged.
     """
     compressor = state_bag.compressor
     aggregator = state_bag.aggregator
@@ -426,7 +471,7 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
         sessions = state_bag.sessions
         thread_messages = sessions.get(state.thread_id, [])
         if len(thread_messages) >= THREAD_COMPACTION_THRESHOLD:
-            asyncio.create_task(_run_compaction(state.thread_id, state_bag))
+            asyncio.create_task(_run_compaction(state.thread_id, state.pet_id, state_bag))
 
         # ── Compressor pipeline ─────────────────────────────────────────
         if compressor is None:
@@ -434,9 +479,6 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
 
         facts = await compressor.run(state)
 
-        # Split by confidence threshold.
-        # > 0.70 → high-confidence: Aggregator updates active_profile.
-        # 0.50–0.70 → low-confidence: Agent 1 asks a clarification question next turn.
         high = [f for f in facts if f.confidence > 0.70]
         low  = [f for f in facts if 0.50 <= f.confidence <= 0.70]
 
@@ -453,10 +495,9 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
                 }
                 for f in facts
             ]
-            # Phase 1C: write to PostgreSQL instead of JSON file.
             async with get_session() as db_session:
                 repo = FactLogRepo(db_session)
-                await repo.append(to_log, pet_id=DEFAULT_PET_ID)
+                await repo.append(to_log, pet_id=state.pet_id)
 
         logger.info(
             "Compressor done — session=%s extracted=%d high=%d low=%d",
@@ -465,7 +506,11 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
 
         # ── Aggregator — merge high-confidence facts into active_profile ──
         if high and aggregator is not None:
-            await aggregator.run(high, state.session_id, state_bag.active_profile)
+            # Load current active_profile from DB for this pet
+            async with get_session() as db_session:
+                ap_repo = ActiveProfileRepo(db_session)
+                current_profile = await ap_repo.read_all(state.pet_id) or {}
+            await aggregator.run(high, state.session_id, current_profile, pet_id=state.pet_id)
 
     except Exception as exc:
         logger.error(
@@ -474,7 +519,7 @@ async def _run_background(state: AgentState, state_bag: Any) -> None:
         )
 
 
-async def _run_compaction(thread_id: str, state_bag: Any) -> None:
+async def _run_compaction(thread_id: str, pet_id: int, state_bag: Any) -> None:
     """
     Fire-and-forget compaction task.
 
@@ -488,26 +533,21 @@ async def _run_compaction(thread_id: str, state_bag: Any) -> None:
         if len(messages) < THREAD_COMPACTION_THRESHOLD:
             return
 
-        # Split: old messages to summarize, recent to keep
         old_messages = messages[:-THREAD_CONTEXT_WINDOW]
         recent_messages = messages[-THREAD_CONTEXT_WINDOW:]
 
-        # Get existing summary from DB
         async with get_session() as db_session:
             thread_repo = ThreadRepo(db_session)
-            thread = await thread_repo.get_active(DEFAULT_PET_ID)
+            thread = await thread_repo.get_active(pet_id)
             existing_summary = thread.get("compaction_summary") if thread else None
 
-        # LLM summarize
         summarizer = state_bag.thread_summarizer
         new_summary = await summarizer.summarize(old_messages, existing_summary)
 
-        # Update DB
         async with get_session() as db_session:
             thread_repo = ThreadRepo(db_session)
             await thread_repo.update_compaction_summary(thread_id, new_summary)
 
-        # Trim in-memory list
         sessions[thread_id] = recent_messages
 
         logger.info(

@@ -1,9 +1,9 @@
 # tests/run_e2e.py
 #
-# End-to-end test suite for AnyMall-chan backend -- Phase 2.
+# End-to-end test suite for AnyMall-chan backend -- API v1.
 #
 # Tests the full pipeline:
-#   POST /chat
+#   POST /api/v1/chat
 #     -> IntentClassifier  (LLM)
 #     -> Agent 1           (LLM)
 #     -> guardrails
@@ -22,9 +22,10 @@
 #     No test raises -- failures are captured and counted at the end.
 #
 # Phase 1C changes:
-#   - Fact log is now read via GET /debug/facts?session_id=... (PostgreSQL)
+#   - Fact log is now read via GET /api/v1/debug/facts?session_id=... (PostgreSQL)
 #     instead of reading data/fact_log.json directly.
 #   - New Section 6: Database & Infrastructure tests.
+#   - All endpoints now under /api/v1/ prefix (except /health).
 #
 # Usage:
 #   # Terminal 1 -- start backend:
@@ -72,27 +73,36 @@ def new_sid() -> str:
     return f"e2e-{uuid.uuid4().hex[:10]}"
 
 
-def post_chat(message: str, session_id: str) -> dict:
-    """POST /chat and return the parsed JSON body. Raises on HTTP error."""
+TEST_USER_CODE = "3AOU9K1PWH"
+TEST_PET_IDS = [149]
+TEST_HEADERS = {"X-User-Code": TEST_USER_CODE}
+
+
+def post_chat(message: str, session_id: str, pet_ids: list[int] | None = None) -> dict:
+    """POST /api/v1/chat and return the parsed JSON body. Raises on HTTP error."""
     resp = requests.post(
-        f"{BASE_URL}/chat",
-        json={"message": message, "session_id": session_id},
+        f"{BASE_URL}/api/v1/chat",
+        json={
+            "message": message,
+            "session_id": session_id,
+            "pet_ids": pet_ids or TEST_PET_IDS,
+        },
+        headers=TEST_HEADERS,
         timeout=30,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def facts_for(session_id: str) -> list[dict]:
+def facts_for(session_id: str, pet_id: int = 149) -> list[dict]:
     """
     Fetch fact_log entries for a specific session_id from the database.
 
-    Phase 1C: reads via GET /debug/facts?session_id=... (PostgreSQL)
-    instead of reading data/fact_log.json directly.
+    Reads via GET /api/v1/debug/facts?pet_id=...&session_id=... (PostgreSQL).
     """
     resp = requests.get(
-        f"{BASE_URL}/debug/facts",
-        params={"session_id": session_id, "limit": 100},
+        f"{BASE_URL}/api/v1/debug/facts",
+        params={"pet_id": pet_id, "session_id": session_id, "limit": 100},
         timeout=10,
     )
     resp.raise_for_status()
@@ -147,17 +157,18 @@ def test_health_endpoint() -> bool:
                 "GET /health -- llm_reachable",
                 "False -- check Azure credentials in .env",
             )
-        return passed("GET /health", f"phase={data.get('phase')} llm_reachable=True")
+        return passed("GET /health", f"version={data.get('version')} llm_reachable=True")
     except Exception as exc:
         return failed("GET /health", str(exc))
 
 
 def test_response_structure() -> bool:
-    """POST /chat response contains all required fields with correct types."""
+    """POST /api/v1/chat response contains all required fields with correct types."""
     sid = new_sid()
     try:
         data = post_chat("Hello!", sid)
         required = {
+            "status": str,
             "message": str,
             "session_id": str,
             "thread_id": str,
@@ -192,9 +203,12 @@ def test_response_structure() -> bool:
 
 
 def test_confidence_endpoint() -> bool:
-    """GET /confidence returns confidence_score (int 0-100) and confidence_color."""
+    """GET /api/v1/confidence returns confidence_score (int 0-100) and confidence_color."""
     try:
-        resp = requests.get(f"{BASE_URL}/confidence", timeout=10)
+        resp = requests.get(
+            f"{BASE_URL}/api/v1/confidence?pet_id=149",
+            headers=TEST_HEADERS, timeout=10,
+        )
         if resp.status_code != 200:
             return failed("GET /confidence -- HTTP 200", f"got {resp.status_code}")
         data = resp.json()
@@ -239,8 +253,13 @@ def test_health_intent_redirect() -> bool:
             return failed("Health intent -- redirect present", "redirect is null")
         if redirect.get("module") != "health":
             return failed("Health intent -- module=health", f"got module={redirect.get('module')!r}")
-        if not redirect.get("deep_link"):
-            return failed("Health intent -- deep_link non-empty", "deep_link is empty")
+        # New v1 structure: redirect has display + context nested objects
+        if not redirect.get("display"):
+            return failed("Health intent -- display object", "missing 'display' in redirect")
+        if not redirect.get("context"):
+            return failed("Health intent -- context object", "missing 'context' in redirect")
+        if not redirect["context"].get("query"):
+            return failed("Health intent -- context.query", "context.query is empty")
         urgency = redirect.get("urgency", "unknown")
         return passed("Health intent", f"module=health urgency={urgency}")
     except Exception as exc:
@@ -592,8 +611,8 @@ def test_needs_clarification_flag() -> bool:
 # ── Section 5: Aggregator -- Profile Merging ───────────────────────────────────
 
 def get_profile() -> dict:
-    """GET /debug/profile and return the profile dict."""
-    resp = requests.get(f"{BASE_URL}/debug/profile", timeout=10)
+    """GET /api/v1/debug/profile and return the profile dict."""
+    resp = requests.get(f"{BASE_URL}/api/v1/debug/profile?pet_id=149", timeout=10)
     resp.raise_for_status()
     return resp.json().get("profile", {})
 
@@ -759,9 +778,9 @@ def test_aggregator_seed_data_preserved() -> bool:
 
 
 def test_aggregator_debug_endpoint() -> bool:
-    """GET /debug/profile returns status=ok and field_count > 0."""
+    """GET /api/v1/debug/profile returns status=ok and field_count > 0."""
     try:
-        resp = requests.get(f"{BASE_URL}/debug/profile", timeout=10)
+        resp = requests.get(f"{BASE_URL}/api/v1/debug/profile?pet_id=149", timeout=10)
         if resp.status_code != 200:
             return failed("Debug profile endpoint", f"HTTP {resp.status_code}")
         data = resp.json()
@@ -778,9 +797,9 @@ def test_aggregator_debug_endpoint() -> bool:
 # ── Section 6: Database & Phase 1C ────────────────────────────────────────────
 
 def test_debug_facts_endpoint() -> bool:
-    """GET /debug/facts returns a list from PostgreSQL (not JSON file)."""
+    """GET /api/v1/debug/facts returns a list from PostgreSQL (not JSON file)."""
     try:
-        resp = requests.get(f"{BASE_URL}/debug/facts", timeout=10)
+        resp = requests.get(f"{BASE_URL}/api/v1/debug/facts?pet_id=149", timeout=10)
         if resp.status_code != 200:
             return failed("GET /debug/facts -- HTTP 200", f"got {resp.status_code}")
         data = resp.json()
@@ -887,7 +906,7 @@ def test_profile_from_db_has_seed_data() -> bool:
 # ── Section 7: Thread Management (Phase 2) ───────────────────────────────────
 #
 # NOTE: Threads are per-pet (not per-session). Since all tests use the same
-# pet (Luna / DEFAULT_PET_ID), threads are shared within a 24h window.
+# pet (pet_id=149), threads are shared within a 24h window.
 # The first test run after server start creates a new thread; subsequent
 # requests (even with different session_ids) reuse it until it expires.
 
@@ -996,7 +1015,7 @@ def test_thread_messages_persisted() -> bool:
         wait_background("thread message persistence")
 
         resp = requests.get(
-            f"{BASE_URL}/debug/thread/{thread_id}/messages",
+            f"{BASE_URL}/api/v1/debug/thread/{thread_id}/messages",
             timeout=10,
         )
         resp.raise_for_status()
@@ -1027,7 +1046,7 @@ def test_thread_message_schema() -> bool:
         wait_background("thread message schema")
 
         resp = requests.get(
-            f"{BASE_URL}/debug/thread/{thread_id}/messages",
+            f"{BASE_URL}/api/v1/debug/thread/{thread_id}/messages",
             timeout=10,
         )
         resp.raise_for_status()
@@ -1056,7 +1075,7 @@ def test_thread_message_schema() -> bool:
 def test_debug_threads_endpoint() -> bool:
     """GET /debug/threads returns active threads list with correct schema."""
     try:
-        resp = requests.get(f"{BASE_URL}/debug/threads", timeout=10)
+        resp = requests.get(f"{BASE_URL}/api/v1/debug/threads", timeout=10)
         if resp.status_code != 200:
             return failed("GET /debug/threads -- HTTP 200", f"got {resp.status_code}")
         data = resp.json()
@@ -1095,7 +1114,7 @@ def test_debug_thread_messages_endpoint() -> bool:
         wait_background("debug messages endpoint")
 
         resp = requests.get(
-            f"{BASE_URL}/debug/thread/{thread_id}/messages",
+            f"{BASE_URL}/api/v1/debug/thread/{thread_id}/messages",
             timeout=10,
         )
         if resp.status_code != 200:
@@ -1115,7 +1134,7 @@ def test_debug_thread_messages_endpoint() -> bool:
 
 
 def test_compressor_still_works_with_threads() -> bool:
-    """Compressor fact extraction still works after Phase 2 thread changes (regression)."""
+    """Compressor fact extraction still works with thread management (regression)."""
     sid = new_sid()
     try:
         data = post_chat(
@@ -1129,7 +1148,7 @@ def test_compressor_still_works_with_threads() -> bool:
         wait_background("compressor regression")
         facts = facts_for(sid)
         if not facts:
-            return failed("Compressor + threads regression", "no facts extracted — pipeline broken?")
+            return failed("Compressor + threads regression", "no facts extracted -- pipeline broken?")
 
         keys = [f.get("key", f.get("field_key")) for f in facts]
         return passed("Compressor + threads regression", f"thread + {len(facts)} fact(s): {keys}")
@@ -1137,11 +1156,355 @@ def test_compressor_still_works_with_threads() -> bool:
         return failed("Compressor + threads regression", str(exc))
 
 
+# ── Section 8: API v1 Contract ────────────────────────────────────────────────
+
+def test_old_chat_url_returns_404() -> bool:
+    """POST /chat (without /api/v1/) returns 404 -- old URL is dead."""
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/chat",
+            json={"message": "test", "session_id": "test"},
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return passed("Old /chat URL -> 404", "correctly rejected")
+        return failed("Old /chat URL -> 404", f"got HTTP {resp.status_code} -- old URL still works!")
+    except Exception as exc:
+        return failed("Old /chat URL -> 404", str(exc))
+
+
+def test_old_confidence_url_returns_404() -> bool:
+    """GET /confidence (without /api/v1/) returns 404."""
+    try:
+        resp = requests.get(f"{BASE_URL}/confidence", timeout=10)
+        if resp.status_code == 404:
+            return passed("Old /confidence URL -> 404", "correctly rejected")
+        return failed("Old /confidence URL -> 404", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("Old /confidence URL -> 404", str(exc))
+
+
+def test_error_contract_shape() -> bool:
+    """Bad request returns standard error shape: {status: 'error', error: {code, message}}."""
+    try:
+        # Send empty message -- should fail validation (min_length=1)
+        resp = requests.post(
+            f"{BASE_URL}/api/v1/chat",
+            json={"message": "", "session_id": "test"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return failed("Error contract shape", "empty message returned 200 -- expected 422")
+        data = resp.json()
+        if data.get("status") != "error":
+            return failed("Error contract -- status='error'", f"got status={data.get('status')!r}")
+        err = data.get("error")
+        if not isinstance(err, dict):
+            return failed("Error contract -- error object", f"error is {type(err).__name__}")
+        if "code" not in err:
+            return failed("Error contract -- error.code", f"keys: {list(err.keys())}")
+        if "message" not in err:
+            return failed("Error contract -- error.message", f"keys: {list(err.keys())}")
+        return passed("Error contract shape", f"code={err['code']!r}")
+    except Exception as exc:
+        return failed("Error contract shape", str(exc))
+
+
+def test_chat_response_has_status_ok() -> bool:
+    """POST /api/v1/chat success response includes status='ok'."""
+    sid = new_sid()
+    try:
+        data = post_chat("Hello!", sid)
+        if data.get("status") != "ok":
+            return failed("Chat status='ok'", f"got status={data.get('status')!r}")
+        return passed("Chat status='ok'", "present in success response")
+    except Exception as exc:
+        return failed("Chat status='ok'", str(exc))
+
+
+def test_confidence_response_has_status_ok() -> bool:
+    """GET /api/v1/confidence response includes status='ok'."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/api/v1/confidence?pet_id=149",
+            headers=TEST_HEADERS, timeout=10,
+        )
+        data = resp.json()
+        if data.get("status") != "ok":
+            return failed("Confidence status='ok'", f"got status={data.get('status')!r}")
+        return passed("Confidence status='ok'", "present in success response")
+    except Exception as exc:
+        return failed("Confidence status='ok'", str(exc))
+
+
+def test_redirect_new_structure() -> bool:
+    """Health redirect has new nested structure: display{label,style} + context{query,pet_id,pet_summary}."""
+    sid = new_sid()
+    try:
+        data = post_chat(
+            "Luna is bleeding from her ear and won't stop crying, I'm terrified",
+            sid,
+        )
+        redirect = data.get("redirect")
+        if redirect is None:
+            return failed("Redirect structure", "redirect is null -- expected health redirect")
+
+        # Check display object
+        display = redirect.get("display")
+        if not isinstance(display, dict):
+            return failed("Redirect -- display is dict", f"got {type(display).__name__}")
+        if not display.get("label"):
+            return failed("Redirect -- display.label", "missing or empty")
+        if display.get("style") not in ("urgent", "suggestion"):
+            return failed("Redirect -- display.style", f"got {display.get('style')!r}")
+
+        # Check context object
+        context = redirect.get("context")
+        if not isinstance(context, dict):
+            return failed("Redirect -- context is dict", f"got {type(context).__name__}")
+        if not context.get("query"):
+            return failed("Redirect -- context.query", "missing or empty")
+        if not context.get("pet_id"):
+            return failed("Redirect -- context.pet_id", "missing or empty")
+        if not context.get("pet_summary"):
+            return failed("Redirect -- context.pet_summary", "missing or empty")
+
+        return passed(
+            "Redirect new structure",
+            f"display.label={display['label']!r} style={display['style']!r} context.pet_id={context['pet_id']!r}",
+        )
+    except Exception as exc:
+        return failed("Redirect structure", str(exc))
+
+
+# ── Section 9: AALDA Integration + Multi-Pet Sprint ──────────────────────────
+
+def test_missing_user_code_returns_401() -> bool:
+    """POST /api/v1/chat without X-User-Code header returns 401."""
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/api/v1/chat",
+            json={"message": "Hello", "session_id": new_sid(), "pet_ids": [149]},
+            # No X-User-Code header
+            timeout=15,
+        )
+        if resp.status_code == 401:
+            return passed("Missing X-User-Code -> 401")
+        return failed("Missing X-User-Code -> 401", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("Missing X-User-Code -> 401", str(exc))
+
+
+def test_missing_pet_ids_returns_422() -> bool:
+    """POST /api/v1/chat without pet_ids returns 422 validation error."""
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/api/v1/chat",
+            json={"message": "Hello", "session_id": new_sid()},
+            headers=TEST_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 422:
+            return passed("Missing pet_ids -> 422")
+        return failed("Missing pet_ids -> 422", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("Missing pet_ids -> 422", str(exc))
+
+
+def test_list_pets_endpoint() -> bool:
+    """GET /api/v1/pets returns a list of pets for the user."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/api/v1/pets",
+            headers=TEST_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return failed("GET /pets -- HTTP 200", f"got {resp.status_code}")
+        data = resp.json()
+        if data.get("status") != "ok":
+            return failed("GET /pets -- status=ok", f"got {data.get('status')!r}")
+        pets = data.get("pets", [])
+        if not isinstance(pets, list) or len(pets) == 0:
+            return failed("GET /pets -- non-empty list", f"got {len(pets)} pets")
+        # Check that each pet has expected fields
+        first_pet = pets[0]
+        for field in ("pet_id", "name", "species", "breed"):
+            if field not in first_pet:
+                return failed(f"GET /pets -- pet has '{field}'", f"missing from {list(first_pet.keys())}")
+        return passed("GET /pets", f"{len(pets)} pet(s), first={first_pet.get('name')!r}")
+    except Exception as exc:
+        return failed("GET /pets", str(exc))
+
+
+def test_list_pets_requires_user_code() -> bool:
+    """GET /api/v1/pets without X-User-Code returns 401."""
+    try:
+        resp = requests.get(f"{BASE_URL}/api/v1/pets", timeout=15)
+        if resp.status_code == 401:
+            return passed("GET /pets without user code -> 401")
+        return failed("GET /pets without user code -> 401", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("GET /pets without user code -> 401", str(exc))
+
+
+def test_single_pet_chat() -> bool:
+    """POST /api/v1/chat with pet_ids=[149] returns a valid response with real pet data."""
+    sid = new_sid()
+    try:
+        data = post_chat("Hello, how is my pet?", sid, pet_ids=[149])
+        if data.get("status") != "ok":
+            return failed("Single pet chat -- status", f"got {data.get('status')!r}")
+        if not data.get("message"):
+            return failed("Single pet chat -- message", "empty reply")
+        if not data.get("thread_id"):
+            return failed("Single pet chat -- thread_id", "missing")
+        return passed("Single pet chat", f"reply_len={len(data['message'])} thread={data['thread_id'][:12]}...")
+    except Exception as exc:
+        return failed("Single pet chat", str(exc))
+
+
+def test_dual_pet_chat() -> bool:
+    """POST /api/v1/chat with pet_ids=[149, 153] returns a valid response."""
+    sid = new_sid()
+    try:
+        data = post_chat("How are both my pets doing?", sid, pet_ids=[149, 153])
+        if data.get("status") != "ok":
+            return failed("Dual pet chat -- status", f"got {data.get('status')!r}")
+        if not data.get("message"):
+            return failed("Dual pet chat -- message", "empty reply")
+        return passed("Dual pet chat", f"reply_len={len(data['message'])}")
+    except Exception as exc:
+        return failed("Dual pet chat", str(exc))
+
+
+def test_pet_ids_integer_type() -> bool:
+    """POST /api/v1/chat with string pet_ids returns 422 (must be integers)."""
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/api/v1/chat",
+            json={"message": "Hello", "session_id": new_sid(), "pet_ids": ["luna-001"]},
+            headers=TEST_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 422:
+            return passed("String pet_ids -> 422")
+        return failed("String pet_ids -> 422", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("String pet_ids -> 422", str(exc))
+
+
+def test_too_many_pet_ids_returns_422() -> bool:
+    """POST /api/v1/chat with 3 pet_ids returns 422 (max 2)."""
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/api/v1/chat",
+            json={"message": "Hello", "session_id": new_sid(), "pet_ids": [149, 153, 200]},
+            headers=TEST_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 422:
+            return passed("3 pet_ids -> 422")
+        return failed("3 pet_ids -> 422", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("3 pet_ids -> 422", str(exc))
+
+
+def test_confidence_requires_pet_id() -> bool:
+    """GET /api/v1/confidence without pet_id returns 400."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/api/v1/confidence",
+            headers=TEST_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 400:
+            return passed("GET /confidence without pet_id -> 400")
+        return failed("GET /confidence without pet_id -> 400", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("GET /confidence without pet_id -> 400", str(exc))
+
+
+def test_confidence_with_pet_id() -> bool:
+    """GET /api/v1/confidence?pet_id=149 with X-User-Code returns valid score."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/api/v1/confidence?pet_id=149",
+            headers=TEST_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return failed("GET /confidence with pet_id -- HTTP 200", f"got {resp.status_code}")
+        data = resp.json()
+        score = data.get("confidence_score")
+        color = data.get("confidence_color")
+        if not isinstance(score, int):
+            return failed("Confidence with pet_id -- score type", f"got {type(score).__name__}")
+        if color not in ("green", "yellow", "red"):
+            return failed("Confidence with pet_id -- color", f"got {color!r}")
+        return passed("Confidence with pet_id", f"score={score} color={color}")
+    except Exception as exc:
+        return failed("Confidence with pet_id", str(exc))
+
+
+def test_debug_facts_requires_pet_id() -> bool:
+    """GET /api/v1/debug/facts without pet_id returns 400."""
+    try:
+        resp = requests.get(f"{BASE_URL}/api/v1/debug/facts", timeout=10)
+        if resp.status_code == 400:
+            return passed("GET /debug/facts without pet_id -> 400")
+        return failed("GET /debug/facts without pet_id -> 400", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("GET /debug/facts without pet_id -> 400", str(exc))
+
+
+def test_debug_profile_requires_pet_id() -> bool:
+    """GET /api/v1/debug/profile without pet_id returns 400."""
+    try:
+        resp = requests.get(f"{BASE_URL}/api/v1/debug/profile", timeout=10)
+        if resp.status_code == 400:
+            return passed("GET /debug/profile without pet_id -> 400")
+        return failed("GET /debug/profile without pet_id -> 400", f"got HTTP {resp.status_code}")
+    except Exception as exc:
+        return failed("GET /debug/profile without pet_id -> 400", str(exc))
+
+
+def test_chat_uses_real_pet_name() -> bool:
+    """Chat response should use the real pet name from AALDA, not 'Luna'."""
+    sid = new_sid()
+    try:
+        # First get the pet name from /pets
+        pets_resp = requests.get(f"{BASE_URL}/api/v1/pets", headers=TEST_HEADERS, timeout=15)
+        pets_data = pets_resp.json()
+        pet_name = None
+        for p in pets_data.get("pets", []):
+            if p.get("pet_id") == 149:
+                pet_name = p.get("name")
+                break
+
+        if not pet_name:
+            return failed("Real pet name", "could not fetch pet 149 name from AALDA")
+
+        # Now chat and check the reply uses the real name
+        data = post_chat(f"Tell me about my pet", sid, pet_ids=[149])
+        reply = data.get("message", "").lower()
+
+        if pet_name.lower() in reply:
+            return passed("Chat uses real pet name", f"found '{pet_name}' in reply")
+        # Even if pet name isn't in this particular reply, it's not a hard failure --
+        # the LLM might not mention the name in every reply. Check it's not "Luna".
+        if "luna" in reply:
+            return failed("Chat uses real pet name", f"reply still contains 'Luna' -- expected '{pet_name}'")
+        return passed("Chat uses real pet name", f"'{pet_name}' not in reply but 'Luna' also absent")
+    except Exception as exc:
+        return failed("Chat uses real pet name", str(exc))
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     print(f"\n{BOLD}{'=' * 56}{RESET}")
-    print(f"{BOLD}  AnyMall-chan -- Phase 2 End-to-End Test Suite{RESET}")
+    print(f"{BOLD}  AnyMall-chan -- API v1 End-to-End Test Suite{RESET}")
     print(f"{BOLD}{'=' * 56}{RESET}")
     print(f"  Backend:   {BASE_URL}")
     print(f"  Storage:   PostgreSQL (via GET /debug/facts)")
@@ -1218,6 +1581,31 @@ def main() -> None:
     results.append(test_debug_threads_endpoint())
     results.append(test_debug_thread_messages_endpoint())
     results.append(test_compressor_still_works_with_threads())
+
+    # ── Section 8: API v1 Contract ────────────────────────────────────────────
+    section("8  API v1 Contract")
+    results.append(test_old_chat_url_returns_404())
+    results.append(test_old_confidence_url_returns_404())
+    results.append(test_error_contract_shape())
+    results.append(test_chat_response_has_status_ok())
+    results.append(test_confidence_response_has_status_ok())
+    results.append(test_redirect_new_structure())
+
+    # ── Section 9: AALDA Integration + Multi-Pet Sprint ────────────────────────
+    section("9  AALDA Integration + Multi-Pet Sprint")
+    results.append(test_missing_user_code_returns_401())
+    results.append(test_missing_pet_ids_returns_422())
+    results.append(test_list_pets_endpoint())
+    results.append(test_list_pets_requires_user_code())
+    results.append(test_single_pet_chat())
+    results.append(test_dual_pet_chat())
+    results.append(test_pet_ids_integer_type())
+    results.append(test_too_many_pet_ids_returns_422())
+    results.append(test_confidence_requires_pet_id())
+    results.append(test_confidence_with_pet_id())
+    results.append(test_debug_facts_requires_pet_id())
+    results.append(test_debug_profile_requires_pet_id())
+    results.append(test_chat_uses_real_pet_name())
 
     # ── Summary ────────────────────────────────────────────────────────────────
     passed_count = sum(results)

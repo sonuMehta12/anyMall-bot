@@ -54,6 +54,10 @@ async def init_db(database_url: str) -> AsyncEngine:
     """
     global _engine, _session_factory
 
+    # Railway/Render provide postgresql:// but asyncpg needs postgresql+asyncpg://
+    if database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
     _engine = create_async_engine(
         database_url,
         echo=False,       # True = log every SQL statement (noisy, useful for debugging)

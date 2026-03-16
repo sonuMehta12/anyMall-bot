@@ -3,32 +3,30 @@
 # Debug endpoints — development only, remove in Phase 4.
 #
 # What lives here:
-#   - GET /debug/facts              — Compressor output (fact_log table)
-#   - GET /debug/profile            — Aggregator output (active_profile table)
-#   - GET /debug/threads            — Active threads (Phase 2)
-#   - GET /debug/thread/{id}/messages — Messages for a thread (Phase 2)
+#   - GET /api/v1/debug/facts              — Compressor output (fact_log table)
+#   - GET /api/v1/debug/profile            — Aggregator output (active_profile table)
+#   - GET /api/v1/debug/threads            — Active threads (Phase 2)
+#   - GET /api/v1/debug/thread/{id}/messages — Messages for a thread (Phase 2)
 #
-# GET /confidence lives in main.py (must be defined directly on the app
-# to take priority over the catch-all frontend route).
-#
+# All pet-specific endpoints require pet_id query param.
 # Phase 1C: reads from PostgreSQL instead of JSON files.
 
 import logging
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.db.session import get_session
 from app.db.repositories import FactLogRepo, ActiveProfileRepo, ThreadRepo, ThreadMessageRepo
-from constants import DEFAULT_PET_ID
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/debug", tags=["debug"])
+router = APIRouter(prefix="/api/v1/debug", tags=["debug"])
 
 
 @router.get("/facts", summary="Compressor output — recent extracted facts")
 async def debug_facts(
+    pet_id: int = 0,
     session_id: str | None = None,
     limit: int = 20,
 ) -> dict[str, Any]:
@@ -36,43 +34,45 @@ async def debug_facts(
     Returns the most recent entries from the fact_log table.
 
     Query params:
+        pet_id      — which pet (required)
         session_id  — filter to one session (omit for all sessions)
         limit       — max entries to return (default 20, max 100)
-
-    This is how the UI sees Agent 2 (Compressor) output.
-    The Compressor runs after the /chat reply is sent, so its output
-    is NOT in the /chat response — poll this endpoint instead.
     """
+    if pet_id == 0:
+        raise HTTPException(status_code=400, detail="pet_id query parameter is required.")
+
     limit = min(limit, 100)
 
     async with get_session() as session:
         repo = FactLogRepo(session)
-        facts = await repo.read_recent(DEFAULT_PET_ID, session_id=session_id, limit=limit)
+        facts = await repo.read_recent(pet_id, session_id=session_id, limit=limit)
 
     return {
         "count": len(facts),
+        "pet_id": pet_id,
         "session_id_filter": session_id,
         "facts": facts,
     }
 
 
 @router.get("/profile", summary="Active profile — current best-known facts")
-async def debug_profile() -> dict[str, Any]:
+async def debug_profile(pet_id: int = 0) -> dict[str, Any]:
     """
     Returns the current active_profile from the database.
 
-    This is how you see Agent 3 (Aggregator) output.
-    After each /chat with extractable facts, the Aggregator merges
-    high-confidence facts into the active profile.
+    Query params:
+        pet_id — which pet (required)
     """
+    if pet_id == 0:
+        raise HTTPException(status_code=400, detail="pet_id query parameter is required.")
+
     async with get_session() as session:
         repo = ActiveProfileRepo(session)
-        profile = await repo.read_all(DEFAULT_PET_ID)
+        profile = await repo.read_all(pet_id)
 
     if profile is None:
         return {"status": "no_profile", "field_count": 0, "profile": {}}
 
-    # Count only fact entries (skip metadata keys like _pet_history).
     fact_count = sum(1 for k in profile if not k.startswith("_"))
     return {"status": "ok", "field_count": fact_count, "profile": profile}
 

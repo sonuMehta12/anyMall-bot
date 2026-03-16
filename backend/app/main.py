@@ -4,16 +4,16 @@
 #
 # What lives here:
 #   - App creation + CORS config
-#   - Lifespan: connect DB, create LLM provider + agents, store on app.state
+#   - Lifespan: connect DB, create LLM provider + agents + pet_fetcher, store on app.state
 #   - GET /health — liveness check (infrastructure, stays with the app)
-#   - GET /confidence — confidence bar score
+#   - Error handlers — standardised error contract for Flutter
 #   - include_router() calls to wire in route modules
 #
 # What does NOT live here:
 #   - Route handlers (app/routes/)
 #   - Business logic (agents/ and services/)
 #   - LLM credentials (core/config.py + .env)
-#   - Pet data (context_builder.py reads from PostgreSQL at startup)
+#   - Pet data (fetched per-request from AALDA API via pet_fetcher.py)
 #
 # Session state (Phase 2):
 #   In-memory dict: thread_id -> list of messages.
@@ -30,9 +30,11 @@ from typing import Any
 
 # ── Third-party ────────────────────────────────────────────────────────────────
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # ── Our code ───────────────────────────────────────────────────────────────────
 from app.core.config import settings
@@ -41,10 +43,9 @@ from app.agents.conversation import ConversationAgent
 from app.agents.intent_classifier import IntentClassifier
 from app.agents.compressor import CompressorAgent
 from app.agents.aggregator import AggregatorAgent
-from app.services.context_builder import build_context, load_profiles_from_db
-from app.services.confidence_calculator import calculate_confidence_score, confidence_color
+from app.services.pet_fetcher import PetFetcher
 from app.db.session import init_db, dispose_engine, get_session
-from app.db.repositories import PetRepo, UserRepo, ActiveProfileRepo, ThreadRepo, ThreadMessageRepo
+from app.db.repositories import ThreadRepo, ThreadMessageRepo
 from app.services.thread_summarizer import ThreadSummarizer
 
 # ── Route modules ─────────────────────────────────────────────────────────────
@@ -88,17 +89,8 @@ async def lifespan(app: FastAPI):
 
     await init_db(settings.database_url)
 
-    # Load profiles from PostgreSQL (seeds Luna + Shara defaults if empty).
-    async with get_session() as session:
-        profiles = await load_profiles_from_db(
-            pet_repo=PetRepo(session),
-            user_repo=UserRepo(session),
-            active_repo=ActiveProfileRepo(session),
-        )
-
-    app.state.active_profile = profiles["active"]
-    app.state.pet_profile = profiles["pet"]
-    app.state.user_profile = profiles["user"]
+    # ── AALDA API client (fetches real pet data per-request) ──────────────
+    app.state.pet_fetcher = PetFetcher(settings.aalda_api_url)
 
     # ── LLM + Agents ─────────────────────────────────────────────────────
     llm = create_llm_provider(settings)
@@ -111,7 +103,7 @@ async def lifespan(app: FastAPI):
     app.state.thread_summarizer = ThreadSummarizer(llm=llm)
 
     # ── Phase 2: Reload active threads from PostgreSQL ─────────────────
-    # Same pattern as load_profiles_from_db — read from DB at startup,
+    # Read from DB at startup,
     # populate app.state so runtime reads are in-memory only.
     async with get_session() as session:
         thread_repo = ThreadRepo(session)
@@ -135,6 +127,7 @@ async def lifespan(app: FastAPI):
     # can finish their DB writes before the connection pool is disposed.
     logger.info("Shutting down — waiting for background tasks...")
     await asyncio.sleep(2)
+    await app.state.pet_fetcher.close()
     await dispose_engine()
     logger.info("Shutdown complete.")
 
@@ -143,7 +136,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AnyMall-chan API",
-    description="Pet companion chat backend — Phase 2 (Thread Management)",
+    description="Pet companion chat backend — API v1",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -162,6 +155,54 @@ app.add_middleware(
 )
 
 
+# ── Error handlers — standardised error contract ─────────────────────────────
+#
+# Every error response follows the same shape:
+#   {"status": "error", "error": {"code": "...", "message": "..."}}
+#
+# Flutter checks `status` field first, then reads `error.code` + `error.message`.
+
+_ERROR_CODES: dict[int, str] = {
+    400: "BAD_REQUEST",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+    503: "SERVICE_UNAVAILABLE",
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request, exc: StarletteHTTPException) -> JSONResponse:
+    """Wrap all HTTP errors into the standard error shape."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "error": {
+                "code": _ERROR_CODES.get(exc.status_code, "UNKNOWN_ERROR"),
+                "message": str(exc.detail),
+            },
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError) -> JSONResponse:
+    """Wrap Pydantic validation errors into the standard error shape."""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "error",
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": str(exc),
+            },
+        },
+    )
+
+
 # ── Register route modules ────────────────────────────────────────────────────
 
 app.include_router(chat_router)
@@ -169,7 +210,7 @@ app.include_router(debug_router)
 app.include_router(simulator_router)
 
 
-# ── Infrastructure route (stays in main.py) ────────────────────────────────────
+# ── Infrastructure route (stays in main.py — no /api/v1 prefix) ──────────────
 
 @app.get("/health", summary="Liveness check")
 async def health() -> dict[str, Any]:
@@ -183,30 +224,7 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "llm_provider": settings.llm_provider,
         "llm_reachable": llm_ok,
-        "phase": "1C",
-    }
-
-
-@app.get("/confidence", summary="Current confidence bar score")
-async def get_confidence() -> dict[str, Any]:
-    """
-    Returns the current confidence score and color based on active_profile.
-
-    Called by the frontend on mount (before any chat messages) and after
-    each chat response with a short delay (to pick up Aggregator writes).
-
-    No LLM — pure arithmetic on in-memory profile data. Sub-millisecond.
-    """
-    active_profile, _gap_list, _pet_summary, _pet_history, _rel, _conv = build_context(
-        active_profile_raw=app.state.active_profile,
-        pet_profile=app.state.pet_profile,
-        user_profile=app.state.user_profile,
-    )
-    score = calculate_confidence_score(active_profile, app.state.pet_profile)
-    color = confidence_color(score)
-    return {
-        "confidence_score": score,
-        "confidence_color": color,
+        "version": "1.0.0",
     }
 
 

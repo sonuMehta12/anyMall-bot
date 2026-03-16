@@ -1,15 +1,29 @@
 // Development: VITE_API_URL=http://127.0.0.1:8000 (set in .env.development or via CLI)
 // Production:  empty string — requests go to the same server serving the frontend
-const BASE = import.meta.env.VITE_API_URL ?? ''
+export const BASE = import.meta.env.VITE_API_URL ?? ''
 
-// POST /chat
-export async function sendMessage({ sessionId, message }) {
-  const res = await fetch(`${BASE}/chat`, {
+// GET /api/v1/pets — fetch user's pets from AALDA
+export async function fetchPets(userCode) {
+  const res = await fetch(`${BASE}/api/v1/pets`, {
+    headers: { 'X-User-Code': userCode },
+  })
+  if (!res.ok) throw new Error(`${res.status} — failed to fetch pets`)
+  const data = await res.json()
+  return data.pets
+}
+
+// POST /api/v1/chat
+export async function sendMessage({ sessionId, message, petIds, userCode }) {
+  const res = await fetch(`${BASE}/api/v1/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Code': userCode,
+    },
     body: JSON.stringify({
       session_id: sessionId,
       message,
+      pet_ids: petIds,
     }),
   })
   if (!res.ok) throw new Error(`${res.status} — failed to send message`)
@@ -31,11 +45,12 @@ export async function sendMessage({ sessionId, message }) {
   console.groupEnd()
 
   // ── Agent 2 (Compressor) — logged after 8s (runs fire-and-forget in background) ──
-  // The Compressor starts AFTER the reply is sent, so we poll /debug/facts
-  // 8 seconds later to give it time to finish its LLM call and write to fact_log.json.
+  const primaryPetId = petIds[0]
   setTimeout(async () => {
     try {
-      const factsRes = await fetch(`${BASE}/debug/facts?session_id=${data.session_id}&limit=10`)
+      const factsRes = await fetch(
+        `${BASE}/api/v1/debug/facts?pet_id=${primaryPetId}&session_id=${data.session_id}&limit=10`
+      )
       const factsData = await factsRes.json()
 
       if (factsData.facts?.length > 0) {
@@ -64,10 +79,8 @@ export async function sendMessage({ sessionId, message }) {
     }
 
     // ── Agent 3 (Aggregator) — logged right after Agent 2 (same poll window) ──
-    // The Aggregator runs immediately after the Compressor in _run_background(),
-    // so the profile should be updated by the time we check.
     try {
-      const profileRes = await fetch(`${BASE}/debug/profile`)
+      const profileRes = await fetch(`${BASE}/api/v1/debug/profile?pet_id=${primaryPetId}`)
       const profileData = await profileRes.json()
 
       if (profileData.status === 'ok' && profileData.field_count > 0) {
@@ -101,9 +114,11 @@ export async function sendMessage({ sessionId, message }) {
 }
 
 
-// GET /confidence — dedicated endpoint for fresh confidence score
-export async function fetchConfidence() {
-  const res = await fetch(`${BASE}/confidence`)
+// GET /api/v1/confidence — dedicated endpoint for fresh confidence score
+export async function fetchConfidence(petId, userCode) {
+  const res = await fetch(`${BASE}/api/v1/confidence?pet_id=${petId}`, {
+    headers: { 'X-User-Code': userCode },
+  })
   if (!res.ok) throw new Error(`${res.status} — failed to fetch confidence`)
   return res.json()
 }

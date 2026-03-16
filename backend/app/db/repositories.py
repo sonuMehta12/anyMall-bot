@@ -36,7 +36,7 @@ class PetRepo:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def read(self, pet_id: str) -> dict | None:
+    async def read(self, pet_id: int) -> dict | None:
         """Read a pet profile by pet_id.  Returns dict or None if not found."""
         stmt = select(Pet).where(Pet.pet_id == pet_id)
         result = await self._session.execute(stmt)
@@ -124,7 +124,7 @@ class ActiveProfileRepo:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def read_all(self, pet_id: str) -> dict | None:
+    async def read_all(self, pet_id: int) -> dict | None:
         """
         Read all active_profile entries for a pet.
 
@@ -150,7 +150,7 @@ class ActiveProfileRepo:
 
         return profile
 
-    async def write_all(self, pet_id: str, profile_dict: dict) -> None:
+    async def write_all(self, pet_id: int, profile_dict: dict) -> None:
         """
         Write the entire active_profile dict to the database.
 
@@ -233,7 +233,7 @@ class FactLogRepo:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def append(self, facts: list[dict], pet_id: str) -> None:
+    async def append(self, facts: list[dict], pet_id: int) -> None:
         """
         Append a list of fact dicts to the fact_log table.
 
@@ -268,7 +268,7 @@ class FactLogRepo:
 
     async def read_recent(
         self,
-        pet_id: str,
+        pet_id: int,
         session_id: str | None = None,
         limit: int = 20,
     ) -> list[dict]:
@@ -313,7 +313,7 @@ class ThreadRepo:
     async def create(
         self,
         thread_id: str,
-        pet_id: str,
+        pet_id: int,
         user_id: str,
         started_at: str,
         expires_at: str,
@@ -332,7 +332,7 @@ class ThreadRepo:
         logger.info("Thread created: thread_id=%s pet_id=%s", thread_id, pet_id)
         return thread.to_dict()
 
-    async def get_active(self, pet_id: str) -> dict | None:
+    async def get_active(self, pet_id: int) -> dict | None:
         """
         Get the active thread for a pet.
 
@@ -381,7 +381,7 @@ class ThreadRepo:
             await self._session.commit()
             logger.debug("Compaction summary updated: thread_id=%s", thread_id)
 
-    async def get_latest_expired(self, pet_id: str) -> dict | None:
+    async def get_latest_expired(self, pet_id: int) -> dict | None:
         """
         Get the most recently started expired thread for a pet.
 
