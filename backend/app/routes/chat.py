@@ -94,6 +94,10 @@ class ChatRequest(BaseModel):
         ..., min_length=1, max_length=2,
         description="1 or 2 pet IDs to chat about.",
     )
+    language: str = Field(
+        default="auto",
+        description="Language preference: 'EN', 'JA', or 'auto' (detect from message).",
+    )
 
 
 class RedirectDisplay(BaseModel):
@@ -329,7 +333,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         intent_type=intent_type,
         urgency=urgency,
         questions_asked_so_far=questions_so_far,
-        language_str=_detect_language(request_body.message),
+        language_str=request_body.language if request_body.language != "auto" else _detect_language(request_body.message),
         conversation_summary=conversation_summary,
     )
 

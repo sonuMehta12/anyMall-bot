@@ -11,7 +11,7 @@ function makeSessionId() {
   return `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-export default function Chat({ selectedPets, userCode, onBack }) {
+export default function Chat({ selectedPets, userCode, language, onBack }) {
   const [sessionId] = useState(makeSessionId)   // created once, never changes
   const [messages, setMessages] = useState([])
   const [inputText, setInputText] = useState('')
@@ -45,9 +45,13 @@ export default function Chat({ selectedPets, userCode, onBack }) {
 
   // Show opening greeting when chat first mounts
   useEffect(() => {
-    const greeting = selectedPets.length === 1
-      ? `Hi! How's ${primaryPet.name} doing today? 🐾`
-      : `Hi! How are ${petNames} doing today? 🐾`
+    const greeting = language === 'JA'
+      ? (selectedPets.length === 1
+        ? `こんにちは！${primaryPet.name}の調子はどうですか？🐾`
+        : `こんにちは！${petNames}の調子はどうですか？🐾`)
+      : (selectedPets.length === 1
+        ? `Hi! How's ${primaryPet.name} doing today? 🐾`
+        : `Hi! How are ${petNames} doing today? 🐾`)
     setMessages([{ id: 1, text: greeting, isUser: false }])
   }, [])
 
@@ -67,6 +71,7 @@ export default function Chat({ selectedPets, userCode, onBack }) {
         message: text,
         petIds,
         userCode,
+        language,
       })
 
       setConfidenceScore(data.confidence_score ?? 0)
@@ -176,7 +181,7 @@ export default function Chat({ selectedPets, userCode, onBack }) {
           <textarea
             ref={textareaRef}
             className="chat-input"
-            placeholder={`Message about ${petNames}...`}
+            placeholder={language === 'JA' ? `${petNames}について...` : `Message about ${petNames}...`}
             value={inputText}
             onChange={e => {
               setInputText(e.target.value)

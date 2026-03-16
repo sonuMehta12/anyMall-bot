@@ -9,6 +9,7 @@ export default function App() {
   const [screen, setScreen] = useState('petSelect') // 'petSelect' | 'chat'
   const [userCode, setUserCode] = useState(DEFAULT_USER_CODE)
   const [selectedPets, setSelectedPets] = useState([])
+  const [language, setLanguage] = useState('EN') // 'EN' | 'JA'
 
   function handleStartChat(pets) {
     setSelectedPets(pets)
@@ -27,12 +28,15 @@ export default function App() {
           userCode={userCode}
           onUserCodeChange={setUserCode}
           onStartChat={handleStartChat}
+          language={language}
+          onLanguageChange={setLanguage}
         />
       )}
       {screen === 'chat' && (
         <Chat
           selectedPets={selectedPets}
           userCode={userCode}
+          language={language}
           onBack={handleBack}
         />
       )}

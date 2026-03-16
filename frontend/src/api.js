@@ -13,7 +13,7 @@ export async function fetchPets(userCode) {
 }
 
 // POST /api/v1/chat
-export async function sendMessage({ sessionId, message, petIds, userCode }) {
+export async function sendMessage({ sessionId, message, petIds, userCode, language = 'auto' }) {
   const res = await fetch(`${BASE}/api/v1/chat`, {
     method: 'POST',
     headers: {
@@ -24,6 +24,7 @@ export async function sendMessage({ sessionId, message, petIds, userCode }) {
       session_id: sessionId,
       message,
       pet_ids: petIds,
+      language,
     }),
   })
   if (!res.ok) throw new Error(`${res.status} — failed to send message`)

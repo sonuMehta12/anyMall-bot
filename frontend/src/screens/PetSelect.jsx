@@ -16,7 +16,7 @@ function calcAge(dob) {
   return `${years}yo`
 }
 
-export default function PetSelect({ userCode, onUserCodeChange, onStartChat }) {
+export default function PetSelect({ userCode, onUserCodeChange, onStartChat, language, onLanguageChange }) {
   const [pets, setPets] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -69,16 +69,29 @@ export default function PetSelect({ userCode, onUserCodeChange, onStartChat }) {
         <div className="header-mascot">🐢</div>
       </div>
 
-      {/* User code input */}
-      <div className="usercode-input">
-        <label className="usercode-label">User Code</label>
-        <input
-          className="usercode-field"
-          type="password"
-          value={userCode}
-          onChange={e => onUserCodeChange(e.target.value)}
-          placeholder="Enter your user code"
-        />
+      {/* User code + language row */}
+      <div className="settings-row">
+        <div className="usercode-input">
+          <label className="usercode-label">User Code</label>
+          <input
+            className="usercode-field"
+            type="password"
+            value={userCode}
+            onChange={e => onUserCodeChange(e.target.value)}
+            placeholder="Enter your user code"
+          />
+        </div>
+        <div className="language-input">
+          <label className="usercode-label">Language</label>
+          <select
+            className="language-field"
+            value={language}
+            onChange={e => onLanguageChange(e.target.value)}
+          >
+            <option value="EN">English</option>
+            <option value="JA">日本語</option>
+          </select>
+        </div>
       </div>
 
       {/* Onboarding info card */}
