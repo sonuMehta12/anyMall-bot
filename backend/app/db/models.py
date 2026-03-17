@@ -25,6 +25,7 @@
 from sqlalchemy import (
     Boolean,
     Float,
+    ForeignKey,
     Index,
     Integer,
     String,
@@ -94,33 +95,44 @@ class User(Base):
     """
     Owner relationship data.
 
-    user_id stores the x-user-code string (e.g. "3AOU9K1PWH").
-    pet_id is the integer ID from AALDA (e.g. 143).
+    user_code stores the X-User-Code header string (e.g. "3AOU9K1PWH").
+    Pet ownership comes from AALDA API — NOT stored on the user table.
+    Auto-upserted on first chat request with sensible defaults.
     """
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(
+    user_code: Mapped[str] = mapped_column(
         String(64), unique=True, nullable=False)
-    pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    display_name: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="")
     session_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0)
     relationship_summary: Mapped[str] = mapped_column(
         Text, nullable=False, default="")
+    # NL description of the owner's communication style and relationship with their pet.
+    # e.g. "Owner tends to be anxious, prefers short reassuring replies."
+    # Also covers conversation style (anxious/brief/detailed) — no separate field needed.
+    preferred_language: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="auto")  # "EN"|"JA"|"auto"
+    created_at: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="")
     updated_at: Mapped[str] = mapped_column(
         String(64), nullable=False, default="")
 
     def __repr__(self) -> str:
-        return f"<User user_id={self.user_id!r}>"
+        return f"<User user_code={self.user_code!r}>"
 
     def to_dict(self) -> dict:
-        """Return the same dict shape as user_profile.json."""
+        """Return all user fields as a plain dict."""
         return {
-            "user_id": self.user_id,
-            "pet_id": self.pet_id,
+            "user_code": self.user_code,
+            "display_name": self.display_name,
             "session_count": self.session_count,
             "relationship_summary": self.relationship_summary,
+            "preferred_language": self.preferred_language,
+            "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
 
@@ -222,6 +234,8 @@ class FactLog(Base):
     timestamp: Mapped[str | None] = mapped_column(String(64), nullable=True)
     needs_clarification: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
+    pet_label: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="pet_a")  # "pet_a" or "pet_b" — Compressor attribution label
     extracted_at: Mapped[str] = mapped_column(String(64), nullable=False)
 
     __table_args__ = (
@@ -244,6 +258,7 @@ class FactLog(Base):
             "source_quote": self.source_quote,
             "timestamp": self.timestamp,
             "needs_clarification": self.needs_clarification,
+            "pet_label": self.pet_label,
             "extracted_at": self.extracted_at,
             "session_id": self.session_id,
         }
@@ -267,6 +282,8 @@ class Thread(Base):
     thread_id: Mapped[str] = mapped_column(
         String(128), unique=True, nullable=False)
     pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    secondary_pet_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True)  # W11: second pet in dual-pet sessions (None for single-pet)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False)
     started_at: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -279,6 +296,7 @@ class Thread(Base):
 
     __table_args__ = (
         Index("ix_threads_pet_id_status", "pet_id", "status"),
+        Index("ix_threads_secondary_pet_id", "secondary_pet_id"),
         Index("ix_threads_user_id", "user_id"),
     )
 
@@ -290,6 +308,7 @@ class Thread(Base):
         return {
             "thread_id": self.thread_id,
             "pet_id": self.pet_id,
+            "secondary_pet_id": self.secondary_pet_id,
             "user_id": self.user_id,
             "started_at": self.started_at,
             "expires_at": self.expires_at,
@@ -313,7 +332,9 @@ class ThreadMessage(Base):
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
-    thread_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    thread_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("threads.thread_id", ondelete="CASCADE"),
+        nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     timestamp: Mapped[str] = mapped_column(String(64), nullable=False)

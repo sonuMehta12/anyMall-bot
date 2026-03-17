@@ -119,7 +119,7 @@ HOW TO COMMUNICATE:
 {flag_section}
 
 {conversation_summary_section}
-
+{clarification_section}
 RESPONSE STRUCTURE:
 Follow this flow internally. Do not show the structure to the user.
 1. Empathy or acknowledgement (1 sentence, emotion-first. Do not just \
@@ -426,21 +426,24 @@ class ConversationAgent:
         questions_asked_so_far: int = 0,
         language_str: str = "EN",
         conversation_summary: str = "",
+        pending_clarifications: list[dict] | None = None,
     ) -> AgentResponse:
         """
         Process one user message and return an AgentResponse.
 
         Args:
-            user_message:          The latest message from the owner.
-            session_messages:      Previous messages this session.
-            pet_a_context:         dict with keys: active_profile, gap_list, pet_info_json, pet_summary
-            pet_b_context:         Same as pet_a_context for second pet, or None if single pet.
-            relationship_context:  NL sentence: owner's communication style.
-            intent_type:           "health", "food", or "general".
-            urgency:               "high", "medium", "low", or "none".
-            questions_asked_so_far: Gap questions already asked this session.
-            language_str:          Preferred language code ("EN", "JA", etc.).
-            conversation_summary:  Phase 2: compaction summary from thread.
+            user_message:            The latest message from the owner.
+            session_messages:        Previous messages this session.
+            pet_a_context:           dict with keys: active_profile, gap_list, pet_info_json, pet_summary
+            pet_b_context:           Same as pet_a_context for second pet, or None if single pet.
+            relationship_context:    NL sentence: owner's communication style.
+            intent_type:             "health", "food", or "general".
+            urgency:                 "high", "medium", "low", or "none".
+            questions_asked_so_far:  Gap questions already asked this session.
+            language_str:            Preferred language code ("EN", "JA", etc.).
+            conversation_summary:    Phase 2: compaction summary from thread.
+            pending_clarifications:  Low-confidence facts from previous turn to confirm.
+                                     List of {"pet_name", "key", "value", "source_quote"} dicts.
         """
         pet_name_a = pet_a_context["active_profile"].get("name", {}).get("value", "your pet")
 
@@ -460,6 +463,7 @@ class ConversationAgent:
             language_str=language_str,
             conversation_summary=conversation_summary,
             session_messages=session_messages,
+            pending_clarifications=pending_clarifications,
         )
 
         # Append the current message to history before sending to LLM
@@ -529,6 +533,7 @@ class ConversationAgent:
         language_str: str,
         conversation_summary: str = "",
         session_messages: list[dict] | None = None,
+        pending_clarifications: list[dict] | None = None,
     ) -> str:
         """Fill in SYSTEM_PROMPT_TEMPLATE with the current context."""
         active_a = pet_a_context["active_profile"]
@@ -612,8 +617,24 @@ class ConversationAgent:
         conversation_summary_section = ""
         if conversation_summary:
             conversation_summary_section = (
-                "CONVERSATION SUMMARY (from earlier in this conversation):\n"
+                "CONVERSATION SUMMARY (context from recent interactions):\n"
                 f"{conversation_summary}\n\n---\n"
+            )
+
+        # Clarification section — low-confidence facts from previous turn
+        # Shows ONE at a time, takes priority over gap questions
+        clarification_section = ""
+        if pending_clarifications:
+            item = pending_clarifications[0]  # one at a time
+            pet_name = self._sanitize_for_prompt(item.get("pet_name", "the pet"))
+            key = self._sanitize_for_prompt(item.get("key", ""))
+            value = self._sanitize_for_prompt(item.get("value", ""))
+            clarification_section = (
+                "PENDING CLARIFICATION (takes priority over INFORMATION GAPS):\n"
+                f"The user mentioned something about {pet_name} but you were not fully sure.\n"
+                f"Field: {key} — they said \"{value}\"\n"
+                f"If it fits naturally, ask {pet_name}'s parent to confirm this detail.\n"
+                "Ask as a gentle follow-up, not a data request. ONE clarification per message.\n\n"
             )
 
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
@@ -634,6 +655,7 @@ class ConversationAgent:
             date_format_str="YYYY-MM-DD",
             last_answer=last_answer,
             conversation_summary_section=conversation_summary_section,
+            clarification_section=clarification_section,
             max_questions_per_message=MAX_QUESTIONS_PER_MESSAGE,
             max_questions_per_session=MAX_QUESTIONS_PER_SESSION,
         )

@@ -9,7 +9,8 @@
 #   - POST /api/v1/chat route
 #   - GET /api/v1/pets route (fetches from AALDA)
 #   - GET /api/v1/confidence route
-#   - _run_background() — fire-and-forget Compressor + Aggregator pipeline
+#
+# Background pipeline (_run_background, _run_compaction) lives in background.py.
 #
 # Auth: every request must include X-User-Code header.
 # Shared state (agents, sessions) is accessed via request.app.state,
@@ -17,7 +18,6 @@
 
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
-import dataclasses
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
@@ -29,17 +29,17 @@ from pydantic import BaseModel, Field
 
 # ── Our code ───────────────────────────────────────────────────────────────────
 from app.agents.conversation import AgentResponse
-from app.agents.state import AgentState
+from app.agents.state import AgentState, PetInfo
 from app.services.guardrails import apply_guardrails
 from app.services.deeplink import build_deeplink
 from app.services.context_builder import build_pet_context
 from app.services.pet_fetcher import PetFetchError
 from constants import (
     INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM,
-    THREAD_COMPACTION_THRESHOLD, THREAD_CONTEXT_WINDOW, THREAD_EXPIRY_HOURS,
+    THREAD_CONTEXT_WINDOW, THREAD_EXPIRY_HOURS,
 )
 from app.db.session import get_session
-from app.db.repositories import ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
+from app.db.repositories import ActiveProfileRepo, ThreadRepo, UserRepo
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 
 logger = logging.getLogger(__name__)
@@ -47,14 +47,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 
 
-# ── Task tracking (W8 — graceful shutdown) ────────────────────────────────────
-
-def _create_tracked_task(coro: Any, state_bag: Any) -> asyncio.Task:
-    """Create an asyncio task and register it for graceful shutdown tracking."""
-    task = asyncio.create_task(coro)
-    state_bag.background_tasks.add(task)
-    task.add_done_callback(state_bag.background_tasks.discard)
-    return task
+# ── Background pipeline (extracted to background.py) ──────────────────────────
+from app.routes.background import _create_tracked_task, _run_background, _run_compaction
 
 
 # ── Auth helper ───────────────────────────────────────────────────────────────
@@ -261,8 +255,38 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     primary_pet_id = pet_ids[0]
     primary_profile = pet_profiles[0]
 
-    # Relationship context (default for now — no AALDA user API yet)
-    relationship_context = "New user — no relationship data yet."
+    # ── Timestamp (used by user upsert, thread boundary, and message persistence) ──
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+
+    # ── Auto-upsert user record (W18 — creates on first visit) ──────────────
+    user_record = None
+    try:
+        async with get_session() as db_session:
+            user_repo = UserRepo(db_session)
+            user_record = await user_repo.read(user_code)
+            if not user_record:
+                await user_repo.upsert({
+                    "user_code": user_code,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                })
+                user_record = await user_repo.read(user_code)
+            else:
+                # Return visit — update timestamp, preserve existing fields
+                await user_repo.upsert({
+                    "user_code": user_code,
+                    "updated_at": now_iso,
+                    "session_count": user_record.get("session_count", 0) + 1,
+                    "relationship_summary": user_record.get("relationship_summary", ""),
+                    "preferred_language": user_record.get("preferred_language", "auto"),
+                })
+    except Exception as user_exc:
+        logger.warning("User upsert failed (non-fatal): %s", user_exc)
+
+    # Relationship context — read from user record, fallback to default
+    relationship_context = (user_record or {}).get("relationship_summary", "") \
+        or "New user — no relationship data yet."
 
     # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
     conf_score = calculate_confidence_score(primary_ctx["active_profile"], primary_profile)
@@ -271,48 +295,60 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     # ── 4. Thread boundary logic (Phase 2) ────────────────────────────────────
     session_id = request_body.session_id
     user_id = user_code
-
-    now_utc = datetime.now(timezone.utc)
-    now_iso = now_utc.isoformat()
     new_thread = False
     conversation_summary = ""
 
-    try:
-        async with get_session() as db_session:
-            thread_repo = ThreadRepo(db_session)
-            existing = await thread_repo.get_active(primary_pet_id)
+    # Lock per primary pet to prevent duplicate thread creation from concurrent
+    # requests (Phase 2 Addendum race fix). The DB also has a partial unique
+    # index as a safety net (ix_threads_one_active_per_pet).
+    pet_lock = state_bag.pet_locks.setdefault(primary_pet_id, asyncio.Lock())
+    async with pet_lock:
+        try:
+            async with get_session() as db_session:
+                thread_repo = ThreadRepo(db_session)
+                existing = await thread_repo.get_active(primary_pet_id)
 
-            if existing and datetime.fromisoformat(existing["expires_at"]) > now_utc:
-                thread_id = existing["thread_id"]
-                conversation_summary = existing.get("compaction_summary") or ""
-            else:
-                if existing:
-                    await thread_repo.expire(existing["thread_id"])
-                    # Clean up in-memory state for the expired thread (W4+W5)
-                    sessions.pop(existing["thread_id"], None)
-                    state_bag.session_meta.pop(existing["thread_id"], None)
-                    logger.info("Thread expired: %s", existing["thread_id"])
+                if existing and datetime.fromisoformat(existing["expires_at"]) > now_utc:
+                    thread_id = existing["thread_id"]
+                    conversation_summary = existing.get("compaction_summary") or ""
+                    # W11: set secondary_pet_id if upgrading a single-pet thread to dual-pet.
+                    # Once set, it's immutable for this thread's lifetime (24h). If the user
+                    # switches Pet B mid-thread, the old secondary stays — this is intentional
+                    # because facts already logged to that pet_id would become orphaned.
+                    secondary_pid = pet_ids[1] if len(pet_ids) > 1 else None
+                    if secondary_pid and not existing.get("secondary_pet_id"):
+                        await thread_repo.update_secondary_pet_id(thread_id, secondary_pid)
+                else:
+                    if existing:
+                        await thread_repo.expire(existing["thread_id"])
+                        # Clean up in-memory state for the expired thread (W4+W5)
+                        sessions.pop(existing["thread_id"], None)
+                        state_bag.session_meta.pop(existing["thread_id"], None)
+                        state_bag.pending_clarifications.pop(existing["thread_id"], None)
+                        logger.info("Thread expired: %s", existing["thread_id"])
 
-                prev = await thread_repo.get_latest_expired(primary_pet_id)
-                if prev and prev.get("compaction_summary"):
-                    conversation_summary = prev["compaction_summary"]
+                    prev = await thread_repo.get_latest_expired(primary_pet_id)
+                    if prev and prev.get("compaction_summary"):
+                        conversation_summary = prev["compaction_summary"]
 
-                thread_id = str(uuid4())
-                expires_at = (now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
-                await thread_repo.create(
-                    thread_id=thread_id,
-                    pet_id=primary_pet_id,
-                    user_id=user_id,
-                    started_at=now_iso,
-                    expires_at=expires_at,
-                )
-                new_thread = True
-                logger.info("New thread created: %s (session=%s)", thread_id, session_id)
-    except HTTPException:
-        raise  # re-raise our own errors (shouldn't happen here, but defensive)
-    except Exception as db_exc:
-        logger.error("DB error in thread boundary: %s", db_exc)
-        raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
+                    thread_id = str(uuid4())
+                    expires_at = (now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
+                    secondary_pid = pet_ids[1] if len(pet_ids) > 1 else None
+                    await thread_repo.create(
+                        thread_id=thread_id,
+                        pet_id=primary_pet_id,
+                        user_id=user_id,
+                        started_at=now_iso,
+                        expires_at=expires_at,
+                        secondary_pet_id=secondary_pid,
+                    )
+                    new_thread = True
+                    logger.info("New thread created: %s (session=%s)", thread_id, session_id)
+        except HTTPException:
+            raise  # re-raise our own errors (shouldn't happen here, but defensive)
+        except Exception as db_exc:
+            logger.error("DB error in thread boundary: %s", db_exc)
+            raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
 
     # ── Acquire per-thread lock (C2 — prevent concurrent session mutations) ──
     thread_locks: dict[str, asyncio.Lock] = state_bag.thread_locks
@@ -325,16 +361,23 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         session_messages = sessions[thread_id]
 
         # ── Build AgentState — shared context for the background pipeline ─────
+        pet_infos = []
+        for i, pid in enumerate(pet_ids):
+            ap = pet_contexts[i]["active_profile"]
+            pet_infos.append(PetInfo(
+                id=pid,
+                name=ap.get("name", {}).get("value", ""),
+                species=ap.get("species", {}).get("value", ""),
+                age=ap.get("age", {}).get("value", ""),
+                sex=ap.get("sex", {}).get("value", ""),
+                weight=ap.get("weight", {}).get("value", ""),
+            ))
+
         agent_state = AgentState(
             session_id=session_id,
             thread_id=thread_id,
             user_message=request_body.message,
-            pet_id=primary_pet_id,
-            pet_name=primary_ctx["active_profile"].get("name", {}).get("value", ""),
-            pet_species=primary_ctx["active_profile"].get("species", {}).get("value", ""),
-            pet_age=primary_ctx["active_profile"].get("age", {}).get("value", ""),
-            pet_sex=primary_ctx["active_profile"].get("sex", {}).get("value", ""),
-            pet_weight=primary_ctx["active_profile"].get("weight", {}).get("value", ""),
+            pets=pet_infos,
             recent_history=list(session_messages),
         )
 
@@ -352,6 +395,10 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         pet_a_context = pet_contexts[0]
         pet_b_context = pet_contexts[1] if len(pet_contexts) > 1 else None
 
+        # Read pending clarifications for this thread (from previous turn's background pipeline)
+        pending_store = getattr(state_bag, "pending_clarifications", {})
+        pending_clars = pending_store.get(thread_id, [])
+
         agent_response: AgentResponse = await agent.run(
             user_message=request_body.message,
             session_messages=list(session_messages[-THREAD_CONTEXT_WINDOW:]),
@@ -363,6 +410,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             questions_asked_so_far=questions_so_far,
             language_str=request_body.language if request_body.language != "auto" else _detect_language(request_body.message),
             conversation_summary=conversation_summary,
+            pending_clarifications=pending_clars or None,
         )
 
         agent_state.is_entity = agent_response.is_entity
@@ -472,154 +520,3 @@ async def get_confidence(request: Request, pet_id: int | None = None) -> dict[st
     }
 
 
-# ── Background pipeline ────────────────────────────────────────────────────────
-
-async def _run_background(state: AgentState, state_bag: Any) -> None:
-    """
-    Fire-and-forget coroutine launched by asyncio.create_task() after /chat returns.
-
-    Three responsibilities:
-      1. Write-through: persist user + assistant messages to thread_messages table.
-      2. Compaction trigger: if message count >= threshold, fire _run_compaction().
-      3. Compressor + Aggregator: extract facts, split by confidence, persist to
-         fact_log, then merge high-confidence facts into active_profile.
-
-    User never waits for any of this. Never raises — exceptions caught and logged.
-    """
-    compressor = state_bag.compressor
-    aggregator = state_bag.aggregator
-
-    try:
-        # ── Write-through: persist messages to PostgreSQL ────────────────
-        now_iso = datetime.now(timezone.utc).isoformat()
-        async with get_session() as db_session:
-            msg_repo = ThreadMessageRepo(db_session)
-            await msg_repo.append_batch([
-                {
-                    "thread_id": state.thread_id,
-                    "role": "user",
-                    "content": state.user_message,
-                    "timestamp": now_iso,
-                },
-                {
-                    "thread_id": state.thread_id,
-                    "role": "assistant",
-                    "content": state.agent_reply,
-                    "timestamp": now_iso,
-                },
-            ])
-
-        # ── Compaction trigger (guarded — W3) ─────────────────────────
-        sessions = state_bag.sessions
-        thread_messages = sessions.get(state.thread_id, [])
-        compacting = state_bag.compaction_in_progress
-        if (
-            len(thread_messages) >= THREAD_COMPACTION_THRESHOLD
-            and state.thread_id not in compacting
-        ):
-            compacting.add(state.thread_id)
-            _create_tracked_task(_run_compaction(state.thread_id, state.pet_id, state_bag), state_bag)
-
-        # ── Compressor pipeline ─────────────────────────────────────────
-        if compressor is None:
-            return
-
-        facts = await compressor.run(state)
-
-        high = [f for f in facts if f.confidence > 0.70]
-        low  = [f for f in facts if 0.50 <= f.confidence <= 0.70]
-
-        state.extracted_facts       = high
-        state.low_confidence_fields = [f.key for f in low]
-
-        if facts:
-            to_log = [
-                {
-                    **dataclasses.asdict(f),
-                    "needs_clarification": f.confidence <= 0.70,
-                    "extracted_at": datetime.now(timezone.utc).isoformat(),
-                    "session_id": state.session_id,
-                }
-                for f in facts
-            ]
-            async with get_session() as db_session:
-                repo = FactLogRepo(db_session)
-                await repo.append(to_log, pet_id=state.pet_id)
-
-        logger.info(
-            "Compressor done — session=%s extracted=%d high=%d low=%d",
-            state.session_id, len(facts), len(high), len(low),
-        )
-
-        # ── Aggregator — merge high-confidence facts into active_profile ──
-        if high and aggregator is not None:
-            # Load current active_profile from DB for this pet
-            async with get_session() as db_session:
-                ap_repo = ActiveProfileRepo(db_session)
-                current_profile = await ap_repo.read_all(state.pet_id) or {}
-            await aggregator.run(high, state.session_id, current_profile, pet_id=state.pet_id)
-
-    except Exception as exc:
-        logger.error(
-            "Background pipeline failed — session=%s error=%s",
-            state.session_id, exc,
-        )
-
-
-async def _run_compaction(thread_id: str, pet_id: int, state_bag: Any) -> None:
-    """
-    Fire-and-forget compaction task.
-
-    When message count exceeds THREAD_COMPACTION_THRESHOLD, summarize older
-    messages with an LLM, store the summary in threads.compaction_summary,
-    and trim the in-memory list to THREAD_CONTEXT_WINDOW recent messages.
-    """
-    try:
-        sessions = state_bag.sessions
-        # Snapshot the list so mutations during LLM call don't affect us (Addendum)
-        messages = list(sessions.get(thread_id, []))
-        if len(messages) < THREAD_COMPACTION_THRESHOLD:
-            return
-
-        old_messages = messages[:-THREAD_CONTEXT_WINDOW]
-
-        async with get_session() as db_session:
-            thread_repo = ThreadRepo(db_session)
-            thread = await thread_repo.get_by_thread_id(thread_id)
-            existing_summary = thread.get("compaction_summary") if thread else None
-
-        summarizer = state_bag.thread_summarizer
-        new_summary = await summarizer.summarize(old_messages, existing_summary)
-
-        # Find the DB cutoff ID — messages up to this ID are now summarized (W12)
-        async with get_session() as db_session:
-            msg_repo = ThreadMessageRepo(db_session)
-            cutoff_id = await msg_repo.get_compaction_cutoff_id(
-                thread_id, THREAD_CONTEXT_WINDOW,
-            )
-
-        async with get_session() as db_session:
-            thread_repo = ThreadRepo(db_session)
-            await thread_repo.update_compaction_summary(
-                thread_id, new_summary, compacted_before_id=cutoff_id,
-            )
-
-        # Acquire per-thread lock before replacing the session list (C2).
-        # Re-trim from the CURRENT list so messages appended during the
-        # LLM summarization call are not lost.
-        thread_lock = state_bag.thread_locks.setdefault(thread_id, asyncio.Lock())
-        async with thread_lock:
-            current = sessions.get(thread_id, [])
-            # Keep the last THREAD_CONTEXT_WINDOW messages from the CURRENT list
-            sessions[thread_id] = current[-THREAD_CONTEXT_WINDOW:]
-            trimmed = len(current) - THREAD_CONTEXT_WINDOW
-
-        logger.info(
-            "Compaction done — thread=%s summarized=%d trimmed=%d kept=%d",
-            thread_id, len(old_messages), trimmed, THREAD_CONTEXT_WINDOW,
-        )
-
-    except Exception as exc:
-        logger.error("Compaction failed — thread=%s error=%s", thread_id, exc)
-    finally:
-        state_bag.compaction_in_progress.discard(thread_id)

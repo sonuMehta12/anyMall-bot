@@ -7,6 +7,8 @@
 #   - GET /api/v1/debug/profile            — Aggregator output (active_profile table)
 #   - GET /api/v1/debug/threads            — Active threads (Phase 2)
 #   - GET /api/v1/debug/thread/{id}/messages — Messages for a thread (Phase 2)
+#   - GET /api/v1/debug/user              — User record by user_code (W18)
+#   - GET /api/v1/debug/clarifications    — Pending clarifications (in-memory)
 #
 # All pet-specific endpoints require pet_id query param.
 # Phase 1C: reads from PostgreSQL instead of JSON files.
@@ -14,10 +16,10 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from app.db.session import get_session
-from app.db.repositories import FactLogRepo, ActiveProfileRepo, ThreadRepo, ThreadMessageRepo
+from app.db.repositories import FactLogRepo, ActiveProfileRepo, ThreadRepo, ThreadMessageRepo, UserRepo
 
 logger = logging.getLogger(__name__)
 
@@ -95,3 +97,38 @@ async def debug_thread_messages(thread_id: str) -> dict[str, Any]:
         messages = await repo.read_thread(thread_id)
 
     return {"thread_id": thread_id, "count": len(messages), "messages": messages}
+
+
+@router.get("/user", summary="User record")
+async def debug_user(user_code: str = "") -> dict[str, Any]:
+    """
+    Returns a user record by user_code.
+
+    Query params:
+        user_code — the X-User-Code value (required)
+    """
+    if not user_code:
+        raise HTTPException(status_code=400, detail="user_code query parameter is required.")
+
+    async with get_session() as session:
+        repo = UserRepo(session)
+        user = await repo.read(user_code)
+
+    if user is None:
+        return {"status": "not_found", "user": None}
+    return {"status": "ok", "user": user}
+
+
+@router.get("/clarifications", summary="Pending clarifications (in-memory)")
+async def debug_clarifications(request: Request, thread_id: str | None = None) -> dict[str, Any]:
+    """
+    Returns pending_clarifications from app.state (in-memory only).
+
+    Query params:
+        thread_id — filter to one thread (omit for all threads)
+    """
+    pending = getattr(request.app.state, "pending_clarifications", {})
+    if thread_id:
+        items = pending.get(thread_id, [])
+        return {"thread_id": thread_id, "count": len(items), "clarifications": items}
+    return {"thread_count": len(pending), "all": pending}

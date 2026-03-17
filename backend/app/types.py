@@ -6,8 +6,13 @@
 #   ActiveProfileEntry is created in aggregator.py, stored via repositories.py,
 #   and consumed in context_builder.py + conversation.py.  A central definition
 #   prevents circular imports and gives every layer the same type contract.
+#
+#   StateBag is the type contract for FastAPI's app.state object, used by
+#   background pipeline functions (_run_background, _run_compaction) so they
+#   don't need `Any` type hints.
 
-from typing import TypedDict
+import asyncio
+from typing import Any, Protocol, TypedDict
 
 
 class ActiveProfileEntry(TypedDict, total=False):
@@ -35,3 +40,27 @@ class ActiveProfileEntry(TypedDict, total=False):
     status: str
     change_detected: str
     trend_flag: str
+
+
+class StateBag(Protocol):
+    """
+    Type contract for FastAPI's app.state object.
+
+    Populated in main.py lifespan(). Accessed by background pipeline functions
+    in chat.py / background.py. Using a Protocol instead of Any gives static
+    type checkers visibility into what attributes exist.
+    """
+    sessions: dict[str, list]
+    session_meta: dict[str, dict]
+    compaction_in_progress: set[str]
+    thread_locks: dict[str, asyncio.Lock]
+    pet_locks: dict[int, asyncio.Lock]
+    background_tasks: set[asyncio.Task]
+    pending_clarifications: dict[str, list]
+    agent: Any
+    intent_classifier: Any
+    compressor: Any
+    aggregator: Any
+    thread_summarizer: Any
+    pet_fetcher: Any
+    llm_provider: Any

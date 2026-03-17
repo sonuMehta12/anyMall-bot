@@ -135,7 +135,9 @@ async def lifespan(app: FastAPI):
     app.state.session_meta = {}   # thread_id -> tracking metadata (gap questions, cooldowns)
     app.state.compaction_in_progress = set()  # thread_ids currently being compacted (W3)
     app.state.thread_locks: dict[str, asyncio.Lock] = {}  # per-thread locks (C2 — concurrent session safety)
+    app.state.pet_locks: dict[int, asyncio.Lock] = {}  # per-pet locks — prevent duplicate thread creation race
     app.state.background_tasks: set[asyncio.Task] = set()  # tracked tasks for graceful shutdown (W8)
+    app.state.pending_clarifications: dict[str, list] = {}  # thread_id -> low-confidence facts for clarification (C4)
 
     logger.info("Backend ready. LLM provider: %s", settings.llm_provider)
 

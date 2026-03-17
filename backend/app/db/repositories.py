@@ -17,7 +17,7 @@
 
 import logging
 
-from sqlalchemy import select, delete
+from sqlalchemy import or_, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -78,33 +78,35 @@ class PetRepo:
 # ── UserRepo ─────────────────────────────────────────────────────────────────
 
 class UserRepo:
-    """Read/write user_profile data (the `users` table)."""
+    """Read/write user data (the `users` table)."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def read(self, user_id: str) -> dict | None:
-        """Read a user profile by user_id.  Returns dict or None if not found."""
-        stmt = select(User).where(User.user_id == user_id)
+    async def read(self, user_code: str) -> dict | None:
+        """Read a user profile by user_code.  Returns dict or None if not found."""
+        stmt = select(User).where(User.user_code == user_code)
         result = await self._session.execute(stmt)
         user = result.scalar_one_or_none()
         return user.to_dict() if user else None
 
     async def upsert(self, data: dict) -> None:
-        """Insert or update a user profile."""
+        """Insert or update a user record.  Auto-called on every chat request."""
         stmt = pg_insert(User).values(
-            user_id=data["user_id"],
-            pet_id=data["pet_id"],
+            user_code=data["user_code"],
+            display_name=data.get("display_name", ""),
             session_count=data.get("session_count", 0),
             relationship_summary=data.get("relationship_summary", ""),
+            preferred_language=data.get("preferred_language", "auto"),
+            created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
         )
         stmt = stmt.on_conflict_do_update(
-            index_elements=["user_id"],
+            index_elements=["user_code"],
             set_={
-                "pet_id": stmt.excluded.pet_id,
                 "session_count": stmt.excluded.session_count,
                 "relationship_summary": stmt.excluded.relationship_summary,
+                "preferred_language": stmt.excluded.preferred_language,
                 "updated_at": stmt.excluded.updated_at,
             },
         )
@@ -259,6 +261,7 @@ class FactLogRepo:
                 source_quote=fact.get("source_quote", ""),
                 timestamp=fact.get("timestamp"),
                 needs_clarification=bool(fact.get("needs_clarification", False)),
+                pet_label=fact.get("pet_label", "pet_a"),
                 extracted_at=fact.get("extracted_at", ""),
             )
             for fact in facts
@@ -318,11 +321,13 @@ class ThreadRepo:
         user_id: str,
         started_at: str,
         expires_at: str,
+        secondary_pet_id: int | None = None,
     ) -> dict:
         """Insert a new thread row.  Returns to_dict()."""
         thread = Thread(
             thread_id=thread_id,
             pet_id=pet_id,
+            secondary_pet_id=secondary_pet_id,
             user_id=user_id,
             started_at=started_at,
             expires_at=expires_at,
@@ -330,20 +335,27 @@ class ThreadRepo:
         )
         self._session.add(thread)
         await self._session.commit()
-        logger.info("Thread created: thread_id=%s pet_id=%s", thread_id, pet_id)
+        logger.info("Thread created: thread_id=%s pet_id=%s secondary=%s", thread_id, pet_id, secondary_pet_id)
         return thread.to_dict()
 
     async def get_active(self, pet_id: int) -> dict | None:
         """
         Get the active thread for a pet.
 
+        Searches both pet_id and secondary_pet_id (W11 — dual-pet threads).
+        This means a pet that is the secondary on a thread will still find that
+        thread. The caller (chat.py) uses thread_id for all subsequent operations,
+        so the primary/secondary distinction doesn't matter after lookup.
         Returns to_dict() or None if no active thread exists.
         Does NOT check expires_at — caller is responsible for expiry logic
         so it can expire the thread explicitly before creating a new one.
         """
         stmt = (
             select(Thread)
-            .where(Thread.pet_id == pet_id, Thread.status == "active")
+            .where(
+                or_(Thread.pet_id == pet_id, Thread.secondary_pet_id == pet_id),
+                Thread.status == "active",
+            )
             .limit(1)
         )
         result = await self._session.execute(stmt)
@@ -363,6 +375,16 @@ class ThreadRepo:
         result = await self._session.execute(stmt)
         rows = result.scalars().all()
         return [row.to_dict() for row in rows]
+
+    async def update_secondary_pet_id(self, thread_id: str, secondary_pet_id: int) -> None:
+        """Set secondary_pet_id on an existing thread (W11 — dual-pet upgrade)."""
+        stmt = select(Thread).where(Thread.thread_id == thread_id)
+        result = await self._session.execute(stmt)
+        thread = result.scalar_one_or_none()
+        if thread:
+            thread.secondary_pet_id = secondary_pet_id
+            await self._session.commit()
+            logger.debug("Thread %s: set secondary_pet_id=%s", thread_id, secondary_pet_id)
 
     async def expire(self, thread_id: str) -> None:
         """Mark a thread as expired."""
@@ -399,12 +421,16 @@ class ThreadRepo:
         """
         Get the most recently started expired thread for a pet.
 
+        Searches both pet_id and secondary_pet_id (W11 — dual-pet threads).
         Used for cross-thread context — when a new thread starts, we load
         the previous thread's compaction_summary so Agent 1 has continuity.
         """
         stmt = (
             select(Thread)
-            .where(Thread.pet_id == pet_id, Thread.status == "expired")
+            .where(
+                or_(Thread.pet_id == pet_id, Thread.secondary_pet_id == pet_id),
+                Thread.status == "expired",
+            )
             .order_by(Thread.started_at.desc())
             .limit(1)
         )

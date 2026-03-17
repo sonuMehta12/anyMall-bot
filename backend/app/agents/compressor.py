@@ -17,7 +17,7 @@
 #   - Returns ALL facts with confidence >= 0.50 — caller (main.py) splits by threshold
 #   - On any failure: logs error and returns [] — never raises, never crashes background task
 #   - temperature=0.0 — extraction is deterministic, not creative
-#   - max_tokens=400  — enough for ~5 facts in JSON
+#   - max_tokens=600  — enough for ~5 facts in JSON (increased for dual-pet output)
 
 import json
 import logging
@@ -66,6 +66,14 @@ EXTRACTION RULES:
 Otherwise null.
 9. Extract ALL facts in one call. Multiple facts = multiple entries in the array.
 10. If nothing is extractable: return {"facts": []}.
+11. PET LABELING (dual-pet sessions only):
+   If TWO pets are provided in the context (Pet A and Pet B), label each fact \
+with "pet_label": "pet_a" or "pet_b".
+   Determine which pet by: explicit name mention, pronoun context from recent \
+conversation, or species context.
+   If truly ambiguous (cannot determine which pet), default to "pet_a" and set \
+uncertainty="ambiguous pet attribution — could not determine which pet".
+   If only ONE pet is provided, always use "pet_a".
 
 PREFERRED KEY NAMES (use these when applicable — snake_case):
 name, breed, age, weight, sex, neutered_spayed, diet_type, food_brand, allergies,
@@ -78,7 +86,8 @@ OUTPUT FORMAT (strict — no deviation):
 {"facts": [{"key": str, "value": str, "confidence": float,
             "source_rank": "vet_record"|"user_correction"|"explicit_owner",
             "time_scope": "current"|"past"|"unknown", "uncertainty": str,
-            "source_quote": str, "timestamp": str|null}]}"""
+            "source_quote": str, "timestamp": str|null,
+            "pet_label": "pet_a"|"pet_b"}]}"""
 
 
 # ── ExtractedFact ───────────────────────────────────────────────────────────────
@@ -97,6 +106,8 @@ class ExtractedFact:
         uncertainty  — plain text reason why confidence < 1.0, or "" if fully confident
         source_quote — exact substring from the user message that supports this fact
         timestamp    — ISO datetime string if user stated a specific time, else None
+        pet_label    — "pet_a" or "pet_b"; identifies which pet this fact belongs to
+                       Defaults to "pet_a" for backward compat with single-pet sessions.
     """
     key: str
     value: str
@@ -106,6 +117,7 @@ class ExtractedFact:
     uncertainty: str
     source_quote: str
     timestamp: str | None
+    pet_label: str = "pet_a"   # "pet_a" or "pet_b" — set by Compressor for dual-pet
 
 
 # ── _parse_compressor_response ──────────────────────────────────────────────────
@@ -177,6 +189,10 @@ def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[Extracted
             continue
 
         try:
+            # Validate pet_label — must be "pet_a" or "pet_b", default "pet_a"
+            raw_label = str(item.get("pet_label", "pet_a"))
+            pet_label = raw_label if raw_label in ("pet_a", "pet_b") else "pet_a"
+
             fact = ExtractedFact(
                 key=str(item["key"]),
                 value=str(item["value"]),
@@ -186,6 +202,7 @@ def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[Extracted
                 uncertainty=str(item.get("uncertainty", "")),
                 source_quote=str(item.get("source_quote", "")),
                 timestamp=item.get("timestamp"),  # str or None
+                pet_label=pet_label,
             )
             results.append(fact)
         except (KeyError, TypeError) as exc:
@@ -244,7 +261,7 @@ class CompressorAgent:
                 system_prompt=COMPRESSOR_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
                 temperature=0.0,   # deterministic — extraction, not generation
-                max_tokens=400,    # enough for ~5 facts in JSON
+                max_tokens=600,    # enough for ~5 facts in JSON (dual-pet may return more)
             )
         except LLMProviderError as exc:
             logger.error("Compressor: LLM call failed: %s", exc)
@@ -270,26 +287,40 @@ class CompressorAgent:
         Build the user-role message for the Compressor LLM call.
 
         Includes:
-          - Pet essentials (name, species, age, sex, weight) — gives LLM context
-            for pronoun resolution and field relevance
-          - Recent conversation history (last 3 turns) — lets LLM understand
-            "yes" / "she does" type answers without the full conversation
+          - Pet A essentials (name, species, age, sex, weight)
+          - Pet B essentials (if dual-pet session)
+          - Recent conversation history (last 3 turns) — for pronoun resolution
           - The user message to extract facts from
 
         The system prompt (COMPRESSOR_SYSTEM_PROMPT) is sent separately.
         """
-        # ── Pet essentials ─────────────────────────────────────────────────────
-        pet_parts = [f"Pet: {state.pet_name}"]
-        if state.pet_species:
-            pet_parts.append(f"Species: {state.pet_species}")
-        if state.pet_age:
-            pet_parts.append(f"Age: {state.pet_age}")
-        if state.pet_sex:
-            pet_parts.append(f"Sex: {state.pet_sex}")
-        if state.pet_weight:
-            pet_parts.append(f"Weight: {state.pet_weight}")
+        # ── Pet A essentials (always present) ─────────────────────────────────
+        pet_a = state.pets[0]
+        pet_a_parts = [f"Pet A: {pet_a.name}"]
+        if pet_a.species:
+            pet_a_parts.append(f"Species: {pet_a.species}")
+        if pet_a.age:
+            pet_a_parts.append(f"Age: {pet_a.age}")
+        if pet_a.sex:
+            pet_a_parts.append(f"Sex: {pet_a.sex}")
+        if pet_a.weight:
+            pet_a_parts.append(f"Weight: {pet_a.weight}")
+        pet_a_line = " | ".join(pet_a_parts)
 
-        pet_line = " | ".join(pet_parts)
+        # ── Pet B essentials (only if dual-pet session) ───────────────────────
+        pet_b_line = ""
+        if state.is_dual_pet:
+            pet_b = state.pets[1]
+            pet_b_parts = [f"Pet B: {pet_b.name}"]
+            if pet_b.species:
+                pet_b_parts.append(f"Species: {pet_b.species}")
+            if pet_b.age:
+                pet_b_parts.append(f"Age: {pet_b.age}")
+            if pet_b.sex:
+                pet_b_parts.append(f"Sex: {pet_b.sex}")
+            if pet_b.weight:
+                pet_b_parts.append(f"Weight: {pet_b.weight}")
+            pet_b_line = "\n" + " | ".join(pet_b_parts)
 
         # ── Recent conversation history (last 3 turns = 6 messages) ───────────
         # Labelled "for pronoun resolution only" — we do not want the LLM to
@@ -311,7 +342,8 @@ class CompressorAgent:
 
         # ── Assemble ───────────────────────────────────────────────────────────
         return (
-            f"{pet_line}"
+            f"{pet_a_line}"
+            f"{pet_b_line}"
             f"{history_section}"
             f"\nMessage to extract from:\n\"{state.user_message}\""
         )

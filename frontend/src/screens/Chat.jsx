@@ -8,7 +8,7 @@ const SPECIES_EMOJI = { dog: '🐕', cat: '🐱' }
 
 // Generate a session ID once per page load — persists for the full conversation
 function makeSessionId() {
-  return `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  return crypto.randomUUID()
 }
 
 export default function Chat({ selectedPets, userCode, language, onBack }) {
@@ -157,6 +157,11 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
           <button
             className="redirect-sticky-btn"
             onClick={() => {
+              const ALLOWED_MODULES = ['health', 'food']
+              if (!ALLOWED_MODULES.includes(activeRedirect.module)) {
+                console.warn('Blocked redirect to unknown module:', activeRedirect.module)
+                return
+              }
               const params = new URLSearchParams({
                 query: activeRedirect.context.query,
                 pet_id: activeRedirect.context.pet_id,
