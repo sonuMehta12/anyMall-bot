@@ -1,13 +1,13 @@
 {
   "project": "AnyMall-chan Backend",
   "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
-  "last_updated": "2026-03-15",
-  "state": "phase-2-complete",
+  "last_updated": "2026-03-17",
+  "state": "sprint-2-3-review-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
-  "current_focus": "API handover prep (2026-03-16) → phase-2-review-fixes → remaining tasks",
+  "current_focus": "Phase 3 (nightly batch jobs) + HistoryBuilder (ft-013). All review fixes done (31/36). C4 deferred to dual-pet launch.",
 
-  "storage_strategy": "PostgreSQL (Phase 1C complete). Phase 2 adds write-through message persistence: app.state.sessions[thread_id] (in-memory) + thread_messages table (PostgreSQL). Active threads reloaded from DB on startup. Thread compaction via LLM summarizer at 50 messages. Redis deferred (ft-005).",
+  "storage_strategy": "PostgreSQL (Phase 1C complete). Phase 2 adds write-through message persistence: app.state.sessions[thread_id] (in-memory) + thread_messages table (PostgreSQL). Active threads reloaded from DB on startup (W12: only loads un-compacted messages). Thread compaction via LLM summarizer at 50 messages. Per-thread asyncio.Lock for concurrency (C2). Graceful shutdown via tracked background tasks (W8). AALDA API fallback chain: fresh cache → API → expired cache → DB → error (W1+W10). Redis/Valkey deferred (ft-005).",
 
   "phases": [
 
@@ -690,11 +690,12 @@
   "future_tasks": [
     {
       "id": "ft-002",
-      "name": "Cleanup — delete file_store.py and app/models/context.py",
-      "description": "Both files are deprecated since Phase 1C. file_store.py replaced by repositories.py. context.py replaced by db/models.py. Remove both once all import references are cleaned up. Also delete the data/ directory (old JSON files, no longer written to).",
-      "files": ["app/storage/file_store.py", "app/models/context.py", "data/"],
-      "status": "not-started",
-      "priority": "medium"
+      "name": "Cleanup — delete file_store.py and data/ directory",
+      "description": "file_store.py is deprecated since Phase 1C (replaced by repositories.py). context.py already deleted (W14 fix, 2026-03-16). data/ directory holds old JSON files no longer written to. Remaining: delete file_store.py and data/.",
+      "files": ["app/storage/file_store.py", "data/"],
+      "status": "in-progress",
+      "priority": "medium",
+      "notes": "context.py deleted as part of W14 review fix (2026-03-16). file_store.py and data/ still remain."
     },
     {
       "id": "ft-003",
@@ -730,12 +731,13 @@
     },
     {
       "id": "ft-006",
-      "name": "Phase 2 review fixes — 4 critical + 5 quick wins",
-      "description": "Fix issues found in Phase 2 code review (design-docs/phase-2-review-report.md). Split into two batches: (A) Fix now: C1 parse timestamps to datetime before comparing, C2 fix _run_compaction thread lookup, C3 add timestamp to in-memory message dicts, W4+W5 clean up sessions/session_meta on thread expiry. (B) Fix before production: C4 add FK constraint on thread_messages, W1 migrate to DateTime columns, W2 track background tasks for shutdown, W3 add compaction lock, W6 filter expired threads on reload, W8 handle compacted messages on reload.",
-      "files": ["app/routes/chat.py", "app/db/models.py", "app/db/repositories.py", "app/main.py"],
-      "status": "not-started",
-      "priority": "high — batch A before Phase 3, batch B before Phase 4/5",
-      "review_doc": "design-docs/phase-2-review-report.md"
+      "name": "Code review fixes — Phase 2 + Sprint 2+3 (31/36 fixed)",
+      "description": "Fixed 31 of 36 review items across Phase 2 review and Sprint 2+3 review. Includes: per-thread locking (C2), AALDA fallback chain (W1+W10), prompt escaping (W3), graceful shutdown (W8), DB compaction filtering (W12), gap counter reset (W7), Dockerfile migration fix (W9), language threshold (W13), deprecated file cleanup (W14/W15), and 7 suggestions (S1-S7, S10). Remaining 5 deferred: C4 (dual-pet attribution), W11 (Pet B threads), W18 (users table — other team), S8+S9 (test frontend).",
+      "files": ["app/routes/chat.py", "app/db/models.py", "app/db/repositories.py", "app/main.py", "app/services/pet_fetcher.py", "app/agents/conversation.py", "app/agents/aggregator.py", "app/services/context_builder.py", "app/core/config.py", "app/types.py", "app/routes/simulator.py", "Dockerfile"],
+      "status": "complete",
+      "completed_date": "2026-03-17",
+      "priority": "done",
+      "review_doc": "design-docs/sprint2-3-review-report.md"
     },
     {
       "id": "ft-001",
@@ -807,10 +809,10 @@
 
   "summary": {
     "total_features": 70,
-    "complete": 64,
-    "in_progress": 0,
-    "blocked": 2,
-    "not_started": 9,
-    "note": "Phase 0-2 complete (63 features). ft-007 (API v1) complete — ready for handover 2026-03-16. ft-003 and ft-011 blocked on Flutter team input. ft-013 (HistoryBuilder) plumbing wired. ft-014 (SSE compaction UX) planned. Next: ft-006 batch A → Phase 3."
+    "complete": 66,
+    "in_progress": 1,
+    "blocked": 0,
+    "not_started": 7,
+    "note": "Phase 0-2 + API v1 + Sprint 2+3 complete. Code review: 31/36 items fixed (ft-006 done). ft-002 in progress (context.py deleted, file_store.py remains). ft-013 (HistoryBuilder) plumbing wired, builder itself next. ft-014 (SSE compaction UX) planned. Next: Phase 3 (nightly batch jobs) + ft-013."
   }
 }

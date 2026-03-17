@@ -690,7 +690,282 @@ The Aggregator is created once at startup but runs in background tasks — one p
 chat message. Each background task needs its own session. Passing the factory lets
 the Aggregator create a fresh session each time it writes, then close it.
 
-**`asyncio.sleep(2)` before dispose_engine() at shutdown:**
+**Graceful shutdown (originally `asyncio.sleep(2)`, upgraded in Sprint 2+3 review W8):**
 Background tasks (Compressor + Aggregator) run after the user gets their reply.
-Without the sleep, shutting down the server while a background task is mid-write
-would kill the DB connection. 2 seconds gives in-flight writes time to finish.
+Without waiting, shutting down the server while a background task is mid-write
+would kill the DB connection. Originally used a fixed 2-second sleep. Now replaced
+by tracked task set + `asyncio.wait(pending, timeout=10)` — waits for actual
+completion instead of guessing. Tasks that exceed 10 seconds are cancelled.
+
+---
+
+## Phase 2 — Thread & Conversation Management — Completed ✓
+
+### What we built
+
+24-hour conversation windows ("threads") with persistent message storage, in-memory
+session management, and LLM-powered compaction when conversations get long.
+
+**Updated pipeline:**
+```
+User sends message
+    → Thread boundary logic         resolve session_id → thread_id (DB lookup, 24h expiry)
+    → IntentClassifier (LLM)        health / food / general + urgency
+    → _detect_language()            Unicode range check → "EN" or "JA"
+    → Agent 1 (LLM)                 bilingual response + is_entity + asked_gap_question
+    → apply_guardrails()
+    → build_deeplink()
+    → confidence_calculator()
+    → Append to app.state.sessions[thread_id]
+    → Return response to user
+    ↓  [fire-and-forget]
+    → Write-through messages        → PostgreSQL thread_messages table
+    → Compaction check              → if >= 50 messages, fire _run_compaction()
+    → Compressor (LLM)              → fact_log table
+    → Aggregator (rules)            → active_profile table + app.state
+```
+
+### Thread lifecycle
+
+1. **New session** — first message with a `session_id` creates a thread row in PostgreSQL
+   with `expires_at = now + 24h`. Thread ID returned in API response.
+2. **Same session** — subsequent messages reuse the active thread. Messages appended
+   to in-memory list AND written through to `thread_messages` table.
+3. **Expired session** — if `expires_at` has passed, old thread is marked `status="expired"`,
+   new thread created. Old session/meta cleaned from memory.
+4. **Startup reload** — all non-expired threads loaded from DB into `app.state.sessions`
+   so conversations survive server restarts.
+
+### Compaction (ThreadSummarizer)
+
+When a thread hits 50+ messages, the ThreadSummarizer (LLM, temp=0.0) generates a
+`conversation_summary` — a structured summary of key facts and context from the
+conversation so far. This summary is:
+- Stored on the thread row in PostgreSQL
+- Passed to Agent 1 on subsequent messages (cross-turn continuity)
+- Used to trim in-memory history (only recent messages kept, summary covers the rest)
+
+The `compacted_before_id` column tracks which messages have been summarized, so
+DB reads on startup only load un-compacted messages.
+
+### New database tables
+
+| Table | Purpose |
+|-------|---------|
+| `threads` | 24h conversation windows — stores thread_id, session_id, pet_id, user_id, status, expires_at, conversation_summary, compacted_before_id |
+| `thread_messages` | Individual messages — role, content, timestamp, linked to thread |
+
+### New debug endpoints
+
+- `GET /api/v1/debug/threads` — list all active threads
+- `GET /api/v1/debug/thread/{id}/messages` — messages in a specific thread
+
+### Files added/changed
+
+| File | What |
+|------|------|
+| `app/services/thread_summarizer.py` | NEW — LLM summarization for compaction |
+| `app/db/models.py` | Thread + ThreadMessage ORM models |
+| `app/db/repositories.py` | ThreadRepo + ThreadMessageRepo |
+| `app/routes/chat.py` | Thread boundary logic, write-through, compaction trigger |
+| `app/routes/debug.py` | Thread debug endpoints |
+| `app/main.py` | Thread reload at startup, compaction_in_progress guard |
+| `constants.py` | THREAD_EXPIRY_HOURS, COMPACTION_THRESHOLD, THREAD_CONTEXT_WINDOW |
+| `migrations/versions/` | Thread tables migration |
+
+---
+
+## API v1 — Completed ✓
+
+### What we built
+
+Versioned all endpoints under `/api/v1/` prefix. Standardized error responses.
+Restructured the redirect payload for cleaner mobile app integration.
+
+### Key changes
+
+1. **URL prefix** — all endpoints moved from `/chat`, `/debug/...` to `/api/v1/chat`,
+   `/api/v1/debug/...`, etc. Only `/health` stays at root (liveness check convention).
+
+2. **Error contract** — all errors now return:
+   ```json
+   {"status": "error", "error": {"code": "MISSING_SESSION", "message": "..."}}
+   ```
+
+3. **Redirect payload restructured** — split into `display` (label, style for UI) and
+   `context` (query, pet_id, pet_summary for the target module). No more raw URLs.
+
+4. **`pet_context` removed from request** — backend fetches pet data by `pet_id` instead
+   of receiving it from the client. Cleaner separation of concerns.
+
+### Files changed
+
+| File | What |
+|------|------|
+| `app/routes/chat.py` | `/api/v1/chat`, `/api/v1/confidence` |
+| `app/routes/debug.py` | `/api/v1/debug/...` |
+| `app/routes/simulator.py` | `/api/v1/simulator/...` |
+| `app/main.py` | Router prefix `/api/v1`, global error handlers |
+| `design-docs/api-v1-design.md` | Full API v1 specification |
+
+---
+
+## Sprint 2 — AALDA Integration + Multi-Pet — Completed ✓
+
+### What we built
+
+Real pet data from the AALDA API replaces hardcoded defaults. Multi-pet support
+(dual-pet conversations). Per-thread locking for concurrency safety.
+
+### AALDA Integration (PetFetcher)
+
+New service `app/services/pet_fetcher.py` — HTTP client that fetches pet profiles
+from the AALDA API by `pet_id` and `user_code`.
+
+**Fallback chain (5 levels, never fails silently):**
+```
+1. Fresh cache (< 5 min)     → return immediately, no API call
+2. AALDA API call             → parse response, cache result, persist to DB
+3. Expired cache (> 5 min)    → stale data better than no data
+4. Database (pets table)      → last-known data from previous successful fetch
+5. Error                      → 502 with clear message
+```
+
+**Cache management:**
+- In-memory dict keyed by `(user_code, pet_id)`
+- TTL: 5 minutes (configurable)
+- Max size: 500 entries — prunes expired first, then evicts oldest
+- Uses `time.monotonic()` for TTL — immune to system clock changes
+
+**Response guarding:** `resp.json()` wrapped in try-except. `body.get("data")` with
+None check. Both `fetch_pet()` and `fetch_pets_list()` are guarded.
+
+### Multi-pet support
+
+- API accepts `pet_ids: list[int]` (max 2) — primary + secondary pet
+- `asyncio.gather()` fetches both pets in parallel (halves latency)
+- Agent 1 prompt uses PET A / PET B structure with `"unavailable"` for single-pet
+- Prompt v0.3 with `_sanitize_for_prompt()` to escape pet names in format strings
+
+### Per-thread locking (C2 fix)
+
+`app.state.thread_locks` — dict of `{thread_id: asyncio.Lock()}`. Chat handler acquires
+lock from session access through message append. Compaction acquires lock before
+replacing the list. Prevents concurrent mutations to the same thread's message list.
+
+### Context builder changes
+
+- `build_pet_context()` replaces `build_context()` — accepts AALDA data + DB profiles
+- AALDA data is base layer, DB-learned facts override on top (not the other way around)
+- Static fields (species, breed, etc.) get confidence 1.0/0.95/0.90 (float scale, not int)
+
+### Files added/changed
+
+| File | What |
+|------|------|
+| `app/services/pet_fetcher.py` | NEW — AALDA client with cache + fallback chain |
+| `app/services/context_builder.py` | Rewritten — AALDA-first merge, multi-pet support |
+| `app/routes/chat.py` | Multi-pet routing, per-thread locks, x-user-code header |
+| `app/agents/conversation.py` | Prompt v0.3 — PET A/B structure, sanitization |
+| `app/main.py` | PetFetcher lifecycle, thread_locks init, DB fallback wiring |
+| `app/db/repositories.py` | PetRepo.upsert() for DB persist on AALDA success |
+
+---
+
+## Sprint 3 — Language Selector — Completed ✓
+
+### What we built
+
+User-selectable language (English or Japanese) with auto-detection fallback.
+Production deployment fixes.
+
+### Language selector
+
+- API accepts optional `language` field: `"EN"`, `"JA"`, or `"auto"` (default)
+- When `"auto"`: `_detect_language()` uses Unicode range counting (threshold: 3+ JA chars)
+- When explicit: skips detection, uses the provided value
+- Agent 1 receives language and responds accordingly (bilingual prompt)
+
+### Production fixes
+
+- Railway URL auto-conversion in `session.py` and `env.py` (`postgres://` → `postgresql+asyncpg://`)
+- Dockerfile CMD no longer runs migrations (run `alembic upgrade head` separately)
+- CORS and static file serving adjustments
+
+### Files changed
+
+| File | What |
+|------|------|
+| `app/routes/chat.py` | Language field in request, auto-detection threshold fix (W13) |
+| `app/agents/conversation.py` | Language param passed through |
+| `app/db/session.py` | Railway URL prefix handling |
+| `migrations/env.py` | Railway URL prefix handling |
+| `Dockerfile` | Removed migration from CMD |
+
+---
+
+## Sprint 2+3 Code Review — 31/36 Items Fixed ✓
+
+### What we did
+
+Two independent code review passes covering 35 files across Sprint 2 and Sprint 3.
+Found 36 issues total (critical, warning, suggestion). Fixed 31. Remaining 5 are
+deferred to future phases.
+
+### Critical fixes
+
+| # | Issue | Fix |
+|---|-------|-----|
+| C1 | AALDA overwrites chat-learned facts | Swapped merge order — AALDA is base, DB overrides |
+| C2 | Concurrent session dict mutation | Per-thread `asyncio.Lock` via `app.state.thread_locks` |
+| C5 | `resp.json()` unguarded in PetFetcher | try-except + `body.get("data")` None check |
+| C6 | PetFetcher cache never pruned | Max 500 entries, prunes expired + evicts oldest |
+| C7 | `debug_flow.py` crashes | Rewrote with Sprint 2 function signatures |
+
+### Warning fixes (selected highlights)
+
+| # | Issue | Fix |
+|---|-------|-----|
+| W1+W10 | No AALDA failure fallback + pets table never written | Full fallback chain: cache → API → expired → DB → 502. Persists to DB on success |
+| W3 | Pet names not escaped in LLM prompt | `_sanitize_for_prompt()` escapes `{`, `}`, `"`, `\` |
+| W5 | Session history sent to LLM unbounded | Capped to `THREAD_CONTEXT_WINDOW` (20 messages) |
+| W7 | Gap question counter never resets | Reset to 0 when `is_entity=True` after gap question |
+| W8 | Shutdown grace period (sleep) | `asyncio.wait(pending, timeout=10)` + tracked task set |
+| W12 | Compaction trims memory but DB keeps all rows | `compacted_before_id` column + migration. Startup reload respects it |
+| W13 | `_detect_language()` triggers on single JA char | Threshold changed from 1 to 3 |
+
+### Suggestion fixes
+
+| # | Issue | Fix |
+|---|-------|-----|
+| S1 | `pet_id: int = 0` sentinel | Changed to `Optional[int]`, check `is None` |
+| S2 | No TypedDict for active profile | `ActiveProfileEntry` TypedDict in `app/types.py`, used across 4+ files |
+| S4 | httpx timeout hardcoded | Moved to `config.py` (`aalda_timeout_seconds`) |
+| S5 | No AALDA response time logging | `time.monotonic()` timing on success + failure |
+| S6 | No DB error handling in chat route | try-except returning 503 on DB failure |
+| S7 | `last_answer` truncation mid-word | `rfind(" ")` word-boundary truncation |
+| S10 | No index on `threads.user_id` | Added index + Alembic migration |
+
+### Phase 2 review fixes (applied during this pass)
+
+8 items from the Phase 2 review were also fixed: ISO string comparison (P2-C1),
+wrong compaction lookup (P2-C2), message shape mismatch (P2-C3), compaction lock (P2-W3),
+session/meta cleanup on expiry (P2-W4+W5), compaction snapshot (P2-Add),
+stale docstrings (P2-WK2, P2-WK3).
+
+### Remaining (deferred)
+
+| # | Issue | When |
+|---|-------|------|
+| C4 | Dual-pet Compressor attribution — all facts go to primary pet | Before dual-pet launch |
+| W11 | Thread boundary only tracks primary pet | After C4 |
+| W18 | `users` table has single `pet_id` — needs coordination with backend team | Phase 4+ |
+| S8 | Frontend `makeSessionId()` — use `crypto.randomUUID()` | Backlog (test UI only) |
+| S9 | Frontend redirect — validate against whitelist | Backlog (test UI only) |
+
+### Verdict
+
+**Single-pet chat is production-ready.** All critical and pre-production items fixed.
+Dual-pet requires C4 (Compressor attribution) before launch. Single-pet is unaffected.
+
+Full report: `design-docs/sprint2-3-review-report.md` (local only, gitignored).
