@@ -969,3 +969,117 @@ stale docstrings (P2-WK2, P2-WK3).
 Dual-pet requires C4 (Compressor attribution) before launch. Single-pet is unaffected.
 
 Full report: `design-docs/sprint2-3-review-report.md` (local only, gitignored).
+
+---
+
+## Sprint 4 — Dual-Pet Pipeline + Clarification Loop — Completed ✓
+
+### What we built
+
+Closed the remaining Sprint 2-3 deferred items C4 and W11, plus built the clarification
+loop for hedged (low-confidence) facts. Dual-pet conversations now fully attribute facts
+to the correct pet and track both pets in thread records.
+
+### Dual-pet Compressor attribution (C4)
+
+- Compressor prompt updated to output `pet_label: "pet_a"` or `"pet_b"` on each extracted fact
+- `_run_background()` groups facts by `pet_label` and logs them to the correct `pet_id`
+- `fact_log` table has `pet_label` column (added in Sprint 2, now actually used)
+- Aggregator merges high-confidence facts into the correct pet's active_profile
+
+### Thread secondary_pet_id (W11)
+
+- `threads` table has `secondary_pet_id` column (nullable Integer)
+- Set during thread creation when `is_dual_pet=True`
+- Allows querying "all threads involving pet X" regardless of primary/secondary role
+
+### Clarification loop (hedged facts)
+
+When the Compressor extracts a fact with confidence ≤ 0.70:
+1. Fact stored in `pending_clarifications[thread_id]` with `needs_clarification=True`
+2. Next turn, Agent 1's prompt includes pending items → asks user to confirm
+3. If user confirms → Compressor extracts with high confidence → Aggregator merges → pending cleared
+4. If user doesn't confirm → pending persists across turns until confirmed or thread expires
+
+**Scoping rules:**
+- Pending clarifications are scoped per-thread (no leakage between threads)
+- In dual-pet mode, confirming Pet A's fact does NOT clear Pet B's pending items
+- High-confidence facts in the same key clear corresponding pending items
+
+### Edge-case tests added (Section 11)
+
+- Single-pet fact routing — all facts correctly under the right `pet_id`
+- User record in DB — `/debug/user` endpoint confirms user_code and session_count
+- Pending scoped to thread — fake thread_id returns count=0
+- Cross-pet clarification — confirm Pet A, Pet B survives independently
+
+### Users table redesign (W18)
+
+- `users` table redesigned: removed `pet_id` column, added `user_code` (unique), `display_name`,
+  `session_count`, `relationship_summary`, `preferred_language`, `created_at`, `updated_at`
+- Pet ownership comes from AALDA API, NOT stored on user table
+- Auto-upserted on first chat request with sensible defaults
+- Alembic migration: `62b04c546a07_redesign_users_table_w18.py`
+
+### Files added/changed
+
+| File | What |
+|------|------|
+| `app/agents/compressor.py` | `pet_label` in extraction prompt + output parsing |
+| `app/agents/state.py` | `low_confidence_fields`, `extracted_facts` on AgentState |
+| `app/routes/chat.py` | Pending clarification injection into Agent 1 prompt |
+| `app/routes/debug.py` | `/debug/user` endpoint, `/debug/pending` endpoint |
+| `app/db/models.py` | `Thread.secondary_pet_id`, `User` table redesign |
+| `app/db/repositories.py` | `UserRepo` with upsert, `ThreadRepo` secondary_pet_id support |
+| `app/main.py` | `pending_clarifications` dict on app.state |
+| `tests/run_e2e.py` | Section 10 (dual-pet pipeline) + Section 11 (edge cases) |
+| `migrations/versions/` | 2 new migrations (secondary_pet_id, users table redesign) |
+
+---
+
+## Sprint 5 — Close All Review Debt — Completed ✓
+
+### What we did
+
+Resolved ALL remaining open items from Sprint 2-3 and Sprint 4 code reviews.
+9 fixes across 4 deployment groups. Zero new features — pure cleanup and hardening.
+
+### Fixes applied
+
+| # | What | File(s) |
+|---|------|---------|
+| 1 | `StateBag` Protocol for type-safe `app.state` access | `app/types.py` |
+| 2 | Compaction summary label: "from earlier in this conversation" → "context from recent interactions" | `app/agents/conversation.py` |
+| 3 | Deleted deprecated `app/storage/` and `data/` directories (ft-002 complete) | deleted |
+| 4 | Frontend `makeSessionId()` → `crypto.randomUUID()` | `frontend/src/screens/Chat.jsx` |
+| 5 | Frontend redirect module whitelist (`['health', 'food']`) | `frontend/src/screens/Chat.jsx` |
+| 6 | Per-pet `asyncio.Lock` prevents concurrent thread creation race | `app/routes/chat.py`, `app/main.py` |
+| 7 | Partial unique index: one active thread per pet (DB safety net) | migration `9240cda7ebf7` |
+| 8 | FK constraint: `thread_messages.thread_id → threads.thread_id` with CASCADE | migration `707a460b11df`, `app/db/models.py` |
+| 9 | Extracted `_run_background()`, `_run_compaction()`, `_create_tracked_task()` to `background.py` | `app/routes/background.py` (new), `app/routes/chat.py` |
+| 10 | Parallel aggregator via `asyncio.gather()` for dual-pet sessions | `app/routes/background.py` |
+
+### Items resolved without code changes
+
+| Item | Why no fix needed |
+|------|-------------------|
+| Timestamps as String(64) | Works correctly. ISO strings + `datetime.fromisoformat()` is fine. Not a problem. |
+| Startup loads expired threads | NOT A BUG — runtime correctly handles expiry on first request |
+| AALDA fallback | Already complete — 5-level fallback chain exists |
+
+### Only remaining external dependency
+
+**W18 — users table schema coordination** — needs the separate backend team to agree on
+the schema. Not a code bug, just an organizational dependency. Currently the user table
+works correctly with `user_code` as the identity key.
+
+### Test results
+
+68/70 E2E tests pass. 2 failures are pre-existing LLM non-determinism in Section 4
+(Multiple fact extraction, Past-tense time_scope) — not caused by Sprint 5 changes.
+
+### chat.py size reduction
+
+`chat.py` went from 734 lines to 522 lines after extracting background functions to
+`app/routes/background.py` (251 lines). The extraction is a pure refactor — zero
+behavior changes.

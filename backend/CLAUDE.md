@@ -31,17 +31,21 @@ We build the minimum that works at each phase. We do not add complexity until th
 simple version is working and understood. Every line of code is written with full
 understanding of what it does and why it is there.
 
-**Current goal: Phase 2 ✓ complete, API v1 ✓ complete → Phase 3 (nightly batch jobs) next.**
+**Current goal: Sprint 5 complete (all review debt resolved) → Phase 3 (nightly batch jobs) + ft-013 (HistoryBuilder) + ft-005 (Valkey) next.**
 
 Phase 0 ✓. Phase 1A ✓. Phase 1B ✓. Phase 1C ✓ (PostgreSQL replaces JSON files).
 Phase 2 ✓ (Thread & Conversation Management — 24h thread windows, write-through message persistence, startup reload, LLM compaction, cross-thread continuity via conversation_summary).
 API v1 ✓ (versioned endpoints under `/api/v1/`, standardized error contract, restructured redirect payload, `pet_context` removed from request).
+Sprint 2 ✓ (AALDA integration, multi-pet support, X-User-Code auth).
+Sprint 3 ✓ (Language selector, production deploy fixes).
+Sprint 4 ✓ (Dual-pet Compressor attribution, clarification loop, users table redesign).
+Sprint 5 ✓ (All review debt closed — StateBag Protocol, per-pet lock, FK constraint, background.py extraction, parallel aggregator, frontend fixes, deprecated file cleanup).
 
 **Known gaps before production (tracked in progress.json future_tasks):**
-- `ft-002`: Cleanup — delete deprecated `file_store.py`, `app/models/context.py`, `data/` directory
-- `ft-003`: Wire `x-user-code` header — blocked on Flutter team clarification. Currently `DEFAULT_PET_ID="luna-001"` is hardcoded.
-- `ft-011`: AALDA API integration — backend should fetch pet data by `pet_id` instead of using defaults. Blocked on API details from Flutter team. See `design-docs/aalda-integration.md`.
-- `ft-012`: Remove DEFAULT_PET_ID/USER_ID fallbacks — after ft-011 and ft-003 are done.
+- `ft-005`: Valkey hot storage — replaces in-memory dicts for horizontal scaling
+- `ft-013`: HistoryBuilder — pet history narrative from fact_log (prompt plumbing already wired)
+- `ft-009`: Multiple LLM providers — OpenAI direct + Claude/Anthropic
+- `W18`: Users table schema coordination — needs separate backend team agreement
 
 ---
 
@@ -73,25 +77,30 @@ See `notes.md` Phase 1A section for full details.
 
 **All agents built and tested. Routes refactored. Confidence calculator added. Prompt v2 (PRD-aligned) deployed.**
 
-**Current pipeline (Phase 2 complete):**
+**Current pipeline (Sprint 5 complete):**
 ```
-User message
+User message + X-User-Code header + pet_ids[]
+    → Auth check                  X-User-Code required (401 if missing)
+    → AALDA fetch (parallel)      PetFetcher with 5-level fallback, asyncio.gather for dual-pet
+    → Per-pet lock                asyncio.Lock prevents duplicate thread creation
     → Thread boundary logic       resolve session_id → thread_id (DB lookup, 24h expiry check)
     → IntentClassifier (LLM)      health / food / general + urgency
     → _detect_language()          Unicode range check → "EN" or "JA"
+    → Pending clarifications      inject hedged facts into Agent 1 prompt
     → Agent 1 (LLM)               outputs {"reply": "...", "is_entity": bool, "asked_gap_question": bool}
-                                   receives conversation_summary from thread compaction
+                                   receives conversation_summary + pending clarifications
     → apply_guardrails()
     → build_deeplink()            (food LOW urgency → no redirect)
     → confidence_calculator()     confidence_score + confidence_color (reads from app.state)
     → Append to app.state.sessions[thread_id]  (in-memory, keyed by thread_id)
     → Return response to user     (includes status, thread_id, new_thread, is_entity, intent_type, urgency, confidence)
-    ↓  [fire-and-forget — user does NOT wait]
+    ↓  [fire-and-forget — user does NOT wait]  (app/routes/background.py)
     → _run_background(AgentState)
-         → Write-through messages   → PostgreSQL thread_messages table
+         → Write-through messages   → PostgreSQL thread_messages table (FK to threads)
          → Compaction check         → if >= 50 messages, fire _run_compaction() task
-         → Compressor (LLM, temp=0.0)   → PostgreSQL fact_log table
-         → Aggregator (no LLM)          → app.state.active_profile (mutates in place) + write-through to PostgreSQL
+         → Compressor (LLM, temp=0.0)   → facts with pet_label attribution → PostgreSQL fact_log table
+         → Aggregator (no LLM)          → parallel per-pet via asyncio.gather() → active_profile + PostgreSQL
+         → Clarification mgmt           → low-confidence facts → pending_clarifications store
 ```
 
 **In-memory patterns:**
@@ -100,18 +109,20 @@ User message
 - All runtime reads from `app.state` (no disk I/O or DB I/O on hot path)
 - Aggregator mutates `app.state.active_profile` by reference, writes through to PostgreSQL for persistence
 - Messages appended to `app.state.sessions[thread_id]` synchronously, written through to `thread_messages` table in `_run_background()`
-- `build_context()` accepts optional in-memory profiles + `conversation_summary`; returns 6 values
+- `build_pet_context()` accepts AALDA data + DB profiles + `conversation_summary`; returns 6 values
 - `GET /api/v1/confidence` reads from `app.state` — frontend calls on mount + 4s after each message
+- `app.state.pet_locks` — per-pet `asyncio.Lock` prevents concurrent thread creation for same pet
+- `app.state.pending_clarifications` — hedged facts awaiting user confirmation, scoped per thread_id
 
-**File structure — current state (Phase 2 complete):**
+**File structure — current state (Sprint 5 complete):**
 ```
 backend/
 |-- app/
 |   |-- agents/
 |   |   |-- conversation.py          # Agent 1 — PRD-aligned bilingual prompt, outputs {reply, is_entity} JSON
 |   |   |-- intent_classifier.py     # IntentClassifier — Phase 1A
-|   |   |-- state.py                 # AgentState dataclass (includes thread_id)
-|   |   |-- compressor.py            # Agent 2 — fact extraction (LLM, temp=0.0)
+|   |   |-- state.py                 # AgentState dataclass (thread_id, pets, low_confidence_fields, etc.)
+|   |   |-- compressor.py            # Agent 2 — fact extraction with pet_label attribution (LLM, temp=0.0)
 |   |   `-- aggregator.py            # Agent 3 — fact merge (no LLM, Rules 0-6), write-through to PostgreSQL
 |   |-- db/                          # PostgreSQL layer
 |   |   |-- __init__.py
@@ -120,48 +131,35 @@ backend/
 |   |   `-- repositories.py          # PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
 |   |-- routes/
 |   |   |-- __init__.py
-|   |   |-- chat.py                  # POST /api/v1/chat + GET /api/v1/confidence + thread boundary + _run_background()
-|   |   |-- debug.py                 # GET /api/v1/debug/facts, /profile, /threads, /thread/{id}/messages
+|   |   |-- chat.py                  # POST /api/v1/chat + GET /api/v1/confidence + GET /api/v1/pets + thread boundary
+|   |   |-- background.py            # Fire-and-forget: _run_background(), _run_compaction(), _create_tracked_task()
+|   |   |-- debug.py                 # GET /api/v1/debug/facts, /profile, /threads, /thread/{id}/messages, /user, /pending
 |   |   `-- simulator.py             # GET /api/v1/simulator/health, GET /api/v1/simulator/food
 |   |-- services/
 |   |   |-- guardrails.py            # apply_guardrails() only
 |   |   |-- deeplink.py              # build_deeplink() — returns data (module, display, context), no URLs
-|   |   |-- context_builder.py       # load_profiles_from_db() + build_context() — returns 6 context values
+|   |   |-- context_builder.py       # load_profiles_from_db() + build_pet_context() — AALDA-first merge, multi-pet
 |   |   |-- confidence_calculator.py # confidence_score + confidence_color
-|   |   `-- thread_summarizer.py     # Phase 2 — LLM summarization for thread compaction
-|   |-- storage/
-|   |   |-- __init__.py
-|   |   `-- file_store.py            # DEPRECATED — replaced by repositories.py. Scheduled for deletion (ft-002).
-|   |-- models/
-|   |   |-- __init__.py
-|   |   `-- context.py               # DEPRECATED — replaced by app/db/models.py. Scheduled for deletion (ft-002).
+|   |   |-- thread_summarizer.py     # Phase 2 — LLM summarization for thread compaction
+|   |   `-- pet_fetcher.py           # AALDA API client with 5-level fallback chain + TTL cache
 |   |-- llm/
 |   |   |-- base.py                  # Abstract LLMProvider
 |   |   |-- azure_openai.py          # Azure implementation
 |   |   `-- factory.py               # creates provider from settings
+|   |-- types.py                     # ActiveProfileEntry TypedDict + StateBag Protocol
 |   `-- core/
-|       `-- config.py                # reads .env -> Settings (includes database_url)
+|       `-- config.py                # reads .env -> Settings (includes database_url, aalda_*, etc.)
 |-- constants.py                     # business logic constants + FULL_FIELD_LIST + GAP_PRIORITY_LADDER + thread constants
 |-- docker-compose.yml               # PostgreSQL 16 Alpine container (port 5433:5432)
 |-- alembic.ini                      # Alembic migration config
 |-- migrations/                      # Alembic migration scripts
 |   |-- env.py                       # async runner, imports Base.metadata from app.db.models
-|   `-- versions/                    # migration files (3 total: initial + indexes + threads)
+|   `-- versions/                    # migration files (7 total)
 |-- design-docs/                     # all design & architecture documents
-|   |-- aggregator-design.md         # Aggregator design doc
-|   |-- compressor-design.md         # Compressor design doc + decision log
-|   |-- confidence-bar.md            # Confidence bar formula, tiers, decay, decision log
-|   |-- security.md                  # production security risks + fix phases
-|   |-- system-design.md             # full system architecture
-|   |-- system.md                    # PRD review notes
-|   |-- session-management.md        # Phase 2 design doc — thread lifecycle, compaction, write-through
-|   |-- prompt-gap-analysis.md       # 17-gap comparison: current prompt vs PW1-PRD v0.2b
-|   |-- prompt-v2-proposal.md        # Approved prompt v2 design + review checklist
-|   `-- api-v1-design.md             # API v1 design doc — versioning, error contract, redirect structure
 |-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health, error handlers, DB init
 |-- tests/
-|   `-- run_e2e.py                   # e2e tests (8 sections: infra, intent, session, compressor, aggregator, DB, threads, API v1)
-`-- data/                            # gitignored — DEPRECATED (Phase 1B legacy, no longer written to)
+|   `-- run_e2e.py                   # e2e tests (11 sections, 70 tests: infra through edge cases)
+`-- Dockerfile                       # Production container (Railway deployment)
 ```
 
 ---
@@ -305,7 +303,20 @@ API v1  (DONE):  All endpoints versioned under /api/v1/ (except /health).
                   pet_context removed from request — backend uses pet_id + DEFAULT_PET_ID fallback.
                   See design-docs/api-v1-design.md for full specification.
 
-Phase 3:         Nightly batch jobs
+Sprint 2 (DONE): AALDA API integration (PetFetcher with 5-level fallback chain + TTL cache).
+                  Multi-pet support (pet_ids: list[int], max 2, parallel fetch).
+                  X-User-Code auth header. Per-thread asyncio.Lock (C2).
+
+Sprint 3 (DONE): Language selector (EN/JA/auto). Production deploy fixes (Railway).
+
+Sprint 4 (DONE): Dual-pet Compressor attribution (pet_label). Clarification loop for hedged facts.
+                  Thread secondary_pet_id. Users table redesign (W18). Edge-case E2E tests.
+
+Sprint 5 (DONE): All review debt closed. StateBag Protocol. Per-pet lock + partial unique index.
+                  FK constraint (thread_messages → threads). background.py extraction.
+                  Parallel aggregator. Frontend crypto.randomUUID + redirect whitelist.
+
+Phase 3:         Nightly batch jobs + HistoryBuilder (ft-013)
 
 Phase 4:         JWT auth + rate limiting
 
