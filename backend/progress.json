@@ -1,13 +1,13 @@
 {
   "project": "AnyMall-chan Backend",
   "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
-  "last_updated": "2026-03-17",
-  "state": "sprint-5-review-debt-complete",
+  "last_updated": "2026-03-19",
+  "state": "ft-005-valkey-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
-  "current_focus": "Phase 3 (nightly batch jobs) + HistoryBuilder (ft-013) + Valkey hot storage (ft-005). All Sprint 2-3 and Sprint 4 review debt resolved. 68/70 E2E tests pass (2 LLM non-determinism).",
+  "current_focus": "Phase 3 (nightly batch jobs) + HistoryBuilder (ft-013). ft-005 Valkey complete and tested: 17/17 Valkey tests pass, 68/70 E2E tests pass (2 pre-existing LLM timeout flakes). Next: ft-013, Phase 3.",
 
-  "storage_strategy": "PostgreSQL (Phase 1C complete). Phase 2 adds write-through message persistence: app.state.sessions[thread_id] (in-memory) + thread_messages table (PostgreSQL). Active threads reloaded from DB on startup (W12: only loads un-compacted messages). Thread compaction via LLM summarizer at 50 messages. Per-thread asyncio.Lock for session mutations (C2). Per-pet asyncio.Lock for thread creation (Sprint 5). FK constraint: thread_messages → threads with CASCADE (Sprint 5). Partial unique index: one active thread per pet (Sprint 5). Graceful shutdown via tracked background tasks (W8). AALDA API fallback chain: fresh cache → API → expired cache → DB → error (W1+W10). Valkey hot storage deferred (ft-005).",
+  "storage_strategy": "PostgreSQL (source of truth, Phase 1C+). Valkey (hot cache layer, ft-005 complete): all hot state (sessions, meta, pending_clarifications, active_profile, user_record, AALDA) cached with TTL. Write-through rule: DB written first, then Valkey — violation impossible by design (Valkey write in background.py after DB commit). Lua atomic append (LUA_APPEND_MESSAGES) prevents multi-instance session-list races. Distributed compaction lock via SETNX + UUID token + LUA_RELEASE_LOCK. Circuit breaker (5 failures -> 30s open -> half-open probe). TTL jitter ±10% prevents thundering herd. Graceful degradation: Valkey down -> falls back to PostgreSQL transparently. Per-thread asyncio.Lock for session mutations (C2). Per-pet asyncio.Lock for thread creation (Sprint 5). Graceful shutdown via tracked background tasks (W8).",
 
   "phases": [
 
@@ -724,11 +724,29 @@
     },
     {
       "id": "ft-005",
-      "name": "Valkey hot storage — decision made (Valkey, not Redis)",
-      "description": "Implement Valkey as hot storage for conversation threads and active profiles. Valkey is a Redis-compatible open-source fork — any Redis client library (redis-py, aioredis) works unchanged. Replaces in-memory Python dict (app.state.sessions, app.state.active_profile). Write-through to PostgreSQL already implemented in Phase 2. COORDINATE with ft-003 (multi-user) — both require restructuring app.state.",
-      "files": ["app/db/valkey_client.py", "app/services/context_builder.py", "app/agents/aggregator.py", "app/routes/chat.py"],
-      "status": "not-started",
-      "priority": "high — required for horizontal scaling and production multi-user"
+      "name": "Valkey hot storage",
+      "description": "Valkey (open-source Redis fork) as shared TTL-aware hot cache in front of PostgreSQL. Replaces all in-memory Python dicts on app.state. Write-through rule: DB first (source of truth), then Valkey. Circuit breaker, TTL jitter, graceful degradation (Valkey down -> transparent PostgreSQL fallback). Distributed compaction lock via SETNX + UUID token. Lua atomic session append. Two full review cycles (11 + 15 issues = 26 total fixes). Dedicated test suite: 17/17 pass.",
+      "files": [
+        "app/cache/__init__.py",
+        "app/cache/keys.py",
+        "app/cache/client.py",
+        "app/routes/chat.py",
+        "app/routes/background.py",
+        "app/agents/aggregator.py",
+        "app/services/pet_fetcher.py",
+        "app/types.py",
+        "app/core/config.py",
+        "app/main.py",
+        "docker-compose.yml",
+        ".env.example",
+        "requirements.txt",
+        "tests/test_valkey.py"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-19",
+      "test_results": "17/17 Valkey tests pass. 68/70 E2E tests pass (2 pre-existing LLM timeout flakes)."
     },
     {
       "id": "ft-006",
@@ -810,10 +828,10 @@
 
   "summary": {
     "total_features": 70,
-    "complete": 67,
+    "complete": 68,
     "in_progress": 0,
     "blocked": 0,
-    "not_started": 6,
-    "note": "Phase 0-2 + API v1 + Sprint 2-5 complete. All review debt resolved (Sprint 2-3 + Sprint 4). ft-002 complete (all deprecated files deleted). 68/70 E2E tests pass (2 LLM non-determinism in Compressor). Next: ft-013 (HistoryBuilder), ft-005 (Valkey hot storage), Phase 3 (nightly batch jobs)."
+    "not_started": 5,
+    "note": "Phase 0-2 + API v1 + Sprint 2-5 + ft-005 (Valkey) complete. All review debt resolved. ft-002 complete (deprecated files deleted). 17/17 Valkey tests pass. 68/70 E2E tests pass (2 pre-existing LLM timeout flakes). Next: ft-013 (HistoryBuilder), Phase 3 (nightly batch jobs)."
   }
 }

@@ -12,7 +12,10 @@
 #   don't need `Any` type hints.
 
 import asyncio
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.cache.client import ValkeyClient
 
 
 class ActiveProfileEntry(TypedDict, total=False):
@@ -64,3 +67,4 @@ class StateBag(Protocol):
     thread_summarizer: Any
     pet_fetcher: Any
     llm_provider: Any
+    valkey: "ValkeyClient"

@@ -22,6 +22,7 @@
 
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
+import json
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 # ── Third-party ────────────────────────────────────────────────────────────────
+import valkey.asyncio as valkey_lib
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +39,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # ── Our code ───────────────────────────────────────────────────────────────────
+from app.cache.client import ValkeyClient
+from app.cache.keys import CacheKeys, TTL_HEALTH, jittered_ttl
 from app.core.config import settings
 from app.llm.factory import create_llm_provider
 from app.agents.conversation import ConversationAgent
@@ -89,6 +93,34 @@ async def lifespan(app: FastAPI):
 
     await init_db(settings.database_url)
 
+    # ── Valkey cache pool (ft-005) ────────────────────────────────────────
+    # Create the connection pool once at startup and store on app.state.
+    # decode_responses=True → get str, not bytes (no .decode() needed in code).
+    # socket_timeout=5.0    → if Valkey hangs, fall back to DB in 5s max.
+    # health_check_interval → auto-PING idle connections before reuse so we
+    #                         detect stale TCP connections early.
+    raw_vk = valkey_lib.Valkey.from_url(
+        settings.valkey_url,
+        decode_responses=True,
+        max_connections=20,
+        socket_timeout=5.0,
+        socket_connect_timeout=5.0,
+        health_check_interval=30,
+        retry_on_timeout=True,
+        socket_keepalive=True,
+    )
+    app.state.valkey = ValkeyClient(raw_vk)
+
+    # Probe Valkey at startup (non-fatal — app runs without it).
+    vk_ok = await app.state.valkey.ping()
+    if vk_ok:
+        logger.info("Valkey connected at %s", settings.valkey_url)
+    else:
+        logger.warning(
+            "Valkey unreachable at %s — cache disabled, falling back to DB.",
+            settings.valkey_url,
+        )
+
     # ── AALDA API client (fetches real pet data per-request) ──────────────
     # DB callbacks for fallback (W1) and persistence (W10)
     async def _pet_db_fallback(pet_id: int) -> dict | None:
@@ -104,6 +136,7 @@ async def lifespan(app: FastAPI):
         db_fallback=_pet_db_fallback,
         db_persist=_pet_db_persist,
         timeout=settings.aalda_timeout_seconds,
+        valkey=app.state.valkey,
     )
 
     # ── LLM + Agents ─────────────────────────────────────────────────────
@@ -113,31 +146,23 @@ async def lifespan(app: FastAPI):
     app.state.agent = ConversationAgent(llm=llm)
     app.state.intent_classifier = IntentClassifier(llm=llm)
     app.state.compressor = CompressorAgent(llm=llm)
-    app.state.aggregator = AggregatorAgent(get_session=get_session)
+    app.state.aggregator = AggregatorAgent(get_session=get_session, valkey=app.state.valkey)
     app.state.thread_summarizer = ThreadSummarizer(llm=llm)
 
-    # ── Phase 2: Reload active threads from PostgreSQL ─────────────────
-    # Read from DB at startup,
-    # populate app.state so runtime reads are in-memory only.
-    async with get_session() as session:
-        thread_repo = ThreadRepo(session)
-        msg_repo = ThreadMessageRepo(session)
-        active_threads = await thread_repo.get_all_active()
-        sessions: dict[str, list] = {}
-        for thread in active_threads:
-            # Only load messages after the compaction cutoff (W12)
-            after_id = thread.get("compacted_before_id")
-            messages = await msg_repo.read_thread(thread["thread_id"], after_id=after_id)
-            sessions[thread["thread_id"]] = messages
-        app.state.sessions = sessions
-        logger.info("Loaded %d active thread(s) from database.", len(sessions))
-
-    app.state.session_meta = {}   # thread_id -> tracking metadata (gap questions, cooldowns)
-    app.state.compaction_in_progress = set()  # thread_ids currently being compacted (W3)
-    app.state.thread_locks: dict[str, asyncio.Lock] = {}  # per-thread locks (C2 — concurrent session safety)
-    app.state.pet_locks: dict[int, asyncio.Lock] = {}  # per-pet locks — prevent duplicate thread creation race
-    app.state.background_tasks: set[asyncio.Task] = set()  # tracked tasks for graceful shutdown (W8)
-    app.state.pending_clarifications: dict[str, list] = {}  # thread_id -> low-confidence facts for clarification (C4)
+    # ── Session state (ft-005: now lives in Valkey) ───────────────────────
+    # Sessions are no longer reloaded from DB at startup — they are fetched
+    # from Valkey on first access (cache-aside), falling back to DB on miss.
+    # This eliminates the cold-start DB query that grew linearly with users.
+    #
+    # app.state.sessions is kept as an empty dict for any remaining code that
+    # reads from it directly — those paths are updated in chat.py to use Valkey.
+    app.state.sessions = {}
+    app.state.session_meta = {}   # kept for fallback when Valkey is down
+    app.state.compaction_in_progress = set()  # local fallback when Valkey is down (W3)
+    app.state.thread_locks: dict[str, asyncio.Lock] = {}  # per-thread locks (C2)
+    app.state.pet_locks: dict[int, asyncio.Lock] = {}     # per-pet locks (race condition safety)
+    app.state.background_tasks: set[asyncio.Task] = set() # tracked tasks for graceful shutdown (W8)
+    app.state.pending_clarifications: dict[str, list] = {} # local fallback when Valkey is down (C4)
 
     logger.info("Backend ready. LLM provider: %s", settings.llm_provider)
 
@@ -163,6 +188,7 @@ async def lifespan(app: FastAPI):
         logger.info("Shutting down — no background tasks pending.")
 
     await app.state.pet_fetcher.close()
+    await app.state.valkey.aclose()
     await dispose_engine()
     logger.info("Shutdown complete.")
 
@@ -249,18 +275,41 @@ app.include_router(simulator_router)
 
 @app.get("/health", summary="Liveness check")
 async def health() -> dict[str, Any]:
-    """Returns 200 if server is up. Checks LLM reachability via health_check()."""
+    """
+    Returns 200 if server is up.
+
+    Checks LLM reachability via health_check() and caches the result in
+    Valkey for 60 seconds (S-09 fix).  Monitoring tools hit /health every
+    10-30 seconds — without caching that's ~86K Azure API calls/month.
+    With a 60s TTL cache, that drops to ~1,440/month.
+    """
+    vk: ValkeyClient = getattr(app.state, "valkey", None)
+
+    # Check Valkey cache first (S-09 fix)
+    if vk is not None:
+        cached_raw = await vk.get(CacheKeys.health_llm())
+        if cached_raw is not None:
+            cached = json.loads(cached_raw)
+            return cached
+
+    # Cache miss → call LLM
     llm_ok = False
     llm_provider = getattr(app.state, "llm_provider", None)
     if llm_provider is not None:
         llm_ok = await llm_provider.health_check()
 
-    return {
+    result: dict[str, Any] = {
         "status": "ok",
         "llm_provider": settings.llm_provider,
         "llm_reachable": llm_ok,
         "version": "1.0.0",
     }
+
+    # Store in Valkey for TTL_HEALTH seconds (60s)
+    if vk is not None:
+        await vk.setex(CacheKeys.health_llm(), jittered_ttl(TTL_HEALTH), json.dumps(result))
+
+    return result
 
 
 # ── Serve React frontend build (production only) ────────────────────────────

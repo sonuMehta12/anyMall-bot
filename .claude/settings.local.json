@@ -18,7 +18,12 @@
       "Bash(powershell -Command \"Get-Process -Name python -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name uvicorn -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host done\")",
       "Bash(rm -f config.py main.py requirements.txt)",
       "Bash(rm -rf __pycache__)",
-      "Bash(alembic revision:*)"
+      "Bash(alembic revision:*)",
+      "WebFetch(domain:valkey-py.readthedocs.io)",
+      "WebSearch",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:aiven.io)",
+      "WebFetch(domain:leapcell.io)"
     ]
   }
 }

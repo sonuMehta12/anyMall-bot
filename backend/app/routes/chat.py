@@ -18,6 +18,7 @@
 
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
@@ -34,12 +35,16 @@ from app.services.guardrails import apply_guardrails
 from app.services.deeplink import build_deeplink
 from app.services.context_builder import build_pet_context
 from app.services.pet_fetcher import PetFetchError
+from app.cache.client import ValkeyClient
+from app.cache.keys import (
+    CacheKeys, TTL_SESSION, TTL_META, TTL_PENDING, TTL_USER, TTL_PROFILE, jittered_ttl,
+)
 from constants import (
     INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM,
     THREAD_CONTEXT_WINDOW, THREAD_EXPIRY_HOURS,
 )
 from app.db.session import get_session
-from app.db.repositories import ActiveProfileRepo, ThreadRepo, UserRepo
+from app.db.repositories import ActiveProfileRepo, ThreadRepo, ThreadMessageRepo, UserRepo
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
 
 logger = logging.getLogger(__name__)
@@ -230,17 +235,38 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     pet_profiles = [r[0] for r in pet_results]       # list of pet_profile dicts
     aalda_facts_list = [r[1] for r in pet_results]    # list of aalda_facts dicts
 
-    # ── 2. Load active_profiles from DB (per pet) ────────────────────────────
-    active_profiles_raw: list[dict | None] = []
-    try:
-        async with get_session() as db_session:
-            ap_repo = ActiveProfileRepo(db_session)
-            for pid in pet_ids:
-                raw = await ap_repo.read_all(pid)
-                active_profiles_raw.append(raw)
-    except Exception as db_exc:
-        logger.error("DB error loading active profiles: %s", db_exc)
-        raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
+    # ── 2. Load active_profiles — Valkey cache-aside (ft-005, Step 6) ────────
+    # Check Valkey for all pets first (before opening any DB session) so cache
+    # hits don't waste a connection pool slot. Only open the DB session for the
+    # subset of pet_ids that missed the cache.
+    vk: ValkeyClient = state_bag.valkey
+    active_profiles_raw: list[dict | None] = [None] * len(pet_ids)
+    pids_to_fetch: list[tuple[int, int]] = []  # (list-index, pet_id)
+
+    for i, pid in enumerate(pet_ids):
+        raw_cached = await vk.get(CacheKeys.profile(pid))
+        if raw_cached is not None:
+            logger.debug("Profile cache hit — pet_id=%d", pid)
+            active_profiles_raw[i] = json.loads(raw_cached)
+        else:
+            pids_to_fetch.append((i, pid))
+
+    if pids_to_fetch:
+        db_hits: list[tuple[int, int, dict]] = []  # (index, pet_id, profile)
+        try:
+            async with get_session() as db_session:
+                ap_repo = ActiveProfileRepo(db_session)
+                for idx, pid in pids_to_fetch:
+                    raw = await ap_repo.read_all(pid)
+                    active_profiles_raw[idx] = raw
+                    if raw:
+                        db_hits.append((idx, pid, raw))
+        except Exception as db_exc:
+            logger.error("DB error loading active profiles: %s", db_exc)
+            raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
+        # Populate Valkey after the DB session closes (no connection held during cache write)
+        for _, pid, raw in db_hits:
+            await vk.setex(CacheKeys.profile(pid), jittered_ttl(TTL_PROFILE), json.dumps(raw))
 
     # ── 3. Build context for each pet ─────────────────────────────────────────
     pet_contexts = []
@@ -258,35 +284,6 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     # ── Timestamp (used by user upsert, thread boundary, and message persistence) ──
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()
-
-    # ── Auto-upsert user record (W18 — creates on first visit) ──────────────
-    user_record = None
-    try:
-        async with get_session() as db_session:
-            user_repo = UserRepo(db_session)
-            user_record = await user_repo.read(user_code)
-            if not user_record:
-                await user_repo.upsert({
-                    "user_code": user_code,
-                    "created_at": now_iso,
-                    "updated_at": now_iso,
-                })
-                user_record = await user_repo.read(user_code)
-            else:
-                # Return visit — update timestamp, preserve existing fields
-                await user_repo.upsert({
-                    "user_code": user_code,
-                    "updated_at": now_iso,
-                    "session_count": user_record.get("session_count", 0) + 1,
-                    "relationship_summary": user_record.get("relationship_summary", ""),
-                    "preferred_language": user_record.get("preferred_language", "auto"),
-                })
-    except Exception as user_exc:
-        logger.warning("User upsert failed (non-fatal): %s", user_exc)
-
-    # Relationship context — read from user record, fallback to default
-    relationship_context = (user_record or {}).get("relationship_summary", "") \
-        or "New user — no relationship data yet."
 
     # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
     conf_score = calculate_confidence_score(primary_ctx["active_profile"], primary_profile)
@@ -321,11 +318,17 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                 else:
                     if existing:
                         await thread_repo.expire(existing["thread_id"])
-                        # Clean up in-memory state for the expired thread (W4+W5)
-                        sessions.pop(existing["thread_id"], None)
-                        state_bag.session_meta.pop(existing["thread_id"], None)
-                        state_bag.pending_clarifications.pop(existing["thread_id"], None)
-                        logger.info("Thread expired: %s", existing["thread_id"])
+                        # Clean up expired thread from Valkey + local fallback dicts (W4+W5)
+                        old_tid = existing["thread_id"]
+                        await vk.delete(
+                            CacheKeys.session(old_tid),
+                            CacheKeys.meta(old_tid),
+                            CacheKeys.pending(old_tid),
+                        )
+                        sessions.pop(old_tid, None)
+                        state_bag.session_meta.pop(old_tid, None)
+                        state_bag.pending_clarifications.pop(old_tid, None)
+                        logger.info("Thread expired: %s", old_tid)
 
                     prev = await thread_repo.get_latest_expired(primary_pet_id)
                     if prev and prev.get("compaction_summary"):
@@ -350,15 +353,86 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             logger.error("DB error in thread boundary: %s", db_exc)
             raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
 
+    # ── Auto-upsert user record — Valkey cache-aside + write-through (ft-005) ─
+    # Placed after thread boundary so new_thread is known — session_count
+    # increments only once per 24-hour thread window, not once per message.
+    # vk.setex calls happen OUTSIDE the DB session to avoid holding a pool
+    # connection across a Valkey round-trip.
+    user_record = None
+    try:
+        raw_user = await vk.get(CacheKeys.user(user_code))
+        if raw_user is not None:
+            user_record = json.loads(raw_user)
+            logger.debug("User cache hit — user_code=%s", user_code)
+
+        vk_user_to_cache = None
+        async with get_session() as db_session:
+            user_repo = UserRepo(db_session)
+            if user_record is None:
+                user_record = await user_repo.read(user_code)
+
+            if not user_record:
+                await user_repo.upsert({
+                    "user_code": user_code,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                })
+                user_record = await user_repo.read(user_code)
+                if user_record:
+                    vk_user_to_cache = user_record
+            else:
+                updated = {
+                    "user_code": user_code,
+                    "updated_at": now_iso,
+                    # Increment only when a new 24-hour thread window opens.
+                    "session_count": user_record.get("session_count", 0) + (1 if new_thread else 0),
+                    "relationship_summary": user_record.get("relationship_summary", ""),
+                    "preferred_language": user_record.get("preferred_language", "auto"),
+                }
+                await user_repo.upsert(updated)
+                user_record = {**user_record, **updated}
+                vk_user_to_cache = user_record
+
+        # Write-through to Valkey after DB session closes (no connection held)
+        if vk_user_to_cache is not None:
+            await vk.setex(
+                CacheKeys.user(user_code), jittered_ttl(TTL_USER), json.dumps(vk_user_to_cache)
+            )
+    except Exception as user_exc:
+        logger.warning("User upsert failed (non-fatal): %s", user_exc)
+
+    relationship_context = (user_record or {}).get("relationship_summary", "") \
+        or "New user — no relationship data yet."
+
     # ── Acquire per-thread lock (C2 — prevent concurrent session mutations) ──
     thread_locks: dict[str, asyncio.Lock] = state_bag.thread_locks
     thread_lock = thread_locks.setdefault(thread_id, asyncio.Lock())
 
     async with thread_lock:
-        if thread_id not in sessions:
-            sessions[thread_id] = []
-
-        session_messages = sessions[thread_id]
+        # ── Load session messages — Valkey cache-aside (ft-005, Step 4) ─────
+        # GET from Valkey first.  On miss → DB → populate Valkey.
+        raw_session = await vk.get(CacheKeys.session(thread_id))
+        if raw_session is not None:
+            logger.debug("Session cache hit — thread_id=%s", thread_id)
+            session_messages = json.loads(raw_session)
+        else:
+            # Cache miss → load from DB (or start empty for new threads)
+            try:
+                async with get_session() as db_session:
+                    msg_repo = ThreadMessageRepo(db_session)
+                    session_messages = await msg_repo.read_thread(thread_id)
+            except Exception as exc:
+                logger.warning("Session DB load failed — thread=%s: %s", thread_id, exc)
+                session_messages = []
+            # Populate Valkey so next request is a cache hit
+            if session_messages:
+                await vk.setex(
+                    CacheKeys.session(thread_id),
+                    jittered_ttl(TTL_SESSION),
+                    json.dumps(session_messages),
+                )
+        # Keep local ref in sessions dict (used by _run_background for continuity)
+        sessions[thread_id] = session_messages
 
         # ── Build AgentState — shared context for the background pipeline ─────
         pet_infos = []
@@ -381,11 +455,18 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             recent_history=list(session_messages),
         )
 
-        # Track gap questions and redirect cooldowns per thread.
-        meta = state_bag.session_meta.setdefault(thread_id, {
-            "gap_questions_asked": 0,
-            "redirect_turn_tracker": {},
-        })
+        # ── Load session meta — Valkey cache-aside (ft-005, Step 5) ─────────
+        # Tracks gap questions asked and redirect cooldowns per thread.
+        # Acceptable to lose on Valkey down: counter resets to 0 (asks 1 extra question).
+        raw_meta = await vk.get(CacheKeys.meta(thread_id))
+        if raw_meta is not None:
+            meta = json.loads(raw_meta)
+        else:
+            meta = state_bag.session_meta.get(thread_id) or {
+                "gap_questions_asked": 0,
+                "last_asked_gap": False,
+                "redirect_turn_tracker": {},
+            }
         questions_so_far = meta["gap_questions_asked"]
 
         # ── 5. Intent classification (LLM) ──────────────────────────────────
@@ -395,9 +476,16 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         pet_a_context = pet_contexts[0]
         pet_b_context = pet_contexts[1] if len(pet_contexts) > 1 else None
 
-        # Read pending clarifications for this thread (from previous turn's background pipeline)
-        pending_store = getattr(state_bag, "pending_clarifications", {})
-        pending_clars = pending_store.get(thread_id, [])
+        # ── Load pending clarifications — Valkey GET (ft-005, Step 5) ───────
+        # Written by background pipeline after Compressor finds low-confidence facts.
+        # Read next turn to inject hedged facts into Agent 1's prompt.
+        # Acceptable to lose on Valkey down: returns [] (no clarification this turn).
+        raw_pending = await vk.get(CacheKeys.pending(thread_id))
+        if raw_pending is not None:
+            pending_clars = json.loads(raw_pending)
+        else:
+            # Local dict fallback when Valkey is down
+            pending_clars = state_bag.pending_clarifications.get(thread_id, [])
 
         agent_response: AgentResponse = await agent.run(
             user_message=request_body.message,
@@ -452,9 +540,19 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                         redirect_payload = _to_redirect_payload(deeplink)
                         tracker["medium_last_shown"] = current_turn
 
-        # ── 8. Save to session history (in-memory, keyed by thread_id) ────
-        sessions[thread_id].append({"role": "user",      "content": request_body.message, "timestamp": now_iso})
-        sessions[thread_id].append({"role": "assistant",  "content": final_reply, "timestamp": now_iso})
+        # Write meta once after all mutations (gap counter + redirect tracker)
+        await vk.setex(CacheKeys.meta(thread_id), jittered_ttl(TTL_META), json.dumps(meta))
+        state_bag.session_meta[thread_id] = meta
+
+        # ── 8. Save to session history ────────────────────────────────────────
+        # Append to local dict so the next request has the data immediately
+        # (Valkey cache miss falls back to sessions[thread_id]).
+        # Background pipeline writes DB first, then appends to Valkey atomically
+        # via LUA_APPEND_MESSAGES — preserving the DB-first write-through rule.
+        user_msg = {"role": "user", "content": request_body.message, "timestamp": now_iso}
+        asst_msg = {"role": "assistant", "content": final_reply, "timestamp": now_iso}
+        sessions[thread_id].append(user_msg)
+        sessions[thread_id].append(asst_msg)
 
         # ── 9. Fire-and-forget Compressor ─────────────────────────────────
         agent_state.agent_reply = final_reply
@@ -505,9 +603,21 @@ async def get_confidence(request: Request, pet_id: int | None = None) -> dict[st
     except PetFetchError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    async with get_session() as db_session:
-        ap_repo = ActiveProfileRepo(db_session)
-        active_raw = await ap_repo.read_all(pet_id)
+    # Active profile — Valkey cache-aside (ft-005, Step 6)
+    vk: ValkeyClient = request.app.state.valkey
+    raw_cached = await vk.get(CacheKeys.profile(pet_id))
+    if raw_cached is not None:
+        active_raw = json.loads(raw_cached)
+    else:
+        try:
+            async with get_session() as db_session:
+                ap_repo = ActiveProfileRepo(db_session)
+                active_raw = await ap_repo.read_all(pet_id)
+        except Exception as db_exc:
+            logger.error("DB error in /confidence — pet_id=%d: %s", pet_id, db_exc)
+            raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
+        if active_raw:
+            await vk.setex(CacheKeys.profile(pet_id), jittered_ttl(TTL_PROFILE), json.dumps(active_raw))
 
     ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
     score = calculate_confidence_score(ctx["active_profile"], pet_profile)

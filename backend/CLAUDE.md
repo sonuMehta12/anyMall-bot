@@ -31,7 +31,7 @@ We build the minimum that works at each phase. We do not add complexity until th
 simple version is working and understood. Every line of code is written with full
 understanding of what it does and why it is there.
 
-**Current goal: Sprint 5 complete (all review debt resolved) → Phase 3 (nightly batch jobs) + ft-013 (HistoryBuilder) + ft-005 (Valkey) next.**
+**Current goal: ft-005 (Valkey) complete → Phase 3 (nightly batch jobs) + ft-013 (HistoryBuilder) next.**
 
 Phase 0 ✓. Phase 1A ✓. Phase 1B ✓. Phase 1C ✓ (PostgreSQL replaces JSON files).
 Phase 2 ✓ (Thread & Conversation Management — 24h thread windows, write-through message persistence, startup reload, LLM compaction, cross-thread continuity via conversation_summary).
@@ -40,6 +40,7 @@ Sprint 2 ✓ (AALDA integration, multi-pet support, X-User-Code auth).
 Sprint 3 ✓ (Language selector, production deploy fixes).
 Sprint 4 ✓ (Dual-pet Compressor attribution, clarification loop, users table redesign).
 Sprint 5 ✓ (All review debt closed — StateBag Protocol, per-pet lock, FK constraint, background.py extraction, parallel aggregator, frontend fixes, deprecated file cleanup).
+ft-005 ✓ (Valkey hot storage — replaces all in-memory dicts, write-through rule, circuit breaker, TTL jitter, distributed compaction lock, Lua atomic session append, graceful degradation. 17/17 Valkey tests + 68/70 E2E pass).
 
 **Known gaps before production (tracked in progress.json future_tasks):**
 - `ft-005`: Valkey hot storage — replaces in-memory dicts for horizontal scaling
@@ -92,7 +93,7 @@ User message + X-User-Code header + pet_ids[]
     → apply_guardrails()
     → build_deeplink()            (food LOW urgency → no redirect)
     → confidence_calculator()     confidence_score + confidence_color (reads from app.state)
-    → Append to app.state.sessions[thread_id]  (in-memory, keyed by thread_id)
+    → Append to Valkey am:session:{thread_id}  (via LUA_APPEND_MESSAGES in background.py)
     → Return response to user     (includes status, thread_id, new_thread, is_entity, intent_type, urgency, confidence)
     ↓  [fire-and-forget — user does NOT wait]  (app/routes/background.py)
     → _run_background(AgentState)
@@ -103,18 +104,20 @@ User message + X-User-Code header + pet_ids[]
          → Clarification mgmt           → low-confidence facts → pending_clarifications store
 ```
 
-**In-memory patterns:**
-- `load_profiles_from_db()` in `context_builder.py` called once at startup → loads profiles into `app.state`
-- Active threads reloaded from PostgreSQL at startup → `app.state.sessions` (keyed by `thread_id`)
-- All runtime reads from `app.state` (no disk I/O or DB I/O on hot path)
-- Aggregator mutates `app.state.active_profile` by reference, writes through to PostgreSQL for persistence
-- Messages appended to `app.state.sessions[thread_id]` synchronously, written through to `thread_messages` table in `_run_background()`
+**Storage patterns (ft-005 Valkey complete):**
+- Valkey is the hot cache layer; PostgreSQL is the source of truth — all writes go to DB first, then Valkey
+- Sessions: `am:session:{thread_id}` (Valkey, TTL 7200s) — loaded from DB on cache miss
+- Active profile: `am:profile:{pet_id}` (Valkey, TTL 3600s) — cache-aside, written through after aggregator
+- Pending clarifications: `am:pending:{thread_id}` (Valkey, TTL 7200s)
+- Session meta: `am:meta:{thread_id}` (Valkey, TTL 7200s)
+- User record: `am:user:{user_code}` (Valkey, TTL 7200s) — written through after user upsert
+- AALDA cache: `am:aalda:{user_code}:{pet_id}` (Valkey, TTL 300s) — replaces PetFetcher._cache dict
 - `build_pet_context()` accepts AALDA data + DB profiles + `conversation_summary`; returns 6 values
-- `GET /api/v1/confidence` reads from `app.state` — frontend calls on mount + 4s after each message
+- `GET /api/v1/confidence` reads from Valkey profile cache (falls back to DB)
 - `app.state.pet_locks` — per-pet `asyncio.Lock` prevents concurrent thread creation for same pet
-- `app.state.pending_clarifications` — hedged facts awaiting user confirmation, scoped per thread_id
+- Circuit breaker in `ValkeyClient`: 5 failures -> 30s open -> half-open probe. Graceful degradation: all Valkey calls fall back to DB/defaults when Valkey is down
 
-**File structure — current state (Sprint 5 complete):**
+**File structure — current state (ft-005 Valkey complete):**
 ```
 backend/
 |-- app/
@@ -123,8 +126,12 @@ backend/
 |   |   |-- intent_classifier.py     # IntentClassifier — Phase 1A
 |   |   |-- state.py                 # AgentState dataclass (thread_id, pets, low_confidence_fields, etc.)
 |   |   |-- compressor.py            # Agent 2 — fact extraction with pet_label attribution (LLM, temp=0.0)
-|   |   `-- aggregator.py            # Agent 3 — fact merge (no LLM, Rules 0-6), write-through to PostgreSQL
-|   |-- db/                          # PostgreSQL layer
+|   |   `-- aggregator.py            # Agent 3 — fact merge (no LLM, Rules 0-6), per-pet asyncio.Lock, write-through
+|   |-- cache/                       # ft-005: Valkey hot cache layer
+|   |   |-- __init__.py
+|   |   |-- keys.py                  # CacheKeys (all key patterns), jittered_ttl(), TTL constants, Lua scripts
+|   |   `-- client.py                # ValkeyClient wrapper: circuit breaker, swallows errors, all Valkey ops
+|   |-- db/                          # PostgreSQL layer (source of truth)
 |   |   |-- __init__.py
 |   |   |-- session.py               # init_db(), dispose_engine(), get_session() async context manager
 |   |   |-- models.py                # SQLAlchemy 2.0 ORM: Pet, User, ActiveProfile, FactLog, Thread, ThreadMessage
@@ -141,24 +148,25 @@ backend/
 |   |   |-- context_builder.py       # load_profiles_from_db() + build_pet_context() — AALDA-first merge, multi-pet
 |   |   |-- confidence_calculator.py # confidence_score + confidence_color
 |   |   |-- thread_summarizer.py     # Phase 2 — LLM summarization for thread compaction
-|   |   `-- pet_fetcher.py           # AALDA API client with 5-level fallback chain + TTL cache
+|   |   `-- pet_fetcher.py           # AALDA API client with 5-level fallback chain + Valkey cache (ft-005)
 |   |-- llm/
 |   |   |-- base.py                  # Abstract LLMProvider
 |   |   |-- azure_openai.py          # Azure implementation
 |   |   `-- factory.py               # creates provider from settings
-|   |-- types.py                     # ActiveProfileEntry TypedDict + StateBag Protocol
+|   |-- types.py                     # ActiveProfileEntry TypedDict + StateBag Protocol (incl. valkey field)
 |   `-- core/
-|       `-- config.py                # reads .env -> Settings (includes database_url, aalda_*, etc.)
+|       `-- config.py                # reads .env -> Settings (database_url, aalda_*, valkey_url, etc.)
 |-- constants.py                     # business logic constants + FULL_FIELD_LIST + GAP_PRIORITY_LADDER + thread constants
-|-- docker-compose.yml               # PostgreSQL 16 Alpine container (port 5433:5432)
+|-- docker-compose.yml               # PostgreSQL 16 Alpine + Valkey 8 Alpine containers
 |-- alembic.ini                      # Alembic migration config
 |-- migrations/                      # Alembic migration scripts
 |   |-- env.py                       # async runner, imports Base.metadata from app.db.models
 |   `-- versions/                    # migration files (7 total)
 |-- design-docs/                     # all design & architecture documents
-|-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health, error handlers, DB init
+|-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health, Valkey init, error handlers
 |-- tests/
-|   `-- run_e2e.py                   # e2e tests (11 sections, 70 tests: infra through edge cases)
+|   |-- run_e2e.py                   # e2e tests (11 sections, 70 tests: infra through edge cases)
+|   `-- test_valkey.py               # ft-005 Valkey tests (17 tests: keys, TTL, cache-aside, atomic ops, degradation)
 `-- Dockerfile                       # Production container (Railway deployment)
 ```
 
@@ -316,6 +324,10 @@ Sprint 5 (DONE): All review debt closed. StateBag Protocol. Per-pet lock + parti
                   FK constraint (thread_messages → threads). background.py extraction.
                   Parallel aggregator. Frontend crypto.randomUUID + redirect whitelist.
 
+ft-005  (DONE): Valkey hot storage. Replaces all in-memory dicts. Write-through rule (DB first).
+                  Circuit breaker + TTL jitter + graceful degradation. Distributed compaction lock
+                  (SETNX + UUID token). Lua atomic session append. 17/17 Valkey tests pass.
+
 Phase 3:         Nightly batch jobs + HistoryBuilder (ft-013)
 
 Phase 4:         JWT auth + rate limiting
@@ -350,9 +362,10 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env — fill in your Azure OpenAI credentials + DATABASE_URL
 
-# 3. Start PostgreSQL (Docker required)
+# 3. Start PostgreSQL + Valkey (Docker required)
 docker compose up -d
-# Verify: docker exec -it anymall-postgres psql -U anymall -d anymallchan -c "\dt"
+# Verify postgres: docker exec -it anymall-postgres psql -U anymall -d anymallchan -c "\dt"
+# Verify valkey:   docker exec anymall-valkey valkey-cli -a yourpassword ping  # -> PONG
 
 # 4. Run database migrations
 alembic upgrade head

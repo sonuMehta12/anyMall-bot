@@ -1083,3 +1083,112 @@ works correctly with `user_code` as the identity key.
 `chat.py` went from 734 lines to 522 lines after extracting background functions to
 `app/routes/background.py` (251 lines). The extraction is a pure refactor — zero
 behavior changes.
+
+---
+
+## ft-005 — Valkey Hot Storage — Completed 2026-03-19 ✓
+
+### What we built
+
+Replaced all in-memory Python dicts on `app.state` with **Valkey** — an open-source
+Redis fork (BSD license) — as a shared, TTL-aware hot cache in front of PostgreSQL.
+
+The problem: `app.state.sessions`, `app.state.session_meta`, `app.state.pending_clarifications`,
+`app.state.compaction_in_progress`, and `PetFetcher._cache` all lived in a single Python process.
+This works for one server but breaks horizontal scaling (two instances don't share state), leaks
+memory (no TTL means expired threads accumulate forever), and forces a slow full-reload from DB
+every server restart.
+
+Valkey solves all three: shared across instances, every key has a TTL, and cache misses rebuild
+from PostgreSQL on demand.
+
+**PostgreSQL stays the source of truth. Valkey is the fast layer in front of it.**
+
+### What lives where now
+
+| Key pattern | TTL | What it stores |
+|---|---|---|
+| `am:session:{thread_id}` | 7200s | Thread message list (JSON array) |
+| `am:meta:{thread_id}` | 7200s | Gap question counter + redirect tracker |
+| `am:pending:{thread_id}` | 7200s | Low-confidence facts waiting for clarification |
+| `am:profile:{pet_id}` | 3600s | Active profile (current best-known facts) |
+| `am:aalda:{user_code}:{pet_id}` | 300s | AALDA API fetch result |
+| `am:user:{user_code}` | 7200s | User record |
+| `am:health:llm` | 60s | LLM health check result |
+| `am:compacting:{thread_id}` | 300s | Distributed compaction lock (SETNX) |
+
+### New files
+
+- **`app/cache/__init__.py`** — package marker
+- **`app/cache/keys.py`** — `CacheKeys` class: all key patterns in one place so typos are
+  impossible. Also defines `jittered_ttl(base)` (±10% random jitter), TTL constants, and two
+  Lua script constants (`LUA_APPEND_MESSAGES`, `LUA_RELEASE_LOCK`)
+- **`app/cache/client.py`** — `ValkeyClient` wrapper around `valkey.asyncio.Valkey`. Every method
+  catches `ConnectionError`/`TimeoutError` and returns `None`/`False` — callers never see
+  exceptions. Also contains a circuit breaker: 5 consecutive failures -> 30s open -> half-open
+  single-probe recovery
+
+### Key design decisions
+
+**Write-through rule — DB first, always.** Every write goes to PostgreSQL first, then Valkey.
+A cache miss is never a data loss — it just means the next read rebuilds from DB. We enforced
+this by ensuring session message writes only happen in `background.py` (after `append_batch()`
+commits to DB), never in `chat.py`. The previous design had a Valkey write in `chat.py` before
+the background DB write — a latent correctness bug we caught and fixed.
+
+**Lua atomic append for session messages.** A full-list SETEX for session messages is non-atomic
+across two concurrent instances: both read the list, both append, the slower one overwrites the
+faster one's message. `LUA_APPEND_MESSAGES` runs as a single Redis server command — GET +
+JSON-parse + append + SETEX — so no message can be lost.
+
+**Circuit breaker half-open exclusivity.** When the circuit transitions from open to half-open,
+only one coroutine should send the probe. We enforce this by resetting `_last_failure_time` to
+`time.monotonic()` inside a synchronous (non-yielding) method `_should_allow_request()`. Because
+asyncio is single-threaded, a synchronous function cannot be interrupted — so only the first
+caller can claim the probe slot.
+
+**UUID token for compaction lock.** The distributed compaction lock stores a UUID as its value
+(not just `"1"`). `LUA_RELEASE_LOCK` checks the token before deleting — so a slow compaction that
+finishes after its TTL expired cannot delete a lock that another instance already acquired.
+
+**TTL jitter.** `jittered_ttl(base)` returns `base ± 10%` (random). Without jitter, all sessions
+created in the same batch expire at exactly the same second, causing a thundering herd of DB
+reloads. Jitter spreads the load.
+
+**Graceful degradation.** Every Valkey call is wrapped. If Valkey is down, `get()` returns `None`
+(cache miss), `set()`/`setex()` returns `False` (skip write), `eval()` returns `None` (skip Lua).
+Callers check the return value and fall back to PostgreSQL. The circuit breaker prevents 5s
+timeout stacking across all concurrent requests when Valkey is down.
+
+### Review process
+
+ft-005 went through two full external code reviews before tests were written:
+- **Review 1**: 11 issues found and fixed (architecture, type safety, dead code, etc.)
+- **Review 2**: 15 issues found and fixed (write-through violation, half-open exclusivity, token-checked lock, per-pet aggregator locks, session_count semantics, DB connection held across Valkey calls, etc.)
+- **26 total fixes** across 8 files before a single test ran
+
+### Test results
+
+- `tests/test_valkey.py` — **17/17 pass** (dedicated Valkey suite, uses direct Valkey client to bypass the wrapper and verify raw truth)
+- `tests/run_e2e.py` — **68/70 pass** (same 2 pre-existing LLM timeout flakes as before ft-005; not caused by these changes)
+
+### How to verify in production
+
+```bash
+# Start both containers
+docker compose up -d
+
+# Confirm Valkey is running
+docker exec anymall-valkey valkey-cli -a valkey_dev ping
+# -> PONG
+
+# After a chat message, inspect the session key
+docker exec anymall-valkey valkey-cli -a valkey_dev KEYS "am:*"
+docker exec anymall-valkey valkey-cli -a valkey_dev GET "am:session:<thread_id>"
+
+# Test graceful degradation
+docker stop anymall-valkey
+# Send a message -> still works, logs show "Valkey unavailable, falling back to DB"
+docker start anymall-valkey
+# Send another message -> Valkey resumes automatically
+```

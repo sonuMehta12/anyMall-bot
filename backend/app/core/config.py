@@ -66,9 +66,15 @@ class Settings(BaseSettings):
 
     # ── AALDA API ──────────────────────────────────────────────────────────
     # External API for real pet data (profiles, diets, vaccinations).
-    # Backend calls this on every chat request (cached in memory for 5 min).
+    # Backend calls this on every chat request (cached in Valkey for 5 min).
     aalda_api_url: str = "https://anymall-api.stagingapp.in/api/v1"
     aalda_timeout_seconds: float = 10.0  # httpx timeout for AALDA API calls
+
+    # ── Valkey cache (ft-005) ──────────────────────────────────────────────
+    # Connection URL for the Valkey (Redis-compatible) in-memory cache.
+    # Default points to the local Docker container defined in docker-compose.yml.
+    # Format: valkey://:password@host:port/db
+    valkey_url: str = "valkey://:valkey_dev@localhost:6379/0"
 
     # ── pydantic-settings configuration ──────────────────────────────────────
     # env_file: which file to read from disk.

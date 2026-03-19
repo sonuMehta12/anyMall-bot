@@ -13,12 +13,18 @@
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
 import dataclasses
+import json
 from datetime import datetime, timezone
 import logging
 from typing import Any
+from uuid import uuid4
 
 # ── Our code ───────────────────────────────────────────────────────────────────
 from app.agents.state import AgentState
+from app.cache.keys import (
+    CacheKeys, LUA_APPEND_MESSAGES, LUA_RELEASE_LOCK,
+    TTL_COMPACTING, TTL_PENDING, TTL_SESSION, jittered_ttl,
+)
 from app.db.session import get_session
 from app.db.repositories import (
     ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo,
@@ -55,6 +61,7 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
     """
     compressor = state_bag.compressor
     aggregator = state_bag.aggregator
+    vk = getattr(state_bag, "valkey", None)
 
     try:
         # ── Write-through: persist messages to PostgreSQL ────────────────
@@ -76,16 +83,48 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
                 },
             ])
 
-        # ── Compaction trigger (guarded — W3) ─────────────────────────
-        sessions = state_bag.sessions
-        thread_messages = sessions.get(state.thread_id, [])
-        compacting = state_bag.compaction_in_progress
-        if (
-            len(thread_messages) >= THREAD_COMPACTION_THRESHOLD
-            and state.thread_id not in compacting
-        ):
-            compacting.add(state.thread_id)
-            _create_tracked_task(_run_compaction(state.thread_id, state.pet_id, state_bag), state_bag)
+        # ── Valkey session append — after DB write succeeds (ft-005) ─────────
+        # DB is written first (source of truth). Now append the same two messages
+        # to Valkey atomically using the Lua script. If Valkey is down, vk is None
+        # and this is skipped — the local sessions dict still has the data.
+        if vk is not None:
+            session_msgs = [
+                {"role": "user", "content": state.user_message, "timestamp": now_iso},
+                {"role": "assistant", "content": state.agent_reply, "timestamp": now_iso},
+            ]
+            await vk.eval(
+                LUA_APPEND_MESSAGES, 1,
+                CacheKeys.session(state.thread_id),
+                json.dumps(session_msgs),
+                str(jittered_ttl(TTL_SESSION)),
+            )
+
+        # ── Compaction trigger — Valkey distributed lock (ft-005, Step 8) ──
+        # Use Valkey SETNX (set if not exists) as an atomic distributed lock
+        # so multiple instances don't compact the same thread simultaneously.
+        # Fallback: if Valkey is down, use local compaction_in_progress set.
+        thread_messages = state.recent_history  # use the snapshot from AgentState
+        if len(thread_messages) >= THREAD_COMPACTION_THRESHOLD:
+            should_compact = False
+            if vk is not None:
+                lock_token = str(uuid4())
+                acquired = await vk.set(
+                    CacheKeys.compacting(state.thread_id), lock_token,
+                    nx=True, ex=TTL_COMPACTING,
+                )
+                should_compact = bool(acquired)
+            else:
+                # Valkey unavailable — fall back to local set (single-instance safety)
+                compacting = state_bag.compaction_in_progress
+                if state.thread_id not in compacting:
+                    compacting.add(state.thread_id)
+                    should_compact = True
+
+            if should_compact:
+                _create_tracked_task(
+                    _run_compaction(state.thread_id, state_bag, lock_token if vk is not None else ""),
+                    state_bag,
+                )
 
         # ── Compressor pipeline ─────────────────────────────────────────
         if compressor is None:
@@ -141,9 +180,17 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
 
             async def _aggregate_one_pet(label: str, pet_facts: list) -> None:
                 target_pet_id = pet_id_map.get(label, state.pets[0].id)
-                async with get_session() as db_session:
-                    ap_repo = ActiveProfileRepo(db_session)
-                    current_profile = await ap_repo.read_all(target_pet_id) or {}
+                # Read current profile — Valkey cache-aside (ft-005, Step 6)
+                vk_inner = getattr(state_bag, "valkey", None)
+                current_profile: dict = {}
+                if vk_inner is not None:
+                    raw_prof = await vk_inner.get(CacheKeys.profile(target_pet_id))
+                    if raw_prof is not None:
+                        current_profile = json.loads(raw_prof)
+                if not current_profile:
+                    async with get_session() as db_session:
+                        ap_repo = ActiveProfileRepo(db_session)
+                        current_profile = await ap_repo.read_all(target_pet_id) or {}
                 await aggregator.run(pet_facts, state.session_id, current_profile, pet_id=target_pet_id)
 
             await asyncio.gather(*[
@@ -152,7 +199,10 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
             ])
 
         # ── Persist low-confidence facts for clarification next turn ─────
+        # (ft-005, Step 5): Write to Valkey; fall back to local dict when Valkey down.
         pending_store = getattr(state_bag, "pending_clarifications", {})
+        pending_key = CacheKeys.pending(state.thread_id)
+
         if low:
             clarifications = []
             for f in low:
@@ -164,15 +214,34 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
                     "source_quote": f.source_quote,
                 })
             # Deduplicate by (pet_name, key) — newer value replaces older
-            existing = pending_store.get(state.thread_id, [])
+            # Read existing from Valkey (may be None if first time)
+            existing: list = []
+            if vk is not None:
+                raw_existing = await vk.get(pending_key)
+                if raw_existing is not None:
+                    existing = json.loads(raw_existing)
+            else:
+                existing = pending_store.get(state.thread_id, [])
+
             new_keys = {(c["pet_name"], c["key"]) for c in clarifications}
             kept = [p for p in existing if (p["pet_name"], p["key"]) not in new_keys]
-            pending_store[state.thread_id] = kept + clarifications
+            final_pending = kept + clarifications
 
+            # Write to Valkey (primary) + local dict (fallback)
+            if vk is not None:
+                await vk.setex(pending_key, jittered_ttl(TTL_PENDING), json.dumps(final_pending))
+            pending_store[state.thread_id] = final_pending
             state.low_confidence_fields = clarifications
         else:
             # Clear pending clarifications if high-confidence facts resolved them
-            existing = pending_store.get(state.thread_id, [])
+            existing = []
+            if vk is not None:
+                raw_existing = await vk.get(pending_key)
+                if raw_existing is not None:
+                    existing = json.loads(raw_existing)
+            else:
+                existing = pending_store.get(state.thread_id, [])
+
             if existing and high:
                 resolved_keys = set()
                 for f in high:
@@ -180,8 +249,12 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
                     resolved_keys.add((state.pets[pet_idx].name, f.key))
                 remaining = [p for p in existing if (p["pet_name"], p["key"]) not in resolved_keys]
                 if remaining:
+                    if vk is not None:
+                        await vk.setex(pending_key, jittered_ttl(TTL_PENDING), json.dumps(remaining))
                     pending_store[state.thread_id] = remaining
                 else:
+                    if vk is not None:
+                        await vk.delete(pending_key)
                     pending_store.pop(state.thread_id, None)
             state.low_confidence_fields = []
 
@@ -192,18 +265,33 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
         )
 
 
-async def _run_compaction(thread_id: str, pet_id: int, state_bag: StateBag) -> None:
+async def _run_compaction(thread_id: str, state_bag: StateBag, lock_token: str = "") -> None:
     """
     Fire-and-forget compaction task.
 
     When message count exceeds THREAD_COMPACTION_THRESHOLD, summarize older
     messages with an LLM, store the summary in threads.compaction_summary,
-    and trim the in-memory list to THREAD_CONTEXT_WINDOW recent messages.
+    and trim the in-memory + Valkey session list to THREAD_CONTEXT_WINDOW.
+
+    The compaction lock is held in Valkey (SETNX, 5-min TTL) for cross-instance
+    safety.  Released in the finally block.  If Valkey is down, falls back to
+    app.state.compaction_in_progress (single-instance fallback).
     """
+    vk = getattr(state_bag, "valkey", None)
+    lock_key = CacheKeys.compacting(thread_id)
+
     try:
         sessions = state_bag.sessions
-        # Snapshot the list so mutations during LLM call don't affect us (Addendum)
-        messages = list(sessions.get(thread_id, []))
+        # Load current session from Valkey for a consistent snapshot
+        messages: list = []
+        if vk is not None:
+            raw = await vk.get(CacheKeys.session(thread_id))
+            if raw is not None:
+                messages = json.loads(raw)
+        if not messages:
+            # Fallback to local sessions dict
+            messages = list(sessions.get(thread_id, []))
+
         if len(messages) < THREAD_COMPACTION_THRESHOLD:
             return
 
@@ -235,10 +323,26 @@ async def _run_compaction(thread_id: str, pet_id: int, state_bag: StateBag) -> N
         # LLM summarization call are not lost.
         thread_lock = state_bag.thread_locks.setdefault(thread_id, asyncio.Lock())
         async with thread_lock:
-            current = sessions.get(thread_id, [])
-            # Keep the last THREAD_CONTEXT_WINDOW messages from the CURRENT list
-            sessions[thread_id] = current[-THREAD_CONTEXT_WINDOW:]
-            trimmed = len(current) - THREAD_CONTEXT_WINDOW
+            # Re-read current session (may have grown during LLM call)
+            current: list = []
+            if vk is not None:
+                raw_current = await vk.get(CacheKeys.session(thread_id))
+                if raw_current is not None:
+                    current = json.loads(raw_current)
+            if not current:
+                current = sessions.get(thread_id, [])
+
+            trimmed_list = current[-THREAD_CONTEXT_WINDOW:]
+            trimmed = max(0, len(current) - THREAD_CONTEXT_WINDOW)
+
+            # Write trimmed session back to Valkey (primary) + local dict (fallback)
+            if vk is not None:
+                await vk.setex(
+                    CacheKeys.session(thread_id),
+                    jittered_ttl(TTL_SESSION),
+                    json.dumps(trimmed_list),
+                )
+            sessions[thread_id] = trimmed_list
 
         logger.info(
             "Compaction done — thread=%s summarized=%d trimmed=%d kept=%d",
@@ -248,4 +352,12 @@ async def _run_compaction(thread_id: str, pet_id: int, state_bag: StateBag) -> N
     except Exception as exc:
         logger.error("Compaction failed — thread=%s error=%s", thread_id, exc)
     finally:
-        state_bag.compaction_in_progress.discard(thread_id)
+        # Release the compaction lock — token-checked so a slow compaction cannot
+        # delete a lock acquired by another instance after our TTL expired.
+        if vk is not None:
+            if lock_token:
+                await vk.eval(LUA_RELEASE_LOCK, 1, lock_key, lock_token)
+            else:
+                await vk.delete(lock_key)  # fallback: no token (Valkey was down at acquire time)
+        else:
+            state_bag.compaction_in_progress.discard(thread_id)
