@@ -47,14 +47,16 @@ npm install && npm run dev
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
+| Variable | Required | Default (dev only) | Description |
 |---|---|---|---|
-| `LLM_PROVIDER` | No | `openai` | `"openai"` or `"azure"` |
+| `LLM_PROVIDER` | Yes | `openai` | `"openai"` or `"azure"` |
 | `OPENAI_API_KEY` | Yes (if openai) | — | OpenAI API key |
-| `OPENAI_MODEL_CHAT` | No | `gpt-4.1` | Model name |
+| `OPENAI_MODEL_CHAT` | Yes | `gpt-4.1` | Model name |
 | `DATABASE_URL` | Yes | — | PostgreSQL async connection string |
-| `VALKEY_URL` | No | `valkey://:valkey_dev@localhost:6379/0` | Valkey (Redis-compatible) cache |
-| `AALDA_API_URL` | No | `https://anymall-api.stagingapp.in/api/v1` | AALDA platform API |
+| `VALKEY_URL` | Yes | — | Valkey (Redis-compatible) cache URL |
+| `AALDA_API_URL` | Yes | — | AALDA platform API base URL |
+
+Dev defaults exist in `config.py` for `VALKEY_URL` and `AALDA_API_URL` so the app starts locally without extra config. **In production, all variables must be set explicitly** — do not rely on defaults.
 
 To use Azure OpenAI instead, set `LLM_PROVIDER=azure` and configure the `AZURE_OPENAI_*` variables. See `.env.example` for details.
 
