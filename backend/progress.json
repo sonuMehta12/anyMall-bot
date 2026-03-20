@@ -1,11 +1,11 @@
 {
   "project": "AnyMall-chan Backend",
   "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
-  "last_updated": "2026-03-19",
-  "state": "ft-005-valkey-complete",
+  "last_updated": "2026-03-20",
+  "state": "sprint-6-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
-  "current_focus": "Phase 3 (nightly batch jobs) + HistoryBuilder (ft-013). ft-005 Valkey complete and tested: 17/17 Valkey tests pass, 68/70 E2E tests pass (2 pre-existing LLM timeout flakes). Next: ft-013, Phase 3.",
+  "current_focus": "Sprint 6 complete + AALDA DB alignment resolved (no write-back needed) + user fields wired (display_name, language priority chain, owner_name in prompt). Next: Phase 4 (JWT auth + rate limiting).",
 
   "storage_strategy": "PostgreSQL (source of truth, Phase 1C+). Valkey (hot cache layer, ft-005 complete): all hot state (sessions, meta, pending_clarifications, active_profile, user_record, AALDA) cached with TTL. Write-through rule: DB written first, then Valkey — violation impossible by design (Valkey write in background.py after DB commit). Lua atomic append (LUA_APPEND_MESSAGES) prevents multi-instance session-list races. Distributed compaction lock via SETNX + UUID token + LUA_RELEASE_LOCK. Circuit breaker (5 failures -> 30s open -> half-open probe). TTL jitter ±10% prevents thundering herd. Graceful degradation: Valkey down -> falls back to PostgreSQL transparently. Per-thread asyncio.Lock for session mutations (C2). Per-pet asyncio.Lock for thread creation (Sprint 5). Graceful shutdown via tracked background tasks (W8).",
 
@@ -807,12 +807,46 @@
     {
       "id": "ft-013",
       "name": "HistoryBuilder — pet history narrative from fact_log",
-      "description": "New LLM-based service (app/services/history_builder.py) that reads fact_log rows for a pet and builds a chronological narrative stored as _pet_history in active_profile. Similar pattern to ThreadSummarizer. Runs in _run_background() after Aggregator writes new facts. Focus on events and changes: health events, medication changes, behavioral shifts, vet visits, and time_scope='past' facts (which the Aggregator skips but are exactly what history needs). Prompt plumbing already wired — build_pet_context() extracts _pet_history, conversation.py template has {pet_history_section}.",
-      "files": ["app/services/history_builder.py", "app/routes/chat.py", "app/services/context_builder.py"],
-      "status": "not-started",
-      "priority": "high",
-      "depends_on": [],
-      "notes": "Prompt wiring done (2026-03-16). Only the builder itself + trigger in _run_background() remain."
+      "description": "LLM-based service (app/services/history_builder.py) that reads high-confidence health facts from fact_log since last build, merges with existing _pet_history narrative, writes updated narrative back to active_profile._pet_history. Hybrid trigger: Condition A (>=3 new high-confidence facts in session) OR Condition B (>=1 fact AND >=2 sessions since last build). Conditional write: _history_last_updated NOT advanced when no health-relevant facts found. Cache invalidation: Valkey profile key deleted after every write so next request reads fresh narrative.",
+      "files": [
+        "app/services/history_builder.py",
+        "app/routes/background.py",
+        "app/db/repositories.py",
+        "app/db/models.py"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-19",
+      "test_results": "T04-T08 in test_sprint6.py all pass. _pet_history written as 789-char narrative, _history_last_updated as ISO string (not dict). Cache invalidated correctly. Pointer not advanced when no health facts.",
+      "notes": "Part of Sprint 6. 13 bugs found and fixed via code review before tests ran."
+    },
+    {
+      "id": "ft-015",
+      "name": "Sprint 6 — Background Intelligence Pipeline",
+      "description": "Six-task sprint completing the AI context pipeline. Task 1: ThreadSummarizer enhanced to two-section format (HEALTH CONTEXT: + USER STYLE:) — both sections passed to Agent 1 and parsed by RelationshipBuilder. Task 2: HistoryBuilder (see ft-013). Task 3: Closing summary nightly job — finds expired threads with no compaction_summary, runs ThreadSummarizer, writes result so RelationshipBuilder can use it. Task 4: RelationshipBuilder — reads USER STYLE sections from last 5 thread summaries per user, merges into users.relationship_summary via LLM. Task 5: APScheduler — AsyncIOScheduler cron job at 00:00 UTC running nightly jobs (graceful shutdown with wait=True). Task 6: DB write batching — FactLogRepo.append_bulk() for atomic dual-pet fact writes. Debug endpoints added: POST /debug/trigger_nightly and POST /debug/trigger_summarizer for testing without midnight wait or 50-message compaction. 13 bugs found and fixed via two-agent code review (critical: field_key->key, _history_last_updated dict, high_by_pet NameError, append_bulk atomicity; major: lazy expiry, nightly isolation, wait=False shutdown, _writer access, confidence threshold; regression: write_all deleting _history_last_updated).",
+      "files": [
+        "app/jobs/__init__.py",
+        "app/jobs/nightly.py",
+        "app/services/thread_summarizer.py",
+        "app/services/history_builder.py",
+        "app/services/relationship_builder.py",
+        "app/routes/background.py",
+        "app/routes/debug.py",
+        "app/db/repositories.py",
+        "app/db/models.py",
+        "app/main.py",
+        "app/types.py",
+        "requirements.txt",
+        "tests/test_sprint6.py",
+        "migrations/versions/1d20aafa64c5_add_composite_indexes_for_history_.py"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-19",
+      "test_results": "test_sprint6.py: 21/21 (20 PASS + 1 SKIP by design). run_e2e.py: 69/70 (1 pre-existing clarification-loop flake). test_valkey.py: 17/17.",
+      "notes": "Alembic migration 1d20aafa64c5 applied: adds ix_fact_log_pet_id_extracted_at (composite) + ix_threads_expires_at. Also fixed models.py to declare ix_threads_one_active_per_pet partial unique index to prevent Alembic from dropping it on future autogenerate."
     },
     {
       "id": "ft-014",
@@ -823,15 +857,33 @@
       "priority": "medium",
       "depends_on": ["ft-013"],
       "notes": "Per-thread asyncio.Lock (C2) is the current safety mechanism. SSE is the UX improvement on top — user sees 'compacting...' instead of a slow response. Design: SSE endpoint per thread, frontend subscribes on mount, server pushes compaction_start/compaction_done events."
+    },
+    {
+      "id": "ft-016",
+      "name": "AALDA DB alignment + user fields wiring",
+      "description": "Decided no write-back to AALDA APIs (nutrition, diet, vaccination) — context_builder.py already merges AALDA as base layer with chat-learned facts on top. Wired dormant user fields: display_name in ChatRequest (persisted to DB), 3-step language priority chain (request explicit > DB stored > auto-detect), owner_name in Agent 1 prompt (OWNER: section with sanitization). Fixed UserRepo.upsert bug (display_name missing from on_conflict_do_update). Confirmed relationship_summary IS user_context_memory — no new field needed.",
+      "files": [
+        "app/routes/chat.py",
+        "app/db/repositories.py",
+        "app/agents/conversation.py",
+        "design-docs/aalda-writeback-design.md",
+        "design-docs/aalda-db-alignment-questions.md"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-20",
+      "test_results": "No regressions. 66/70 E2E (4 pre-existing: 2 LLM flakes, 1 AALDA data, 1 clarification-loop). 20/21 Sprint 6 (1 Valkey connectivity). 14/17 Valkey (3 Valkey connectivity — not related to changes).",
+      "notes": "No Alembic migration needed — display_name and preferred_language columns already existed from W18. Backward compatible (display_name defaults to empty, language defaults to auto)."
     }
   ],
 
   "summary": {
-    "total_features": 70,
-    "complete": 68,
+    "total_features": 78,
+    "complete": 76,
     "in_progress": 0,
     "blocked": 0,
-    "not_started": 5,
-    "note": "Phase 0-2 + API v1 + Sprint 2-5 + ft-005 (Valkey) complete. All review debt resolved. ft-002 complete (deprecated files deleted). 17/17 Valkey tests pass. 68/70 E2E tests pass (2 pre-existing LLM timeout flakes). Next: ft-013 (HistoryBuilder), Phase 3 (nightly batch jobs)."
+    "not_started": 4,
+    "note": "Phase 0-2 + API v1 + Sprint 2-6 + ft-005 (Valkey) + ft-013 (HistoryBuilder) + ft-015 (Sprint 6 pipeline) + ft-016 (AALDA alignment + user fields) complete. AALDA write-back decided unnecessary. User fields wired (display_name, language priority, owner_name). Next: Phase 4 (JWT auth + rate limiting)."
   }
 }

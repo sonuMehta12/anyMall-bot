@@ -13,7 +13,7 @@
 #   8.  User record cache          — am:user:{user_code} written after /chat
 #   9.  session_count per thread   — session_count increments once per thread, not per message
 #  10.  AALDA cache                — am:aalda:{user_code}:{pet_id} written after /chat
-#  11.  AALDA stale cache          — am:aalda-stale:* written for fallback
+#  11.  No stale AALDA cache       — am:aalda-stale:* must NOT exist (AALDA is sole source)
 #  12.  Pending clarifications     — am:pending:{tid} written when low-conf facts found
 #  13.  Meta cache                 — am:meta:{tid} written + gap counter present
 #  14.  Thread expiry cleanup      — old thread keys deleted from Valkey when thread expires
@@ -478,9 +478,9 @@ def test_10_aalda_cache() -> bool:
         return failed(label, str(exc))
 
 
-def test_11_aalda_stale_cache() -> bool:
-    """am:aalda-stale:{user_code}:{pet_id} is written as fallback key."""
-    label = "T11 AALDA stale fallback key written"
+def test_11_no_stale_aalda_cache() -> bool:
+    """am:aalda-stale:* must NOT exist — AALDA is the sole source of truth."""
+    label = "T11 no stale AALDA fallback key"
     try:
         pet_id = TEST_PET_IDS[0]
         stale_key = f"am:aalda-stale:{TEST_USER_CODE}:{pet_id}"
@@ -489,18 +489,10 @@ def test_11_aalda_stale_cache() -> bool:
         post_chat("Tell me about Luna", sid)
 
         raw = vk.get(stale_key)
-        if raw is None:
-            return failed(label, f"{stale_key} missing — stale fallback not written")
+        if raw is not None:
+            return failed(label, f"{stale_key} exists — stale fallback should not be written")
 
-        ttl = vk.ttl(stale_key)
-        if ttl <= 0:
-            return failed(label, "stale key has no TTL")
-
-        # Stale key TTL should be much longer than fresh key (7200s base vs 300s)
-        if ttl < 3000:
-            return failed(label, f"stale key TTL={ttl}s is too short (expected ~7200s)")
-
-        return passed(label, f"TTL={ttl}s")
+        return passed(label, "no stale key found (correct)")
     except Exception as exc:
         return failed(label, str(exc))
 
@@ -749,7 +741,7 @@ TESTS = [
     test_08_user_record_cached,
     test_09_session_count_per_thread,
     test_10_aalda_cache,
-    test_11_aalda_stale_cache,
+    test_11_no_stale_aalda_cache,
     test_12_meta_cache,
     test_13_no_bare_ttl_constants,
     test_14_thread_expiry_cleanup,

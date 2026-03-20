@@ -76,6 +76,11 @@ If replying in Japanese:
 
 ---
 
+OWNER:
+{owner_section}
+
+---
+
 PET DATA:
 PET A:
 {pet_info_a}
@@ -427,6 +432,7 @@ class ConversationAgent:
         language_str: str = "EN",
         conversation_summary: str = "",
         pending_clarifications: list[dict] | None = None,
+        owner_name: str = "",
     ) -> AgentResponse:
         """
         Process one user message and return an AgentResponse.
@@ -444,6 +450,7 @@ class ConversationAgent:
             conversation_summary:    Phase 2: compaction summary from thread.
             pending_clarifications:  Low-confidence facts from previous turn to confirm.
                                      List of {"pet_name", "key", "value", "source_quote"} dicts.
+            owner_name:              Owner's display name from Flutter (empty if unknown).
         """
         pet_name_a = pet_a_context["active_profile"].get("name", {}).get("value", "your pet")
 
@@ -464,6 +471,7 @@ class ConversationAgent:
             conversation_summary=conversation_summary,
             session_messages=session_messages,
             pending_clarifications=pending_clarifications,
+            owner_name=owner_name,
         )
 
         # Append the current message to history before sending to LLM
@@ -534,6 +542,7 @@ class ConversationAgent:
         conversation_summary: str = "",
         session_messages: list[dict] | None = None,
         pending_clarifications: list[dict] | None = None,
+        owner_name: str = "",
     ) -> str:
         """Fill in SYSTEM_PROMPT_TEMPLATE with the current context."""
         active_a = pet_a_context["active_profile"]
@@ -637,6 +646,17 @@ class ConversationAgent:
                 "Ask as a gentle follow-up, not a data request. ONE clarification per message.\n\n"
             )
 
+        # ── Owner section ────────────────────────────────────────────────────
+        if owner_name:
+            safe_owner = self._sanitize_for_prompt(owner_name)
+            owner_section = (
+                f"Owner's name: {safe_owner}. "
+                f"Use it naturally (e.g. \"{safe_owner}-san\" in JA) when it fits. "
+                "Do not overuse it."
+            )
+        else:
+            owner_section = "Owner's name is unknown. Do not guess or ask for it."
+
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             pet_name_a=pet_name_a,
             pet_suffix_a=pet_suffix_a,
@@ -656,6 +676,7 @@ class ConversationAgent:
             last_answer=last_answer,
             conversation_summary_section=conversation_summary_section,
             clarification_section=clarification_section,
+            owner_section=owner_section,
             max_questions_per_message=MAX_QUESTIONS_PER_MESSAGE,
             max_questions_per_session=MAX_QUESTIONS_PER_SESSION,
         )

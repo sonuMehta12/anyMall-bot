@@ -26,7 +26,6 @@ TTL_META = 7200         # same as session — meta dies when session dies
 TTL_PENDING = 7200      # same as session — pending clari dies when session dies
 TTL_PROFILE = 3600      # 1h — refreshed by Aggregator on every fact merge
 TTL_AALDA = 300         # 5min — matches current PetFetcher CACHE_TTL_SECONDS
-TTL_AALDA_STALE = 7200  # 2h stale-cache fallback (refreshed on every fresh fetch)
 TTL_USER = 7200         # 2h — matches session lifetime, refreshed on upsert
 TTL_HEALTH = 60         # 60s — checks Azure at most once per minute
 TTL_COMPACTING = 300    # 5min safety net — auto-cleanup if compaction task dies
@@ -131,11 +130,6 @@ class CacheKeys:
     def aalda(user_code: str, pet_id: int) -> str:
         """Fresh AALDA API result for this user+pet (5-min TTL)."""
         return f"am:aalda:{user_code}:{pet_id}"
-
-    @staticmethod
-    def aalda_stale(user_code: str, pet_id: int) -> str:
-        """Last known-good AALDA result — used as fallback when API is unreachable."""
-        return f"am:aalda-stale:{user_code}:{pet_id}"
 
     @staticmethod
     def user(user_code: str) -> str:

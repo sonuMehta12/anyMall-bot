@@ -3,9 +3,10 @@
 # Fire-and-forget background tasks extracted from chat.py.
 #
 # What lives here:
-#   - _create_tracked_task()  — registers async tasks for graceful shutdown
-#   - _run_background()       — Compressor + Aggregator pipeline, message persistence
-#   - _run_compaction()       — LLM summarization when messages exceed threshold
+#   - _create_tracked_task()          — registers async tasks for graceful shutdown
+#   - _run_background()               — Compressor + Aggregator pipeline, message persistence
+#   - _run_compaction()               — LLM summarization when messages exceed threshold
+#   - _maybe_run_history_builder()    — HistoryBuilder hybrid trigger (ft-013)
 #
 # These run AFTER the HTTP response is sent — the user never waits.
 # All exceptions are caught and logged, never propagated.
@@ -149,6 +150,11 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
             for f in facts:
                 facts_by_pet.setdefault(f.pet_label, []).append(f)
 
+            # Build all (facts_list, pet_id) pairs then write atomically in one commit.
+            # append_bulk() does a single add_all + commit across all pets so a failure
+            # on Pet B cannot leave Pet A's facts committed while Pet B's are silently lost.
+            extracted_at = datetime.now(timezone.utc).isoformat()
+            all_to_log: list[tuple[list, int]] = []
             for label, pet_facts in facts_by_pet.items():
                 if label not in pet_id_map:
                     logger.warning("Unknown pet_label %r from Compressor — defaulting to Pet A (session=%s)", label, state.session_id)
@@ -157,14 +163,16 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
                     {
                         **dataclasses.asdict(f),
                         "needs_clarification": f.confidence <= 0.70,
-                        "extracted_at": datetime.now(timezone.utc).isoformat(),
+                        "extracted_at": extracted_at,
                         "session_id": state.session_id,
                     }
                     for f in pet_facts
                 ]
-                async with get_session() as db_session:
-                    repo = FactLogRepo(db_session)
-                    await repo.append(to_log, pet_id=target_pet_id)
+                all_to_log.append((to_log, target_pet_id))
+
+            async with get_session() as db_session:
+                repo = FactLogRepo(db_session)
+                await repo.append_bulk(all_to_log, user_code=state.user_code)
 
         logger.info(
             "Compressor done — session=%s extracted=%d high=%d low=%d dual=%s",
@@ -172,11 +180,13 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
         )
 
         # ── Aggregator — merge high-confidence facts per pet (parallel) ──
+        # high_by_pet is built unconditionally so the HistoryBuilder block below
+        # can reference it even when aggregator is None.
+        high_by_pet: dict[str, list] = {}
+        for f in high:
+            high_by_pet.setdefault(f.pet_label, []).append(f)
+
         if high and aggregator is not None:
-            # Group high-confidence facts by pet_label
-            high_by_pet: dict[str, list] = {}
-            for f in high:
-                high_by_pet.setdefault(f.pet_label, []).append(f)
 
             async def _aggregate_one_pet(label: str, pet_facts: list) -> None:
                 target_pet_id = pet_id_map.get(label, state.pets[0].id)
@@ -191,12 +201,27 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
                     async with get_session() as db_session:
                         ap_repo = ActiveProfileRepo(db_session)
                         current_profile = await ap_repo.read_all(target_pet_id) or {}
-                await aggregator.run(pet_facts, state.session_id, current_profile, pet_id=target_pet_id)
+                await aggregator.run(pet_facts, state.session_id, current_profile, pet_id=target_pet_id, user_code=state.user_code)
 
             await asyncio.gather(*[
                 _aggregate_one_pet(label, pet_facts)
                 for label, pet_facts in high_by_pet.items()
             ])
+
+        # ── HistoryBuilder — rebuild pet history narrative (ft-013) ──────
+        # Runs after Aggregator so both pipelines use the same high-confidence facts.
+        # Each pet wrapped in its own try/except — a HistoryBuilder failure must NOT
+        # propagate to the outer except and skip the low-confidence persistence below.
+        if high:
+            for label, pet_facts in high_by_pet.items():
+                target_pet_id = pet_id_map.get(label, state.pets[0].id)
+                try:
+                    await _maybe_run_history_builder(target_pet_id, pet_facts, state_bag, user_code=state.user_code)
+                except Exception as hb_exc:
+                    logger.error(
+                        "HistoryBuilder failed — pet_id=%s session=%s error=%s",
+                        target_pet_id, state.session_id, hb_exc,
+                    )
 
         # ── Persist low-confidence facts for clarification next turn ─────
         # (ft-005, Step 5): Write to Valkey; fall back to local dict when Valkey down.
@@ -263,6 +288,100 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
             "Background pipeline failed — session=%s error=%s",
             state.session_id, exc,
         )
+
+
+async def _maybe_run_history_builder(
+    pet_id: int,
+    new_high_facts: list,
+    state_bag: StateBag,
+    user_code: str = "",
+) -> None:
+    """
+    Hybrid trigger for HistoryBuilder (ft-013).
+
+    Runs HistoryBuilder if EITHER condition is met:
+      A) >= 3 new high-confidence facts in this session (significant new info)
+      B) >= 1 new fact AND >= 2 distinct sessions have passed since last build
+         (gradual accumulation across sessions)
+
+    After build, writes new narrative to active_profile and invalidates
+    the Valkey profile cache so the next request sees fresh _pet_history.
+    """
+    history_builder = getattr(state_bag, "history_builder", None)
+    if history_builder is None:
+        return
+
+    new_facts_count = len(new_high_facts)
+    if new_facts_count == 0:
+        return
+
+    # ── Read _history_last_updated from active_profile ───────────────────
+    async with get_session() as db_session:
+        ap_repo = ActiveProfileRepo(db_session)
+        profile = await ap_repo.read_all(pet_id) or {}
+
+    last_updated = profile.get("_history_last_updated", "") or ""
+    existing_history = profile.get("_pet_history", "") or ""
+    if isinstance(existing_history, dict):
+        # _pet_history stored as dict entry in old format — extract value
+        existing_history = existing_history.get("value", "") or ""
+
+    # ── Count sessions since last build ──────────────────────────────────
+    sessions_since_build = 0
+    if last_updated:
+        async with get_session() as db_session:
+            fact_repo = FactLogRepo(db_session)
+            sessions_since_build = await fact_repo.count_distinct_sessions_since(
+                pet_id, last_updated,
+            )
+
+    # ── Hybrid trigger logic ─────────────────────────────────────────────
+    should_run = (
+        new_facts_count >= 3                                        # Condition A
+        or (new_facts_count >= 1 and sessions_since_build >= 2)    # Condition B
+    )
+    if not should_run:
+        logger.debug(
+            "HistoryBuilder skipped — pet_id=%s new_facts=%d sessions_since=%d",
+            pet_id, new_facts_count, sessions_since_build,
+        )
+        return
+
+    # ── Fetch all new facts from fact_log since last build ───────────────
+    since = last_updated or "1970-01-01T00:00:00+00:00"
+    async with get_session() as db_session:
+        fact_repo = FactLogRepo(db_session)
+        all_new_facts = await fact_repo.read_since(pet_id, since)
+
+    # ── Build updated history narrative ──────────────────────────────────
+    new_history = await history_builder.build(pet_id, all_new_facts, existing_history)
+
+    # Only persist if the narrative actually changed.
+    # build() returns existing_history unchanged when no health-relevant facts were found.
+    # Advancing _history_last_updated when nothing changed would permanently skip those
+    # facts on the next run — they'd fall before the new last_updated pointer.
+    if new_history == existing_history:
+        logger.debug(
+            "HistoryBuilder: narrative unchanged — skipping write (pet_id=%s)", pet_id,
+        )
+        return
+
+    # ── Persist to active_profile ─────────────────────────────────────────
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with get_session() as db_session:
+        ap_repo = ActiveProfileRepo(db_session)
+        await ap_repo.write_history(pet_id, new_history, now_iso, user_code=user_code)
+
+    # ── Invalidate Valkey profile cache ───────────────────────────────────
+    # Next request will miss the cache and reload fresh _pet_history from DB.
+    vk = getattr(state_bag, "valkey", None)
+    if vk is not None:
+        await vk.delete(CacheKeys.profile(pet_id))
+
+    logger.info(
+        "HistoryBuilder complete — pet_id=%s new_facts=%d sessions_since_last=%d",
+        pet_id, len(all_new_facts), sessions_since_build,
+    )
 
 
 async def _run_compaction(thread_id: str, state_bag: StateBag, lock_token: str = "") -> None:

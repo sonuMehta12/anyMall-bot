@@ -50,6 +50,7 @@ class AgentState:
     # ── Set at request start — never modified ────────────────────────────────
     session_id: str
     thread_id: str     # Phase 2 — backend's thread UUID for DB writes
+    user_code: str     # X-User-Code — threaded to all DB writes in background pipeline
     user_message: str
     pets: list[PetInfo]  # index 0 = Pet A (always), index 1 = Pet B (if dual-pet)
 

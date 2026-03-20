@@ -21,17 +21,29 @@ logger = logging.getLogger(__name__)
 
 SUMMARIZER_SYSTEM_PROMPT = """You are a conversation summarizer for a pet companion chat application.
 
-Your job is to summarize a conversation between a pet owner and a friendly AI assistant.
+Summarize the conversation into EXACTLY two labeled sections:
 
-Focus on:
-- Key pet facts mentioned (health, diet, behavior, symptoms)
-- Emotional context (owner's mood, concerns, anxieties)
+HEALTH CONTEXT:
+Summarize key pet health information (3-4 sentences):
+- Health events, diagnoses, symptoms, medications, vet visits
+- Diet or weight changes and their context
 - Action items or advice given
-- Questions that were asked and answered
 - Any unresolved concerns
+If a previous summary is provided, incorporate its HEALTH CONTEXT into your new summary.
 
-Keep the summary concise (3-5 sentences). Write in plain text, no bullet points or formatting.
-If a previous summary is provided, incorporate its key points into the new summary so nothing is lost."""
+USER STYLE:
+Summarize the owner's communication style (1-2 sentences):
+- Anxiety level: calm / mildly anxious / frequently anxious
+- Preferred detail level: brief answers vs detailed explanations
+- Question patterns: follow-up count and type
+- Emotional tone: worried, curious, practical, etc.
+
+Output format — use these exact labels, nothing else before HEALTH CONTEXT:
+HEALTH CONTEXT:
+[your health summary here]
+
+USER STYLE:
+[your style observation here]"""
 
 
 class ThreadSummarizer:
@@ -76,7 +88,7 @@ class ThreadSummarizer:
             system_prompt=SUMMARIZER_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
             temperature=0.0,
-            max_tokens=400,
+            max_tokens=500,  # two-section format needs slightly more room than single-section
         )
 
         logger.info(

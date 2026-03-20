@@ -103,8 +103,8 @@ AnyMall-chat/
 │   │   │   └── thread_summarizer.py  # LLM summarization for thread compaction
 │   │   ├── db/
 │   │   │   ├── session.py            # Async engine + session factory
-│   │   │   ├── models.py             # ORM: Pet, User, ActiveProfile, FactLog, Thread, ThreadMessage
-│   │   │   └── repositories.py       # PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
+│   │   │   ├── models.py             # ORM: User, ActiveProfile, FactLog, Thread, ThreadMessage
+│   │   │   └── repositories.py       # UserRepo, ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
 │   │   ├── llm/
 │   │   │   ├── base.py              # Abstract LLMProvider
 │   │   │   ├── azure_openai.py      # Azure OpenAI implementation
@@ -130,7 +130,6 @@ AnyMall-chat/
 
 | Table | Purpose |
 |-------|---------|
-| `pets` | Pet identity (name, species, breed) from AALDA |
 | `users` | Owner relationship data |
 | `active_profile` | Current best-known facts per field with confidence |
 | `fact_log` | Append-only audit trail of every extracted fact |

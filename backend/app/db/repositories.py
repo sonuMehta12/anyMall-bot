@@ -12,67 +12,22 @@
 # The lifespan or get_session() creates the session, passes it down.
 # Repositories never create their own sessions.
 #
-# Phase 1C repos: PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo
+# Phase 1C repos: UserRepo, ActiveProfileRepo, FactLogRepo
 # Phase 2 repos:  ThreadRepo, ThreadMessageRepo
 
 import logging
+from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import or_, select, delete
+from sqlalchemy import func, or_, select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db.models import (
-    Pet, User, ActiveProfile, FactLog, Thread, ThreadMessage,
+    User, ActiveProfile, FactLog, Thread, ThreadMessage,
 )
 from app.types import ActiveProfileEntry
 
 logger = logging.getLogger(__name__)
-
-
-# ── PetRepo ──────────────────────────────────────────────────────────────────
-
-class PetRepo:
-    """Read/write pet_profile data (the `pets` table)."""
-
-    def __init__(self, session: AsyncSession) -> None:
-        self._session = session
-
-    async def read(self, pet_id: int) -> dict | None:
-        """Read a pet profile by pet_id.  Returns dict or None if not found."""
-        stmt = select(Pet).where(Pet.pet_id == pet_id)
-        result = await self._session.execute(stmt)
-        pet = result.scalar_one_or_none()
-        return pet.to_dict() if pet else None
-
-    async def upsert(self, data: dict) -> None:
-        """
-        Insert or update a pet profile.
-
-        Uses PostgreSQL's ON CONFLICT DO UPDATE so this works whether
-        the pet exists or not — no need to check first.
-        """
-        stmt = pg_insert(Pet).values(
-            pet_id=data["pet_id"],
-            name=data["name"],
-            species=data.get("species", "dog"),
-            breed=data.get("breed", "unknown"),
-            date_of_birth=data.get("date_of_birth", "unknown"),
-            sex=data.get("sex", "unknown"),
-            life_stage=data.get("life_stage", "adult"),
-        )
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["pet_id"],
-            set_={
-                "name": stmt.excluded.name,
-                "species": stmt.excluded.species,
-                "breed": stmt.excluded.breed,
-                "date_of_birth": stmt.excluded.date_of_birth,
-                "sex": stmt.excluded.sex,
-                "life_stage": stmt.excluded.life_stage,
-            },
-        )
-        await self._session.execute(stmt)
-        await self._session.commit()
 
 
 # ── UserRepo ─────────────────────────────────────────────────────────────────
@@ -90,6 +45,33 @@ class UserRepo:
         user = result.scalar_one_or_none()
         return user.to_dict() if user else None
 
+    async def update_relationship_summary(self, user_code: str, summary: str) -> None:
+        """
+        Targeted write of relationship_summary for a user.
+
+        Called by RelationshipBuilder (via UserProfileWriter Protocol) after
+        the nightly job builds a new summary from USER STYLE sections.
+
+        Uses a targeted UPDATE rather than full upsert to avoid touching other
+        user fields (session_count, preferred_language, etc.).
+        """
+        from sqlalchemy import update as sql_update
+        now = datetime.now(timezone.utc).isoformat()
+        stmt = (
+            sql_update(User)
+            .where(User.user_code == user_code)
+            .values(relationship_summary=summary, updated_at=now)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.commit()
+        if result.rowcount == 0:
+            logger.warning(
+                "users: update_relationship_summary matched 0 rows — user_code=%s not found",
+                user_code,
+            )
+        else:
+            logger.debug("users: updated relationship_summary for user_code=%s", user_code)
+
     async def upsert(self, data: dict) -> None:
         """Insert or update a user record.  Auto-called on every chat request."""
         stmt = pg_insert(User).values(
@@ -104,6 +86,7 @@ class UserRepo:
         stmt = stmt.on_conflict_do_update(
             index_elements=["user_code"],
             set_={
+                "display_name": stmt.excluded.display_name,
                 "session_count": stmt.excluded.session_count,
                 "relationship_summary": stmt.excluded.relationship_summary,
                 "preferred_language": stmt.excluded.preferred_language,
@@ -153,7 +136,7 @@ class ActiveProfileRepo:
 
         return profile
 
-    async def write_all(self, pet_id: int, profile_dict: dict[str, ActiveProfileEntry | str]) -> None:
+    async def write_all(self, pet_id: int, profile_dict: dict[str, ActiveProfileEntry | str], user_code: str = "") -> None:
         """
         Write the entire active_profile dict to the database.
 
@@ -181,10 +164,14 @@ class ActiveProfileRepo:
         rows: list[ActiveProfile] = []
         skipped = 0
         for field_key, entry in profile_dict.items():
-            if field_key == "_pet_history":
-                # _pet_history is a raw string, not a dict.
+            if field_key in ("_pet_history", "_history_last_updated"):
+                # These are stored as plain strings (not metadata dicts).
+                # _pet_history: narrative text.  _history_last_updated: ISO timestamp.
+                # Both must be preserved through every write_all() so the HistoryBuilder
+                # pointer is not erased each time the Aggregator runs.
                 rows.append(ActiveProfile(
                     pet_id=pet_id,
+                    user_code=user_code,
                     field_key=field_key,
                     value=entry if isinstance(entry, str) else str(entry),
                 ))
@@ -192,6 +179,7 @@ class ActiveProfileRepo:
                 # Regular fact entry with metadata.
                 rows.append(ActiveProfile(
                     pet_id=pet_id,
+                    user_code=user_code,
                     field_key=field_key,
                     value=str(entry.get("value", "")),
                     confidence=entry.get("confidence"),
@@ -213,7 +201,8 @@ class ActiveProfileRepo:
         self._session.add_all(rows)
         await self._session.commit()
 
-        fact_count = sum(1 for r in rows if r.field_key != "_pet_history")
+        _internal_keys = {"_pet_history", "_history_last_updated"}
+        fact_count = sum(1 for r in rows if r.field_key not in _internal_keys)
         has_history = any(r.field_key == "_pet_history" for r in rows)
         logger.debug(
             "active_profile: wrote %d fact entries%s for pet_id=%s (skipped %d)",
@@ -221,6 +210,37 @@ class ActiveProfileRepo:
             " + _pet_history" if has_history else "",
             pet_id,
             skipped,
+        )
+
+
+    async def write_history(self, pet_id: int, history: str, last_updated: str, user_code: str = "") -> None:
+        """
+        Upsert the _pet_history and _history_last_updated rows for a pet.
+
+        Called by HistoryBuilder after generating a new narrative. Uses
+        ON CONFLICT DO UPDATE so the rows are created on first call and
+        overwritten on every subsequent call.
+        """
+        for field_key, value in (
+            ("_pet_history", history),
+            ("_history_last_updated", last_updated),
+        ):
+            stmt = pg_insert(ActiveProfile).values(
+                pet_id=pet_id,
+                user_code=user_code,
+                field_key=field_key,
+                value=value,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["pet_id", "field_key"],
+                set_={"value": stmt.excluded.value, "user_code": stmt.excluded.user_code},
+            )
+            await self._session.execute(stmt)
+
+        await self._session.commit()
+        logger.debug(
+            "active_profile: wrote _pet_history + _history_last_updated for pet_id=%s",
+            pet_id,
         )
 
 
@@ -236,7 +256,7 @@ class FactLogRepo:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def append(self, facts: list[dict], pet_id: int) -> None:
+    async def append(self, facts: list[dict], pet_id: int, user_code: str = "") -> None:
         """
         Append a list of fact dicts to the fact_log table.
 
@@ -251,6 +271,7 @@ class FactLogRepo:
         rows = [
             FactLog(
                 pet_id=pet_id,
+                user_code=user_code,
                 session_id=fact.get("session_id", ""),
                 field_key=fact.get("key", ""),
                 value=str(fact.get("value", "")),
@@ -269,6 +290,47 @@ class FactLogRepo:
         self._session.add_all(rows)
         await self._session.commit()
         logger.debug("fact_log: appended %d facts for pet_id=%s", len(rows), pet_id)
+
+    async def append_bulk(self, facts_with_pets: list[tuple[list[dict], int]], user_code: str = "") -> None:
+        """
+        Append facts for multiple pets in a single atomic commit.
+
+        Used by Task 6 batching in background.py to ensure dual-pet fact writes
+        are all-or-nothing. Unlike append(), this method does NOT commit after each
+        pet — one commit covers all pets, so a failure on Pet B cannot leave Pet A's
+        facts permanently written while Pet B's are silently lost.
+
+        Args:
+            facts_with_pets: List of (facts_list, pet_id) tuples, one per pet.
+        """
+        all_rows: list[FactLog] = []
+        for facts, pet_id in facts_with_pets:
+            all_rows.extend([
+                FactLog(
+                    pet_id=pet_id,
+                    user_code=user_code,
+                    session_id=fact.get("session_id", ""),
+                    field_key=fact.get("key", ""),
+                    value=str(fact.get("value", "")),
+                    confidence=float(fact.get("confidence", 0.0)),
+                    source_rank=fact.get("source_rank", "explicit_owner"),
+                    time_scope=fact.get("time_scope", "current"),
+                    uncertainty=fact.get("uncertainty", ""),
+                    source_quote=fact.get("source_quote", ""),
+                    timestamp=fact.get("timestamp"),
+                    needs_clarification=bool(fact.get("needs_clarification", False)),
+                    pet_label=fact.get("pet_label", "pet_a"),
+                    extracted_at=fact.get("extracted_at", ""),
+                )
+                for fact in facts
+            ])
+        if all_rows:
+            self._session.add_all(all_rows)
+            await self._session.commit()
+            logger.debug(
+                "fact_log: bulk appended %d facts across %d pet(s)",
+                len(all_rows), len(facts_with_pets),
+            )
 
     async def read_recent(
         self,
@@ -298,6 +360,67 @@ class FactLogRepo:
         rows = result.scalars().all()
 
         return [row.to_dict() for row in rows]
+
+
+    async def read_since(
+        self,
+        pet_id: int,
+        since: str,
+        confidence_floor: float = 0.70,
+    ) -> list[dict]:
+        """
+        Read high-confidence facts extracted after a given timestamp.
+
+        Used by HistoryBuilder to fetch only the facts that are new since
+        the last history build (pointed to by _history_last_updated).
+
+        Args:
+            pet_id: Filter by pet.
+            since: ISO timestamp string — return facts extracted after this time.
+            confidence_floor: Exclusive lower bound (default 0.70 — matches pipeline
+                              definition of "high": confidence > 0.70).
+
+        Returns list of fact dicts ordered oldest-first (for chronological narrative).
+        """
+        stmt = (
+            select(FactLog)
+            .where(
+                FactLog.pet_id == pet_id,
+                FactLog.extracted_at > since,
+                # Strictly > to match the pipeline's "high" definition (background.py: > 0.70).
+                # Using >= would include exactly-0.70 facts which are classified as "low"
+                # (pending clarification) — wrong to bake unconfirmed facts into history.
+                FactLog.confidence > confidence_floor,
+            )
+            .order_by(FactLog.extracted_at.asc())
+        )
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
+        return [row.to_dict() for row in rows]
+
+    async def count_distinct_sessions_since(self, pet_id: int, since: str) -> int:
+        """
+        Count distinct session_ids in fact_log after a given timestamp.
+
+        Used by HistoryBuilder hybrid trigger — Condition B fires when
+        >= 2 sessions have passed since the last history build.
+        fact_log already has session_id on every row, so no separate counter needed.
+
+        Args:
+            pet_id: Filter by pet.
+            since: ISO timestamp string — count sessions with activity after this time.
+
+        Returns count of distinct session_id values.
+        """
+        stmt = (
+            select(func.count(func.distinct(FactLog.session_id)))
+            .where(
+                FactLog.pet_id == pet_id,
+                FactLog.extracted_at > since,
+            )
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar() or 0
 
 
 # ── ThreadRepo ────────────────────────────────────────────────────────────────
@@ -417,6 +540,96 @@ class ThreadRepo:
                 thread_id, compacted_before_id,
             )
 
+    async def get_expired_unsummarized(self, hours_back: int = 48) -> list[dict]:
+        """
+        Find threads that have passed their expiry time and have no compaction_summary.
+
+        These are threads that ended before hitting THREAD_COMPACTION_THRESHOLD
+        (50 messages), so _run_compaction() was never triggered. The nightly
+        closing-summary job uses this to backfill them.
+
+        Does NOT filter on status == 'expired' because threads are only marked
+        expired lazily on the next chat request. A thread whose expires_at has
+        passed but whose user never returned stays status='active' indefinitely.
+
+        Args:
+            hours_back: Look back this many hours (default 48 — covers last two nights).
+
+        Returns list of thread dicts.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+        stmt = (
+            select(Thread)
+            .where(
+                Thread.compaction_summary.is_(None),
+                # Thread has actually passed its expiry time (not necessarily status='expired')
+                Thread.expires_at <= now,
+                # But only look back hours_back hours — ignore ancient threads
+                Thread.expires_at > cutoff,
+            )
+            .order_by(Thread.expires_at.desc())
+        )
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
+        return [row.to_dict() for row in rows]
+
+    async def get_recent_for_user(self, user_code: str, limit: int = 5) -> list[dict]:
+        """
+        Get the most recent threads with a compaction_summary for a user.
+
+        Used by RelationshipBuilder to read USER STYLE sections from
+        recent conversations and build users.relationship_summary.
+
+        Args:
+            user_code: The user to query (matches threads.user_id).
+            limit: Max threads to return (default 5 — last 5 conversations).
+
+        Returns list of thread dicts, newest first.
+        """
+        stmt = (
+            select(Thread)
+            .where(
+                Thread.user_id == user_code,
+                Thread.compaction_summary.isnot(None),
+            )
+            .order_by(Thread.started_at.desc())
+            .limit(limit)
+        )
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
+        return [row.to_dict() for row in rows]
+
+    async def get_expired_with_summary_since(self, hours_back: int = 24) -> list[dict]:
+        """
+        Find threads that passed their expiry time in the last `hours_back` hours
+        AND have a compaction_summary.
+
+        Used by the nightly RelationshipBuilder job to find users who had
+        activity since the last run — avoids scanning the entire threads table.
+
+        Does NOT filter on status == 'expired' — see get_expired_unsummarized docstring
+        for the lazy-expiry reasoning.
+
+        Args:
+            hours_back: Look back this many hours (default 24 — since last midnight).
+
+        Returns list of thread dicts (deduplicate user_ids in the caller).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+        stmt = (
+            select(Thread)
+            .where(
+                Thread.compaction_summary.isnot(None),
+                Thread.expires_at <= now,
+                Thread.expires_at > cutoff,
+            )
+        )
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
+        return [row.to_dict() for row in rows]
+
     async def get_latest_expired(self, pet_id: int) -> dict | None:
         """
         Get the most recently started expired thread for a pet.
@@ -530,7 +743,6 @@ class ThreadMessageRepo:
         Returns the id of the message just before the 'keep_count' most recent
         messages. Returns None if not enough messages to compact.
         """
-        from sqlalchemy import func
         count_stmt = (
             select(func.count())
             .select_from(ThreadMessage)

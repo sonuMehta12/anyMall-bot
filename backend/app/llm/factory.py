@@ -65,18 +65,17 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
             deployment=settings.azure_openai_deployment_chat,
         )
 
-    # ── Future providers ───────────────────────────────────────────────────────
-    # elif provider_name == "openai":
-    #     from app.llm.openai import OpenAIProvider
-    #     if not settings.openai_api_key:
-    #         raise ValueError("LLM_PROVIDER=openai requires OPENAI_API_KEY")
-    #     return OpenAIProvider(
-    #         api_key=settings.openai_api_key,
-    #         model=settings.openai_model_chat,
-    #     )
+    elif provider_name == "openai":
+        from app.llm.openai_provider import OpenAIProvider
+        if not settings.openai_api_key:
+            raise ValueError("LLM_PROVIDER=openai requires OPENAI_API_KEY")
+        return OpenAIProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model_chat,
+        )
 
     else:
         raise ValueError(
             f"Unknown LLM_PROVIDER: {provider_name!r}. "
-            f"Valid values: 'azure'."
+            f"Valid values: 'azure', 'openai'."
         )

@@ -104,6 +104,7 @@ class AggregatorAgent:
         session_id: str,
         active_profile: dict[str, ActiveProfileEntry] | None = None,
         pet_id: int | None = None,
+        user_code: str = "",
     ) -> dict[str, ActiveProfileEntry]:
         """
         Merge a list of high-confidence facts into active_profile.
@@ -139,7 +140,7 @@ class AggregatorAgent:
                 # Always write to PostgreSQL first (source of truth)
                 async with self._get_session() as session:
                     repo = ActiveProfileRepo(session)
-                    await repo.write_all(pet_id, profile)
+                    await repo.write_all(pet_id, profile, user_code=user_code)
 
                 # Write-through to Valkey after DB succeeds (ft-005, Step 6)
                 # DB first, then cache — so a crash between the two writes

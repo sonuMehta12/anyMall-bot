@@ -31,6 +31,7 @@ from typing import Any
 
 # ── Third-party ────────────────────────────────────────────────────────────────
 import valkey.asyncio as valkey_lib
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,8 +50,11 @@ from app.agents.compressor import CompressorAgent
 from app.agents.aggregator import AggregatorAgent
 from app.services.pet_fetcher import PetFetcher
 from app.db.session import init_db, dispose_engine, get_session
-from app.db.repositories import PetRepo, ThreadRepo, ThreadMessageRepo
+from app.db.repositories import UserRepo, ThreadRepo, ThreadMessageRepo
 from app.services.thread_summarizer import ThreadSummarizer
+from app.services.history_builder import HistoryBuilder
+from app.services.relationship_builder import RelationshipBuilder
+from app.jobs.nightly import run_nightly_jobs
 
 # ── Route modules ─────────────────────────────────────────────────────────────
 from app.routes.chat import router as chat_router
@@ -121,20 +125,17 @@ async def lifespan(app: FastAPI):
             settings.valkey_url,
         )
 
+    # ── APScheduler — nightly maintenance jobs (Sprint 6) ────────────────
+    # AsyncIOScheduler runs jobs inside the existing asyncio event loop —
+    # no threads needed. Jobs are registered after all services are init'd below.
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    app.state.scheduler = scheduler
+    scheduler.start()
+    logger.info("APScheduler started (UTC timezone)")
+
     # ── AALDA API client (fetches real pet data per-request) ──────────────
-    # DB callbacks for fallback (W1) and persistence (W10)
-    async def _pet_db_fallback(pet_id: int) -> dict | None:
-        async with get_session() as session:
-            return await PetRepo(session).read(pet_id)
-
-    async def _pet_db_persist(pet_profile: dict) -> None:
-        async with get_session() as session:
-            await PetRepo(session).upsert(pet_profile)
-
     app.state.pet_fetcher = PetFetcher(
         settings.aalda_api_url,
-        db_fallback=_pet_db_fallback,
-        db_persist=_pet_db_persist,
         timeout=settings.aalda_timeout_seconds,
         valkey=app.state.valkey,
     )
@@ -148,6 +149,21 @@ async def lifespan(app: FastAPI):
     app.state.compressor = CompressorAgent(llm=llm)
     app.state.aggregator = AggregatorAgent(get_session=get_session, valkey=app.state.valkey)
     app.state.thread_summarizer = ThreadSummarizer(llm=llm)
+    app.state.history_builder = HistoryBuilder(llm=llm)
+
+    # ── RelationshipBuilder — USER STYLE summaries → relationship_summary ─
+    # UserProfileWriter Protocol: current impl writes directly to PostgreSQL.
+    # Swap _DBUserWriter for an AALDA-backed writer later — zero changes here.
+    class _DBUserWriter:
+        async def update_relationship_summary(self, user_code: str, summary: str) -> None:
+            async with get_session() as db_session:
+                repo = UserRepo(db_session)
+                await repo.update_relationship_summary(user_code, summary)
+
+    app.state.relationship_builder = RelationshipBuilder(
+        llm=llm,
+        user_writer=_DBUserWriter(),
+    )
 
     # ── Session state (ft-005: now lives in Valkey) ───────────────────────
     # Sessions are no longer reloaded from DB at startup — they are fetched
@@ -163,6 +179,14 @@ async def lifespan(app: FastAPI):
     app.state.pet_locks: dict[int, asyncio.Lock] = {}     # per-pet locks (race condition safety)
     app.state.background_tasks: set[asyncio.Task] = set() # tracked tasks for graceful shutdown (W8)
     app.state.pending_clarifications: dict[str, list] = {} # local fallback when Valkey is down (C4)
+
+    # ── Register nightly cron job — after all services are initialised ────
+    # Jobs run at 00:00 UTC. replace_existing=True so restart doesn't duplicate.
+    app.state.scheduler.add_job(
+        run_nightly_jobs, "cron", hour=0, minute=0,
+        args=[app.state], id="nightly_jobs", replace_existing=True,
+    )
+    logger.info("Nightly job registered — runs at 00:00 UTC")
 
     logger.info("Backend ready. LLM provider: %s", settings.llm_provider)
 
@@ -186,6 +210,14 @@ async def lifespan(app: FastAPI):
             await asyncio.wait(timed_out, timeout=2)
     else:
         logger.info("Shutting down — no background tasks pending.")
+
+    # Shutdown scheduler — wait=True (default) so any in-flight nightly job finishes
+    # its current DB writes before we dispose the connection pool below.
+    # APScheduler raises on timeout if wait=True and jobs are still running after the
+    # internal grace period, but it won't block indefinitely.
+    if getattr(app.state, "scheduler", None):
+        app.state.scheduler.shutdown(wait=True)
+        logger.info("APScheduler shut down.")
 
     await app.state.pet_fetcher.close()
     await app.state.valkey.aclose()

@@ -3,12 +3,14 @@
 # Debug endpoints — development only, remove in Phase 4.
 #
 # What lives here:
-#   - GET /api/v1/debug/facts              — Compressor output (fact_log table)
-#   - GET /api/v1/debug/profile            — Aggregator output (active_profile table)
-#   - GET /api/v1/debug/threads            — Active threads (Phase 2)
-#   - GET /api/v1/debug/thread/{id}/messages — Messages for a thread (Phase 2)
-#   - GET /api/v1/debug/user              — User record by user_code (W18)
-#   - GET /api/v1/debug/clarifications    — Pending clarifications (in-memory)
+#   - GET  /api/v1/debug/facts              — Compressor output (fact_log table)
+#   - GET  /api/v1/debug/profile            — Aggregator output (active_profile table)
+#   - GET  /api/v1/debug/threads            — Active threads (Phase 2)
+#   - GET  /api/v1/debug/thread/{id}/messages — Messages for a thread (Phase 2)
+#   - GET  /api/v1/debug/user              — User record by user_code (W18)
+#   - GET  /api/v1/debug/clarifications    — Pending clarifications (in-memory)
+#   - POST /api/v1/debug/trigger_nightly   — Sprint 6: run nightly jobs immediately (testing)
+#   - POST /api/v1/debug/trigger_summarizer — Sprint 6: run ThreadSummarizer on a thread (testing)
 #
 # All pet-specific endpoints require pet_id query param.
 # Phase 1C: reads from PostgreSQL instead of JSON files.
@@ -20,6 +22,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.db.session import get_session
 from app.db.repositories import FactLogRepo, ActiveProfileRepo, ThreadRepo, ThreadMessageRepo, UserRepo
+from app.jobs.nightly import run_nightly_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -132,3 +135,66 @@ async def debug_clarifications(request: Request, thread_id: str | None = None) -
         items = pending.get(thread_id, [])
         return {"thread_id": thread_id, "count": len(items), "clarifications": items}
     return {"thread_count": len(pending), "all": pending}
+
+
+@router.post("/trigger_nightly", summary="Sprint 6 testing: run nightly jobs immediately")
+async def debug_trigger_nightly(request: Request) -> dict[str, Any]:
+    """
+    Runs run_nightly_jobs() immediately against the live app.state.
+
+    Used by test_sprint6.py to test closing summary + relationship summary jobs
+    without waiting until midnight UTC.
+
+    Returns a summary of what ran.
+    """
+    try:
+        await run_nightly_jobs(request.app.state)
+        return {"status": "ok", "message": "Nightly jobs completed — check server logs for details"}
+    except Exception as exc:
+        logger.error("debug_trigger_nightly: error — %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/trigger_summarizer", summary="Sprint 6 testing: run ThreadSummarizer on a thread")
+async def debug_trigger_summarizer(request: Request, thread_id: str = "") -> dict[str, Any]:
+    """
+    Runs ThreadSummarizer on a given thread_id and writes the result to
+    threads.compaction_summary.
+
+    Used by test_sprint6.py to verify the two-section HEALTH CONTEXT / USER STYLE
+    format without needing to send 50 messages to trigger natural compaction.
+
+    Query params:
+        thread_id — which thread to summarize (required)
+    """
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="thread_id query parameter is required.")
+
+    summarizer = getattr(request.app.state, "thread_summarizer", None)
+    if summarizer is None:
+        raise HTTPException(status_code=503, detail="thread_summarizer not initialised")
+
+    async with get_session() as db_session:
+        msg_repo = ThreadMessageRepo(db_session)
+        messages = await msg_repo.read_thread(thread_id)
+
+    if not messages:
+        raise HTTPException(status_code=404, detail=f"No messages found for thread_id={thread_id!r}")
+
+    async with get_session() as db_session:
+        thread_repo = ThreadRepo(db_session)
+        thread = await thread_repo.get_by_thread_id(thread_id)
+
+    existing_summary = thread.get("compaction_summary") if thread else None
+    summary = await summarizer.summarize(messages, existing_summary)
+
+    async with get_session() as db_session:
+        thread_repo = ThreadRepo(db_session)
+        await thread_repo.update_compaction_summary(thread_id, summary)
+
+    return {
+        "status": "ok",
+        "thread_id": thread_id,
+        "message_count": len(messages),
+        "summary": summary,
+    }

@@ -31,7 +31,7 @@ We build the minimum that works at each phase. We do not add complexity until th
 simple version is working and understood. Every line of code is written with full
 understanding of what it does and why it is there.
 
-**Current goal: ft-005 (Valkey) complete → Phase 3 (nightly batch jobs) + ft-013 (HistoryBuilder) next.**
+**Current goal: Phase 4 (JWT auth + rate limiting). Sprint 6 complete.**
 
 Phase 0 ✓. Phase 1A ✓. Phase 1B ✓. Phase 1C ✓ (PostgreSQL replaces JSON files).
 Phase 2 ✓ (Thread & Conversation Management — 24h thread windows, write-through message persistence, startup reload, LLM compaction, cross-thread continuity via conversation_summary).
@@ -40,13 +40,12 @@ Sprint 2 ✓ (AALDA integration, multi-pet support, X-User-Code auth).
 Sprint 3 ✓ (Language selector, production deploy fixes).
 Sprint 4 ✓ (Dual-pet Compressor attribution, clarification loop, users table redesign).
 Sprint 5 ✓ (All review debt closed — StateBag Protocol, per-pet lock, FK constraint, background.py extraction, parallel aggregator, frontend fixes, deprecated file cleanup).
-ft-005 ✓ (Valkey hot storage — replaces all in-memory dicts, write-through rule, circuit breaker, TTL jitter, distributed compaction lock, Lua atomic session append, graceful degradation. 17/17 Valkey tests + 68/70 E2E pass).
+ft-005 ✓ (Valkey hot storage — replaces all in-memory dicts, write-through rule, circuit breaker, TTL jitter, distributed compaction lock, Lua atomic session append, graceful degradation. 17/17 Valkey tests + 69/70 E2E pass).
+Sprint 6 ✓ (Background Intelligence Pipeline — HistoryBuilder, RelationshipBuilder, enhanced ThreadSummarizer, APScheduler nightly jobs, DB write batching. 21/21 Sprint 6 tests + 69/70 E2E pass. All three Agent 1 context fields now populated: _pet_history, relationship_summary, conversation_summary with USER STYLE).
 
 **Known gaps before production (tracked in progress.json future_tasks):**
-- `ft-005`: Valkey hot storage — replaces in-memory dicts for horizontal scaling
-- `ft-013`: HistoryBuilder — pet history narrative from fact_log (prompt plumbing already wired)
 - `ft-009`: Multiple LLM providers — OpenAI direct + Claude/Anthropic
-- `W18`: Users table schema coordination — needs separate backend team agreement
+- `ft-014`: SSE compaction notifications + message queuing
 
 ---
 
@@ -82,7 +81,7 @@ See `notes.md` Phase 1A section for full details.
 ```
 User message + X-User-Code header + pet_ids[]
     → Auth check                  X-User-Code required (401 if missing)
-    → AALDA fetch (parallel)      PetFetcher with 5-level fallback, asyncio.gather for dual-pet
+    → AALDA fetch (parallel)      PetFetcher with Valkey cache + AALDA API (error if unavailable), asyncio.gather for dual-pet
     → Per-pet lock                asyncio.Lock prevents duplicate thread creation
     → Thread boundary logic       resolve session_id → thread_id (DB lookup, 24h expiry check)
     → IntentClassifier (LLM)      health / food / general + urgency
@@ -111,13 +110,13 @@ User message + X-User-Code header + pet_ids[]
 - Pending clarifications: `am:pending:{thread_id}` (Valkey, TTL 7200s)
 - Session meta: `am:meta:{thread_id}` (Valkey, TTL 7200s)
 - User record: `am:user:{user_code}` (Valkey, TTL 7200s) — written through after user upsert
-- AALDA cache: `am:aalda:{user_code}:{pet_id}` (Valkey, TTL 300s) — replaces PetFetcher._cache dict
+- AALDA cache: `am:aalda:{user_code}:{pet_id}` (Valkey, TTL 300s) — AALDA is sole source of truth, no stale fallback
 - `build_pet_context()` accepts AALDA data + DB profiles + `conversation_summary`; returns 6 values
 - `GET /api/v1/confidence` reads from Valkey profile cache (falls back to DB)
 - `app.state.pet_locks` — per-pet `asyncio.Lock` prevents concurrent thread creation for same pet
 - Circuit breaker in `ValkeyClient`: 5 failures -> 30s open -> half-open probe. Graceful degradation: all Valkey calls fall back to DB/defaults when Valkey is down
 
-**File structure — current state (ft-005 Valkey complete):**
+**File structure — current state (Sprint 6 complete):**
 ```
 backend/
 |-- app/
@@ -134,26 +133,31 @@ backend/
 |   |-- db/                          # PostgreSQL layer (source of truth)
 |   |   |-- __init__.py
 |   |   |-- session.py               # init_db(), dispose_engine(), get_session() async context manager
-|   |   |-- models.py                # SQLAlchemy 2.0 ORM: Pet, User, ActiveProfile, FactLog, Thread, ThreadMessage
-|   |   `-- repositories.py          # PetRepo, UserRepo, ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
+|   |   |-- models.py                # SQLAlchemy 2.0 ORM: User, ActiveProfile, FactLog, Thread, ThreadMessage
+|   |   `-- repositories.py          # UserRepo, ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo
+|   |-- jobs/                        # Sprint 6: APScheduler nightly batch jobs
+|   |   |-- __init__.py
+|   |   `-- nightly.py               # run_nightly_jobs() + _close_expired_thread_summaries() + _rebuild_relationship_summaries()
 |   |-- routes/
 |   |   |-- __init__.py
 |   |   |-- chat.py                  # POST /api/v1/chat + GET /api/v1/confidence + GET /api/v1/pets + thread boundary
-|   |   |-- background.py            # Fire-and-forget: _run_background(), _run_compaction(), _create_tracked_task()
-|   |   |-- debug.py                 # GET /api/v1/debug/facts, /profile, /threads, /thread/{id}/messages, /user, /pending
+|   |   |-- background.py            # Fire-and-forget: _run_background(), _run_compaction(), _create_tracked_task(), HistoryBuilder trigger
+|   |   |-- debug.py                 # GET /api/v1/debug/facts|profile|threads|thread/{id}/messages|user|clarifications + POST trigger_nightly|trigger_summarizer
 |   |   `-- simulator.py             # GET /api/v1/simulator/health, GET /api/v1/simulator/food
 |   |-- services/
 |   |   |-- guardrails.py            # apply_guardrails() only
 |   |   |-- deeplink.py              # build_deeplink() — returns data (module, display, context), no URLs
 |   |   |-- context_builder.py       # load_profiles_from_db() + build_pet_context() — AALDA-first merge, multi-pet
 |   |   |-- confidence_calculator.py # confidence_score + confidence_color
-|   |   |-- thread_summarizer.py     # Phase 2 — LLM summarization for thread compaction
-|   |   `-- pet_fetcher.py           # AALDA API client with 5-level fallback chain + Valkey cache (ft-005)
+|   |   |-- thread_summarizer.py     # LLM summarization — enhanced two-section format: HEALTH CONTEXT + USER STYLE
+|   |   |-- history_builder.py       # Sprint 6: fact_log → _pet_history narrative (LLM, temp=0.0, hybrid trigger)
+|   |   |-- relationship_builder.py  # Sprint 6: USER STYLE sections → users.relationship_summary (LLM, temp=0.0)
+|   |   `-- pet_fetcher.py           # AALDA API client: Valkey cache → AALDA API → error (ft-005)
 |   |-- llm/
 |   |   |-- base.py                  # Abstract LLMProvider
 |   |   |-- azure_openai.py          # Azure implementation
 |   |   `-- factory.py               # creates provider from settings
-|   |-- types.py                     # ActiveProfileEntry TypedDict + StateBag Protocol (incl. valkey field)
+|   |-- types.py                     # ActiveProfileEntry TypedDict + StateBag Protocol + UserProfileWriter Protocol
 |   `-- core/
 |       `-- config.py                # reads .env -> Settings (database_url, aalda_*, valkey_url, etc.)
 |-- constants.py                     # business logic constants + FULL_FIELD_LIST + GAP_PRIORITY_LADDER + thread constants
@@ -161,12 +165,13 @@ backend/
 |-- alembic.ini                      # Alembic migration config
 |-- migrations/                      # Alembic migration scripts
 |   |-- env.py                       # async runner, imports Base.metadata from app.db.models
-|   `-- versions/                    # migration files (7 total)
+|   `-- versions/                    # migration files (8 total, latest: composite indexes for HistoryBuilder + nightly)
 |-- design-docs/                     # all design & architecture documents
-|-- app/main.py                      # FastAPI app creation, CORS, lifespan, /health, Valkey init, error handlers
+|-- app/main.py                      # FastAPI app creation, CORS, lifespan, APScheduler, /health, Valkey init, error handlers
 |-- tests/
 |   |-- run_e2e.py                   # e2e tests (11 sections, 70 tests: infra through edge cases)
-|   `-- test_valkey.py               # ft-005 Valkey tests (17 tests: keys, TTL, cache-aside, atomic ops, degradation)
+|   |-- test_valkey.py               # ft-005 Valkey tests (17 tests: keys, TTL, cache-aside, atomic ops, degradation)
+|   `-- test_sprint6.py              # Sprint 6 tests (21 tests: ThreadSummarizer, HistoryBuilder, nightly jobs, RelationshipBuilder, batching, regressions)
 `-- Dockerfile                       # Production container (Railway deployment)
 ```
 
@@ -242,7 +247,9 @@ Provider: **Azure OpenAI** (current)
 - Agent 1 uses: `temperature=0.7`, `max_tokens=512` — conversational
 - Agent 2 (Compressor) uses: `temperature=0.0`, `max_tokens=400` — deterministic extraction
 - Agent 3 (Aggregator) uses: no LLM — pure deterministic rules (Rules 0-6)
-- ThreadSummarizer uses: `temperature=0.0`, `max_tokens=400` — deterministic compaction
+- ThreadSummarizer uses: `temperature=0.0`, `max_tokens=400` — deterministic two-section compaction (HEALTH CONTEXT + USER STYLE)
+- HistoryBuilder uses: `temperature=0.0`, `max_tokens=500` — deterministic health narrative (3-6 sentences, needs headroom)
+- RelationshipBuilder uses: `temperature=0.0`, `max_tokens=300` — deterministic relationship summary (1-2 sentences)
 
 Deployment name: `gpt-4.1` (configured via `AZURE_OPENAI_DEPLOYMENT_CHAT` in `.env`).
 Migration path: set `LLM_PROVIDER=openai` in `.env`. No agent code changes.
@@ -311,14 +318,14 @@ API v1  (DONE):  All endpoints versioned under /api/v1/ (except /health).
                   pet_context removed from request — backend uses pet_id + DEFAULT_PET_ID fallback.
                   See design-docs/api-v1-design.md for full specification.
 
-Sprint 2 (DONE): AALDA API integration (PetFetcher with 5-level fallback chain + TTL cache).
+Sprint 2 (DONE): AALDA API integration (PetFetcher with Valkey cache + AALDA API, error on unavailability).
                   Multi-pet support (pet_ids: list[int], max 2, parallel fetch).
                   X-User-Code auth header. Per-thread asyncio.Lock (C2).
 
 Sprint 3 (DONE): Language selector (EN/JA/auto). Production deploy fixes (Railway).
 
 Sprint 4 (DONE): Dual-pet Compressor attribution (pet_label). Clarification loop for hedged facts.
-                  Thread secondary_pet_id. Users table redesign (W18). Edge-case E2E tests.
+                  Thread secondary_pet_id. Users table redesign (W18 — resolved). Edge-case E2E tests.
 
 Sprint 5 (DONE): All review debt closed. StateBag Protocol. Per-pet lock + partial unique index.
                   FK constraint (thread_messages → threads). background.py extraction.
@@ -328,7 +335,19 @@ ft-005  (DONE): Valkey hot storage. Replaces all in-memory dicts. Write-through 
                   Circuit breaker + TTL jitter + graceful degradation. Distributed compaction lock
                   (SETNX + UUID token). Lua atomic session append. 17/17 Valkey tests pass.
 
-Phase 3:         Nightly batch jobs + HistoryBuilder (ft-013)
+Sprint 6 (DONE): Background Intelligence Pipeline. HistoryBuilder (fact_log → _pet_history).
+                  RelationshipBuilder (USER STYLE sections → relationship_summary).
+                  Enhanced ThreadSummarizer (two-section: HEALTH CONTEXT + USER STYLE).
+                  APScheduler nightly jobs (closing summary + relationship rebuild).
+                  DB write batching (append_bulk for atomic dual-pet writes).
+                  13 bugs found+fixed via code review. 21/21 Sprint 6 tests + 69/70 E2E pass.
+
+ft-016  (DONE): AALDA DB alignment (no write-back needed) + user fields wired.
+                  display_name in ChatRequest, 3-step language priority chain (request > DB > auto-detect),
+                  owner_name in Agent 1 prompt. W18 users table resolved — relationship_summary IS
+                  user_context_memory. Fixed UserRepo.upsert display_name bug.
+
+Phase 3 (DONE):  Covered by Sprint 6 — nightly batch jobs complete.
 
 Phase 4:         JWT auth + rate limiting
 
@@ -341,7 +360,6 @@ Phase 5:         Tests + production deployment
 
 | Table | Write Pattern | Purpose | ORM Model |
 |---|---|---|---|
-| `pets` | UPSERT | Pet identity: name, species, breed | `app.db.models.Pet` |
 | `users` | UPSERT | Owner relationship data | `app.db.models.User` |
 | `fact_log` | APPEND only | Every extracted fact, full audit trail | `app.db.models.FactLog` |
 | `active_profile` | DELETE+INSERT (per pet) | Current best-known value per field | `app.db.models.ActiveProfile` |
@@ -354,29 +372,48 @@ Phase 5:         Tests + production deployment
 
 ## How to Run
 
+**This project uses a `.venv` virtual environment inside `backend/`.**
+Always activate it before running any Python command:
 ```bash
-# 1. Install dependencies
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+# Windows CMD
+.venv\Scripts\activate.bat
+```
+The prompt will show `(.venv)` when active.
+
+```bash
+# 1. Create venv (first time only)
+python -m venv .venv
+
+# 2. Activate venv (every terminal session)
+.venv\Scripts\Activate.ps1
+
+# 3. Install dependencies (inside activated venv)
 pip install -r requirements.txt
 
-# 2. Set up environment
+# 4. Set up environment
 cp .env.example .env
 # Edit .env — fill in your Azure OpenAI credentials + DATABASE_URL
 
-# 3. Start PostgreSQL + Valkey (Docker required)
+# 5. Start PostgreSQL + Valkey (Docker required)
 docker compose up -d
 # Verify postgres: docker exec -it anymall-postgres psql -U anymall -d anymallchan -c "\dt"
 # Verify valkey:   docker exec anymall-valkey valkey-cli -a yourpassword ping  # -> PONG
 
-# 4. Run database migrations
+# 6. Run database migrations
 alembic upgrade head
 
-# 5. Start server
+# 7. Start server
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-# 6. Test
+# 8. Test
 curl -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Luna seems tired today", "session_id": "test-1"}'
 ```
 
 **Note:** PostgreSQL runs on port 5433 (not 5432) to avoid conflicts with any native PostgreSQL installation. The `DATABASE_URL` in `.env` already points to port 5433.
+
+**Note:** When Claude installs packages, always use `.venv/Scripts/pip install <pkg>` not the system `pip`, so packages land in the venv and are available when the server runs.

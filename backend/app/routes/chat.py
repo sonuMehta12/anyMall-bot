@@ -107,6 +107,11 @@ class ChatRequest(BaseModel):
         default="auto",
         description="Language preference: 'EN', 'JA', or 'auto' (detect from message).",
     )
+    display_name: str = Field(
+        default="",
+        max_length=128,
+        description="Owner's display name from Flutter UI.",
+    )
 
 
 class RedirectDisplay(BaseModel):
@@ -374,6 +379,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             if not user_record:
                 await user_repo.upsert({
                     "user_code": user_code,
+                    "display_name": request_body.display_name,
+                    "preferred_language": request_body.language if request_body.language != "auto" else "auto",
                     "created_at": now_iso,
                     "updated_at": now_iso,
                 })
@@ -381,13 +388,22 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                 if user_record:
                     vk_user_to_cache = user_record
             else:
+                # Only overwrite display_name if Flutter sent one (non-empty).
+                new_display = request_body.display_name or user_record.get("display_name", "")
+                # Only overwrite preferred_language if request is explicit (not "auto").
+                new_lang = (
+                    request_body.language
+                    if request_body.language != "auto"
+                    else user_record.get("preferred_language", "auto")
+                )
                 updated = {
                     "user_code": user_code,
+                    "display_name": new_display,
                     "updated_at": now_iso,
                     # Increment only when a new 24-hour thread window opens.
                     "session_count": user_record.get("session_count", 0) + (1 if new_thread else 0),
                     "relationship_summary": user_record.get("relationship_summary", ""),
-                    "preferred_language": user_record.get("preferred_language", "auto"),
+                    "preferred_language": new_lang,
                 }
                 await user_repo.upsert(updated)
                 user_record = {**user_record, **updated}
@@ -450,6 +466,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         agent_state = AgentState(
             session_id=session_id,
             thread_id=thread_id,
+            user_code=user_code,
             user_message=request_body.message,
             pets=pet_infos,
             recent_history=list(session_messages),
@@ -487,6 +504,13 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             # Local dict fallback when Valkey is down
             pending_clars = state_bag.pending_clarifications.get(thread_id, [])
 
+        # ── Language priority: request explicit > DB stored > auto-detect ────
+        if request_body.language != "auto":
+            language_str = request_body.language
+        else:
+            db_lang = (user_record or {}).get("preferred_language", "auto")
+            language_str = db_lang if db_lang != "auto" else _detect_language(request_body.message)
+
         agent_response: AgentResponse = await agent.run(
             user_message=request_body.message,
             session_messages=list(session_messages[-THREAD_CONTEXT_WINDOW:]),
@@ -496,9 +520,10 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             intent_type=intent_type,
             urgency=urgency,
             questions_asked_so_far=questions_so_far,
-            language_str=request_body.language if request_body.language != "auto" else _detect_language(request_body.message),
+            language_str=language_str,
             conversation_summary=conversation_summary,
             pending_clarifications=pending_clars or None,
+            owner_name=(user_record or {}).get("display_name", ""),
         )
 
         agent_state.is_entity = agent_response.is_entity

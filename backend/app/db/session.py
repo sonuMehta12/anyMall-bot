@@ -108,8 +108,8 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
     Usage:
         async with get_session() as session:
-            repo = PetRepo(session)
-            pet = await repo.read("luna-001")
+            repo = UserRepo(session)
+            user = await repo.read("3AOU9K1PWH")
     """
     if _session_factory is None:
         raise RuntimeError(
