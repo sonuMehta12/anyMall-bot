@@ -32,10 +32,10 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isTyping])
 
-  // Fetch confidence score on mount (for primary pet)
+  // Fetch confidence score on mount (averaged across all selected pets)
   useEffect(() => {
     if (!primaryPet) return
-    fetchConfidence(primaryPet.pet_id, userCode)
+    fetchConfidence(petIds, userCode)
       .then(data => {
         setConfidenceScore(data.confidence_score ?? 0)
         setConfidenceColor(data.confidence_color ?? 'red')
@@ -72,6 +72,7 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
         petIds,
         userCode,
         language,
+        displayName: 'Sarah',
       })
 
       setConfidenceScore(data.confidence_score ?? 0)
@@ -93,7 +94,7 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
 
       // Refresh confidence after background pipeline finishes
       setTimeout(() => {
-        fetchConfidence(primaryPet.pet_id, userCode)
+        fetchConfidence(petIds, userCode)
           .then(fresh => {
             setConfidenceScore(fresh.confidence_score ?? data.confidence_score)
             setConfidenceColor(fresh.confidence_color ?? data.confidence_color)

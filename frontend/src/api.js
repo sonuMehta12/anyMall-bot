@@ -13,7 +13,7 @@ export async function fetchPets(userCode) {
 }
 
 // POST /api/v1/chat
-export async function sendMessage({ sessionId, message, petIds, userCode, language = 'auto' }) {
+export async function sendMessage({ sessionId, message, petIds, userCode, language = 'auto', displayName = '' }) {
   const res = await fetch(`${BASE}/api/v1/chat`, {
     method: 'POST',
     headers: {
@@ -25,6 +25,7 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
       message,
       pet_ids: petIds,
       language,
+      display_name: displayName,
     }),
   })
   if (!res.ok) throw new Error(`${res.status} — failed to send message`)
@@ -115,9 +116,13 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
 }
 
 
-// GET /api/v1/confidence — dedicated endpoint for fresh confidence score
-export async function fetchConfidence(petId, userCode) {
-  const res = await fetch(`${BASE}/api/v1/confidence?pet_id=${petId}`, {
+// GET /api/v1/confidence — confidence score for one or more pets.
+// Accepts a single id or an array: fetchConfidence(101, ...) or fetchConfidence([101, 102], ...)
+// For dual-pet, the backend returns an averaged score automatically.
+export async function fetchConfidence(petIds, userCode) {
+  const ids = Array.isArray(petIds) ? petIds : [petIds]
+  const query = ids.map(id => `pet_id=${id}`).join('&')
+  const res = await fetch(`${BASE}/api/v1/confidence?${query}`, {
     headers: { 'X-User-Code': userCode },
   })
   if (!res.ok) throw new Error(`${res.status} — failed to fetch confidence`)
