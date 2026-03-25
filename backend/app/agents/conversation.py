@@ -350,6 +350,12 @@ _SPECIES_EMOJI: dict[str, str] = {
 
 _DEFAULT_PET_EMOJI: str = "🐾"
 
+# ── Model configuration ────────────────────────────────────────────────────────
+# Model to use for this agent. None = use provider default (set in .env).
+# Change this to test a specific model, e.g. "gpt-5.4-mini".
+# See design-docs/model-strategy.md for full rationale.
+_MODEL: str | None = None
+
 
 # ── AgentResponse ──────────────────────────────────────────────────────────────
 
@@ -484,6 +490,7 @@ class ConversationAgent:
                 messages=messages,
                 temperature=0.7,
                 max_tokens=512,
+                model=_MODEL,      # None = provider default; set above to test a model
             )
         except LLMProviderError as exc:
             logger.error("LLM call failed: %s", exc)

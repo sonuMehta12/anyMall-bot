@@ -2,13 +2,15 @@
 #
 # POST /api/v1/chat — the core endpoint.
 # GET  /api/v1/pets — list user's pets from AALDA.
-# GET  /api/v1/confidence — confidence bar score.
+# GET  /api/v1/setup — confidence bar + suggested questions (replaces /confidence).
+# GET  /api/v1/confidence — alias for /setup (backward compat).
 #
 # What lives here:
 #   - Pydantic request/response models (ChatRequest, ChatResponse, RedirectPayload)
 #   - POST /api/v1/chat route
 #   - GET /api/v1/pets route (fetches from AALDA)
-#   - GET /api/v1/confidence route
+#   - GET /api/v1/setup route (confidence + suggested questions)
+#   - GET /api/v1/confidence route (alias for /setup)
 #
 # Background pipeline (_run_background, _run_compaction) lives in background.py.
 #
@@ -17,15 +19,16 @@
 # which is populated by lifespan() in main.py. No module-level globals.
 
 # ── Standard library ───────────────────────────────────────────────────────────
+from app.routes.background import _create_tracked_task, _run_background, _run_compaction
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Any
+from typing import Any, List
 from uuid import uuid4
 
 # ── Third-party ────────────────────────────────────────────────────────────────
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 # ── Our code ───────────────────────────────────────────────────────────────────
@@ -37,7 +40,8 @@ from app.services.context_builder import build_pet_context
 from app.services.pet_fetcher import PetFetchError
 from app.cache.client import ValkeyClient
 from app.cache.keys import (
-    CacheKeys, TTL_SESSION, TTL_META, TTL_PENDING, TTL_USER, TTL_PROFILE, jittered_ttl,
+    CacheKeys, TTL_SESSION, TTL_META, TTL_PENDING, TTL_USER, TTL_PROFILE,
+    TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl,
 )
 from constants import (
     INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM,
@@ -46,6 +50,7 @@ from constants import (
 from app.db.session import get_session
 from app.db.repositories import ActiveProfileRepo, ThreadRepo, ThreadMessageRepo, UserRepo
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
+from app.services.question_templates import get_evergreen_questions
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +58,6 @@ router = APIRouter(prefix="/api/v1", tags=["chat"])
 
 
 # ── Background pipeline (extracted to background.py) ──────────────────────────
-from app.routes.background import _create_tracked_task, _run_background, _run_compaction
 
 
 # ── Auth helper ───────────────────────────────────────────────────────────────
@@ -62,7 +66,8 @@ def _require_user_code(request: Request) -> str:
     """Extract X-User-Code header or raise 401."""
     user_code = request.headers.get("x-user-code")
     if not user_code:
-        raise HTTPException(status_code=401, detail="Missing X-User-Code header")
+        raise HTTPException(
+            status_code=401, detail="Missing X-User-Code header")
     return user_code
 
 
@@ -144,7 +149,8 @@ class ChatResponse(BaseModel):
     """Body returned by POST /api/v1/chat."""
     status: str = "ok"
     message: str
-    redirect: RedirectPayload | None = None   # present only for health/food intents
+    # present only for health/food intents
+    redirect: RedirectPayload | None = None
     session_id: str
     # ── Phase 2: Thread management ─────────────────────────────────────────────
     thread_id: str                # backend's thread UUID
@@ -154,7 +160,8 @@ class ChatResponse(BaseModel):
     was_guardrailed: bool
     # ── Agent debug fields ─────────────────────────────────────────────────────
     is_entity: bool       # Agent 1: did the user message contain extractable pet facts?
-    asked_gap_question: bool = False  # Agent 1: did the reply ask a gap-filling question?
+    # Agent 1: did the reply ask a gap-filling question?
+    asked_gap_question: bool = False
     intent_type: str      # IntentClassifier: "health" | "food" | "general"
     urgency: str          # IntentClassifier: "high" | "medium" | "low"
     # ── Confidence bar ────────────────────────────────────────────────────────
@@ -225,20 +232,24 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     pet_fetcher = state_bag.pet_fetcher
 
     if agent is None or intent_classifier is None:
-        raise HTTPException(status_code=503, detail="Agent not initialised yet.")
+        raise HTTPException(
+            status_code=503, detail="Agent not initialised yet.")
 
     sessions: dict = state_bag.sessions
     pet_ids = request_body.pet_ids
 
     # ── 1. Fetch pet data from AALDA (parallel for 2 pets) ────────────────────
     try:
-        fetch_tasks = [pet_fetcher.fetch_pet_profile(user_code, pid) for pid in pet_ids]
+        fetch_tasks = [pet_fetcher.fetch_pet_profile(
+            user_code, pid) for pid in pet_ids]
         pet_results = await asyncio.gather(*fetch_tasks)
     except PetFetchError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    pet_profiles = [r[0] for r in pet_results]       # list of pet_profile dicts
-    aalda_facts_list = [r[1] for r in pet_results]    # list of aalda_facts dicts
+    pet_profiles = [r[0]
+                    for r in pet_results]       # list of pet_profile dicts
+    aalda_facts_list = [r[1]
+                        for r in pet_results]    # list of aalda_facts dicts
 
     # ── 2. Load active_profiles — Valkey cache-aside (ft-005, Step 6) ────────
     # Check Valkey for all pets first (before opening any DB session) so cache
@@ -268,7 +279,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                         db_hits.append((idx, pid, raw))
         except Exception as db_exc:
             logger.error("DB error loading active profiles: %s", db_exc)
-            raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
+            raise HTTPException(
+                status_code=503, detail="Database unavailable — please retry.")
         # Populate Valkey after the DB session closes (no connection held during cache write)
         for _, pid, raw in db_hits:
             await vk.setex(CacheKeys.profile(pid), jittered_ttl(TTL_PROFILE), json.dumps(raw))
@@ -291,7 +303,13 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     now_iso = now_utc.isoformat()
 
     # ── Confidence bar (pure arithmetic, sub-ms) ─────────────────────────────
-    conf_score = calculate_confidence_score(primary_ctx["active_profile"], primary_profile)
+    # Average across all selected pets — single pet = no change, dual pet = averaged
+    _conf_scores = [
+        calculate_confidence_score(
+            pet_contexts[i]["active_profile"], pet_profiles[i])
+        for i in range(len(pet_contexts))
+    ]
+    conf_score = round(sum(_conf_scores) / len(_conf_scores))
     conf_color = confidence_color(conf_score)
 
     # ── 4. Thread boundary logic (Phase 2) ────────────────────────────────────
@@ -312,7 +330,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
                 if existing and datetime.fromisoformat(existing["expires_at"]) > now_utc:
                     thread_id = existing["thread_id"]
-                    conversation_summary = existing.get("compaction_summary") or ""
+                    conversation_summary = existing.get(
+                        "compaction_summary") or ""
                     # W11: set secondary_pet_id if upgrading a single-pet thread to dual-pet.
                     # Once set, it's immutable for this thread's lifetime (24h). If the user
                     # switches Pet B mid-thread, the old secondary stays — this is intentional
@@ -340,7 +359,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                         conversation_summary = prev["compaction_summary"]
 
                     thread_id = str(uuid4())
-                    expires_at = (now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
+                    expires_at = (
+                        now_utc + timedelta(hours=THREAD_EXPIRY_HOURS)).isoformat()
                     secondary_pid = pet_ids[1] if len(pet_ids) > 1 else None
                     await thread_repo.create(
                         thread_id=thread_id,
@@ -351,12 +371,15 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                         secondary_pet_id=secondary_pid,
                     )
                     new_thread = True
-                    logger.info("New thread created: %s (session=%s)", thread_id, session_id)
+                    logger.info("New thread created: %s (session=%s)",
+                                thread_id, session_id)
         except HTTPException:
-            raise  # re-raise our own errors (shouldn't happen here, but defensive)
+            # re-raise our own errors (shouldn't happen here, but defensive)
+            raise
         except Exception as db_exc:
             logger.error("DB error in thread boundary: %s", db_exc)
-            raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
+            raise HTTPException(
+                status_code=503, detail="Database unavailable — please retry.")
 
     # ── Auto-upsert user record — Valkey cache-aside + write-through (ft-005) ─
     # Placed after thread boundary so new_thread is known — session_count
@@ -389,7 +412,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                     vk_user_to_cache = user_record
             else:
                 # Only overwrite display_name if Flutter sent one (non-empty).
-                new_display = request_body.display_name or user_record.get("display_name", "")
+                new_display = request_body.display_name or user_record.get(
+                    "display_name", "")
                 # Only overwrite preferred_language if request is explicit (not "auto").
                 new_lang = (
                     request_body.language
@@ -412,7 +436,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         # Write-through to Valkey after DB session closes (no connection held)
         if vk_user_to_cache is not None:
             await vk.setex(
-                CacheKeys.user(user_code), jittered_ttl(TTL_USER), json.dumps(vk_user_to_cache)
+                CacheKeys.user(user_code), jittered_ttl(
+                    TTL_USER), json.dumps(vk_user_to_cache)
             )
     except Exception as user_exc:
         logger.warning("User upsert failed (non-fatal): %s", user_exc)
@@ -438,7 +463,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                     msg_repo = ThreadMessageRepo(db_session)
                     session_messages = await msg_repo.read_thread(thread_id)
             except Exception as exc:
-                logger.warning("Session DB load failed — thread=%s: %s", thread_id, exc)
+                logger.warning(
+                    "Session DB load failed — thread=%s: %s", thread_id, exc)
                 session_messages = []
             # Populate Valkey so next request is a cache hit
             if session_messages:
@@ -509,7 +535,8 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             language_str = request_body.language
         else:
             db_lang = (user_record or {}).get("preferred_language", "auto")
-            language_str = db_lang if db_lang != "auto" else _detect_language(request_body.message)
+            language_str = db_lang if db_lang != "auto" else _detect_language(
+                request_body.message)
 
         agent_response: AgentResponse = await agent.run(
             user_message=request_body.message,
@@ -553,14 +580,16 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             current_turn = len(session_messages) // 2
 
             if urgency == URGENCY_HIGH:
-                deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
+                deeplink = build_deeplink(
+                    intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
                 if deeplink:
                     redirect_payload = _to_redirect_payload(deeplink)
 
             elif urgency == URGENCY_MEDIUM:
                 last_shown_turn = tracker.get("medium_last_shown")
                 if last_shown_turn is None or (current_turn - last_shown_turn) > MEDIUM_COOLDOWN:
-                    deeplink = build_deeplink(intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
+                    deeplink = build_deeplink(
+                        intent_type, urgency, request_body.message, pet_summary_primary, primary_pet_id)
                     if deeplink:
                         redirect_payload = _to_redirect_payload(deeplink)
                         tracker["medium_last_shown"] = current_turn
@@ -574,15 +603,18 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         # (Valkey cache miss falls back to sessions[thread_id]).
         # Background pipeline writes DB first, then appends to Valkey atomically
         # via LUA_APPEND_MESSAGES — preserving the DB-first write-through rule.
-        user_msg = {"role": "user", "content": request_body.message, "timestamp": now_iso}
-        asst_msg = {"role": "assistant", "content": final_reply, "timestamp": now_iso}
+        user_msg = {"role": "user",
+                    "content": request_body.message, "timestamp": now_iso}
+        asst_msg = {"role": "assistant",
+                    "content": final_reply, "timestamp": now_iso}
         sessions[thread_id].append(user_msg)
         sessions[thread_id].append(asst_msg)
 
         # ── 9. Fire-and-forget Compressor ─────────────────────────────────
         agent_state.agent_reply = final_reply
         agent_state.recent_history = list(sessions[thread_id])
-        _create_tracked_task(_run_background(agent_state, state_bag), state_bag)
+        _create_tracked_task(_run_background(
+            agent_state, state_bag), state_bag)
 
     logger.info(
         "Chat complete — session=%s | intent=%s | urgency=%s | questions=%d | guardrailed=%s",
@@ -607,51 +639,170 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     )
 
 
-# ── Confidence endpoint ────────────────────────────────────────────────────────
+# ── Setup endpoint (confidence + suggested questions) ────────────────────────
 
-@router.get("/confidence", summary="Current confidence bar score")
-async def get_confidence(request: Request, pet_id: int | None = None) -> dict[str, Any]:
+@router.get("/setup", summary="Confidence bar + suggested questions")
+async def get_setup(
+    request: Request,
+    pet_id: List[int] = Query(default=[]),
+    language: str = Query(default="auto"),
+) -> dict[str, Any]:
     """
-    Returns the current confidence score and color for a specific pet.
+    Returns confidence score + suggested home screen questions.
 
-    Requires X-User-Code header and pet_id query param.
-    Called by the frontend on mount and after each chat response.
+    Single pet:  GET /setup?pet_id=101
+    Dual pet:    GET /setup?pet_id=101&pet_id=102
+
+    Requires X-User-Code header. Called by the frontend on mount.
+    Replaces the old /confidence endpoint with additional question data.
     """
     user_code = _require_user_code(request)
     pet_fetcher = request.app.state.pet_fetcher
-
-    if pet_id is None:
-        raise HTTPException(status_code=400, detail="pet_id query parameter is required.")
-
-    try:
-        pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pet_id)
-    except PetFetchError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-
-    # Active profile — Valkey cache-aside (ft-005, Step 6)
     vk: ValkeyClient = request.app.state.valkey
-    raw_cached = await vk.get(CacheKeys.profile(pet_id))
-    if raw_cached is not None:
-        active_raw = json.loads(raw_cached)
-    else:
-        try:
-            async with get_session() as db_session:
-                ap_repo = ActiveProfileRepo(db_session)
-                active_raw = await ap_repo.read_all(pet_id)
-        except Exception as db_exc:
-            logger.error("DB error in /confidence — pet_id=%d: %s", pet_id, db_exc)
-            raise HTTPException(status_code=503, detail="Database unavailable — please retry.")
-        if active_raw:
-            await vk.setex(CacheKeys.profile(pet_id), jittered_ttl(TTL_PROFILE), json.dumps(active_raw))
 
-    ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
-    score = calculate_confidence_score(ctx["active_profile"], pet_profile)
-    color = confidence_color(score)
+    if not pet_id:
+        raise HTTPException(
+            status_code=400, detail="pet_id query parameter is required.")
+
+    # ── 1. Confidence scoring (unchanged logic) ─────────────────────────────
+    scores: list[int] = []
+    pet_contexts: list[dict] = []
+    pet_profiles: list[dict] = []
+
+    for pid in pet_id:
+        try:
+            pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pid)
+        except PetFetchError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+        pet_profiles.append(pet_profile)
+
+        # Active profile — Valkey cache-aside
+        raw_cached = await vk.get(CacheKeys.profile(pid))
+        if raw_cached is not None:
+            active_raw = json.loads(raw_cached)
+        else:
+            try:
+                async with get_session() as db_session:
+                    ap_repo = ActiveProfileRepo(db_session)
+                    active_raw = await ap_repo.read_all(pid)
+            except Exception as db_exc:
+                logger.error("DB error in /setup — pet_id=%d: %s", pid, db_exc)
+                raise HTTPException(
+                    status_code=503, detail="Database unavailable — please retry.")
+            if active_raw:
+                await vk.setex(CacheKeys.profile(pid), jittered_ttl(TTL_PROFILE), json.dumps(active_raw))
+
+        ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
+        pet_contexts.append(ctx)
+        scores.append(calculate_confidence_score(
+            ctx["active_profile"], pet_profile))
+
+    avg_score = round(sum(scores) / len(scores))
+    color = confidence_color(avg_score)
+
+    # ── 2. Suggested questions — cache-first, evergreen fallback ────────────
+    # Resolve language
+    resolved_lang = language
+    if resolved_lang == "auto":
+        # Try to load user's preferred language
+        raw_user = await vk.get(CacheKeys.user(user_code))
+        if raw_user:
+            user_data = json.loads(raw_user)
+            db_lang = user_data.get("preferred_language", "auto")
+            resolved_lang = db_lang if db_lang != "auto" else "JA"
+        else:
+            resolved_lang = "JA"
+
+    pet_ids_list = list(pet_id)
+    cache_key = CacheKeys.suggested_questions(
+        user_code, pet_ids_list, resolved_lang)
+
+    # Try cache first
+    questions_cached = True
+    questions_generated_at = ""
+    raw_cached_questions = await vk.get(cache_key)
+
+    if raw_cached_questions is not None:
+        try:
+            cached = json.loads(raw_cached_questions)
+            suggested_questions = cached.get("questions", [])
+            questions_generated_at = cached.get("generated_at", "")
+        except (json.JSONDecodeError, AttributeError):
+            suggested_questions = []
+    else:
+        suggested_questions = []
+
+    # Cache miss → serve evergreen immediately (no LLM call on mount)
+    if not suggested_questions:
+        questions_cached = False
+        suggested_questions = get_evergreen_questions(
+            resolved_lang, pet_count=len(pet_id))
 
     return {
         "status": "ok",
-        "confidence_score": score,
+        "confidence_score": avg_score,
         "confidence_color": color,
+        "suggested_questions": suggested_questions,
+        "questions_cached": questions_cached,
+        "questions_generated_at": questions_generated_at,
     }
 
 
+# ── Backward-compatible alias ───────────────────────────────────────────────
+
+@router.get("/confidence", summary="Confidence bar score (alias for /setup)")
+async def get_confidence(
+    request: Request,
+    pet_id: List[int] = Query(default=[]),
+) -> dict[str, Any]:
+    """
+    Backward-compatible alias — returns confidence score only.
+
+    Mobile clients may still call this. Returns the same confidence fields
+    as /setup but without suggested_questions.
+    """
+    user_code = _require_user_code(request)
+    pet_fetcher = request.app.state.pet_fetcher
+    vk: ValkeyClient = request.app.state.valkey
+
+    if not pet_id:
+        raise HTTPException(
+            status_code=400, detail="pet_id query parameter is required.")
+
+    scores: list[int] = []
+
+    for pid in pet_id:
+        try:
+            pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pid)
+        except PetFetchError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+        raw_cached = await vk.get(CacheKeys.profile(pid))
+        if raw_cached is not None:
+            active_raw = json.loads(raw_cached)
+        else:
+            try:
+                async with get_session() as db_session:
+                    ap_repo = ActiveProfileRepo(db_session)
+                    active_raw = await ap_repo.read_all(pid)
+            except Exception as db_exc:
+                logger.error(
+                    "DB error in /confidence — pet_id=%d: %s", pid, db_exc)
+                raise HTTPException(
+                    status_code=503, detail="Database unavailable — please retry.")
+            if active_raw:
+                await vk.setex(CacheKeys.profile(pid), jittered_ttl(TTL_PROFILE), json.dumps(active_raw))
+
+        ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
+        scores.append(calculate_confidence_score(
+            ctx["active_profile"], pet_profile))
+
+    avg_score = round(sum(scores) / len(scores))
+    color = confidence_color(avg_score)
+
+    return {
+        "status": "ok",
+        "confidence_score": avg_score,
+        "confidence_color": color,
+    }

@@ -13,13 +13,15 @@
 # AsyncIOScheduler (no new threads needed).
 
 # ── Standard library ────────────────────────────────────────────────────────
+import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # ── Our code ────────────────────────────────────────────────────────────────
-from app.cache.keys import CacheKeys
+from app.cache.keys import CacheKeys, TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl
 from app.db.session import get_session
-from app.db.repositories import ThreadRepo, ThreadMessageRepo, UserRepo
+from app.db.repositories import ThreadRepo, ThreadMessageRepo, UserRepo, ActiveProfileRepo
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,10 @@ async def run_nightly_jobs(app_state: Any) -> None:
         await _rebuild_relationship_summaries(app_state)
     except Exception as exc:
         logger.error("Nightly job _rebuild_relationship_summaries failed: %s", exc)
+    try:
+        await _pregenerate_suggested_questions(app_state)
+    except Exception as exc:
+        logger.error("Nightly job _pregenerate_suggested_questions failed: %s", exc)
     logger.info("Nightly jobs complete")
 
 
@@ -196,4 +202,288 @@ async def _rebuild_relationship_summaries(app_state: Any) -> None:
 
     logger.info(
         "Relationship summaries: updated %d / %d users", updated, len(user_codes),
+    )
+
+
+# ── Task 5: Pre-generate suggested questions ───────────────────────────────
+
+async def _pregenerate_suggested_questions(app_state: Any) -> None:
+    """
+    Pre-generate suggested home screen questions for all active users.
+
+    For each user with threads in the last 30 days:
+      1. Check if cached questions exist and are still fresh
+         (generated_at > max(active_profile.updated_at))
+      2. If stale or missing → generate via SuggestedQuestionsAgent → validate → cache
+
+    Uses the cheap/fast LLM model configured in settings.openai_model_suggestions.
+    Runs after relationship summaries so any profile updates from this job cycle
+    are already committed.
+    """
+    sq_agent = getattr(app_state, "suggested_questions_agent", None)
+    if sq_agent is None:
+        logger.info("_pregenerate_suggested_questions: agent not available, skipping")
+        return
+
+    vk = getattr(app_state, "valkey", None)
+    if vk is None:
+        logger.info("_pregenerate_suggested_questions: valkey not available, skipping")
+        return
+
+    pet_fetcher = getattr(app_state, "pet_fetcher", None)
+    if pet_fetcher is None:
+        logger.info("_pregenerate_suggested_questions: pet_fetcher not available, skipping")
+        return
+
+    from app.services.context_builder import build_pet_context
+    from app.services.question_validator import validate_questions
+    from app.services.question_templates import get_evergreen_questions
+    from app.services.pet_fetcher import PetFetchError
+    from app.core.config import settings
+    from app.db.models import Thread, ActiveProfile
+    from sqlalchemy import select, func
+
+    # ── 1. Find active users with their pet combinations ─────────────────
+    active_combos: list[dict] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    try:
+        async with get_session() as db_session:
+            stmt = (
+                select(
+                    Thread.user_id,
+                    Thread.pet_id,
+                    Thread.secondary_pet_id,
+                )
+                .where(Thread.started_at > cutoff.isoformat())
+                .distinct()
+            )
+            result = await db_session.execute(stmt)
+            for row in result.fetchall():
+                pet_ids = [row[1]]  # primary pet_id
+                if row[2]:          # secondary_pet_id
+                    pet_ids.append(row[2])
+                active_combos.append({
+                    "user_code": row[0],
+                    "pet_ids": pet_ids,
+                })
+    except Exception as exc:
+        logger.error("Suggested questions: failed to query active users: %s", exc)
+        return
+
+    if not active_combos:
+        logger.info("Suggested questions: no active users found")
+        return
+
+    logger.info("Suggested questions: processing %d user-pet combo(s)", len(active_combos))
+
+    # ── 2. For each combo, check staleness and regenerate if needed ──────
+    generated = 0
+    skipped = 0
+    failed = 0
+
+    # Use the _MODEL constant from the agent module (same pattern as all other agents).
+    # None = provider default from .env. Override _MODEL in the agent file to test models.
+    from app.agents.suggested_questions import _MODEL as sq_model
+    model = sq_model
+
+    # Compute the 4-week history cutoff once (not per-iteration)
+    history_cutoff_week = (datetime.now(timezone.utc) - timedelta(weeks=4)).strftime("%G-W%V")
+
+    for combo in active_combos:
+        user_code = combo["user_code"]
+        pet_ids = combo["pet_ids"]
+
+        try:
+            # Resolve language from user record
+            raw_user = await vk.get(CacheKeys.user(user_code))
+            if raw_user:
+                user_data = json.loads(raw_user)
+                language = user_data.get("preferred_language", "JA")
+                if language == "auto":
+                    language = "JA"
+            else:
+                async with get_session() as db_session:
+                    user_repo = UserRepo(db_session)
+                    user_data = await user_repo.read(user_code)
+                language = (user_data or {}).get("preferred_language", "JA")
+                if language == "auto":
+                    language = "JA"
+
+            cache_key = CacheKeys.suggested_questions(user_code, pet_ids, language)
+
+            # Check if cached questions exist and are fresh
+            raw_cached = await vk.get(cache_key)
+            if raw_cached:
+                cached = json.loads(raw_cached)
+                generated_at_str = cached.get("generated_at", "")
+
+                # Get max(updated_at) from active_profile for staleness check
+                # Use ORM query instead of raw SQL for asyncpg compatibility
+                profile_last_updated_str: str | None = None
+                try:
+                    async with get_session() as db_session:
+                        stmt = (
+                            select(func.max(ActiveProfile.updated_at))
+                            .where(
+                                ActiveProfile.pet_id.in_(pet_ids),
+                                ~ActiveProfile.field_key.startswith("_"),
+                            )
+                        )
+                        result = await db_session.execute(stmt)
+                        row = result.scalar()
+                        if row:
+                            profile_last_updated_str = str(row)
+                except Exception as db_exc:
+                    logger.debug("Suggested questions: staleness check DB error: %s", db_exc)
+
+                # Compare as ISO strings (both are ISO-8601, lexicographic comparison is valid)
+                if generated_at_str and profile_last_updated_str:
+                    if profile_last_updated_str <= generated_at_str:
+                        skipped += 1
+                        continue
+                elif generated_at_str and not profile_last_updated_str:
+                    # No profile data at all, cached questions are fine
+                    skipped += 1
+                    continue
+
+            # ── Generate questions ───────────────────────────────────────
+            pet_profiles = []
+            pet_contexts = []
+            for pid in pet_ids:
+                try:
+                    pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pid)
+                except PetFetchError:
+                    logger.debug("Suggested questions: AALDA fetch failed for pet_id=%d", pid)
+                    raise
+
+                pet_profiles.append(pet_profile)
+
+                raw_profile = await vk.get(CacheKeys.profile(pid))
+                if raw_profile:
+                    active_raw = json.loads(raw_profile)
+                else:
+                    async with get_session() as db_session:
+                        ap_repo = ActiveProfileRepo(db_session)
+                        active_raw = await ap_repo.read_all(pid)
+
+                ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
+                pet_contexts.append(ctx)
+
+            # Build context for the prompt
+            pets_json = json.dumps(
+                [{"name": p.get("name", ""), "species": p.get("species", ""),
+                  "breed": p.get("breed", ""), "age": c["active_profile"].get("age", {}).get("value", ""),
+                  "sex": p.get("sex", "")}
+                 for p, c in zip(pet_profiles, pet_contexts)],
+                ensure_ascii=False,
+            )
+
+            # Trusted context: high-confidence facts only
+            trusted = {}
+            for c in pet_contexts:
+                for key, entry in c["active_profile"].items():
+                    if isinstance(entry, dict) and entry.get("confidence", 0) >= 0.6:
+                        trusted[key] = entry.get("value", "")
+            trusted_json = json.dumps(trusted, ensure_ascii=False)
+
+            # Gather gap lists (deduplicated)
+            all_gaps: list[str] = []
+            for c in pet_contexts:
+                all_gaps.extend(c.get("gap_list", []))
+            gap_list = list(dict.fromkeys(all_gaps))
+
+            # Load recent question history
+            history_key = CacheKeys.suggested_history(user_code, pet_ids)
+            raw_history = await vk.get(history_key)
+            recent_questions: list[str] = []
+            history_entries: list[dict] = []
+            if raw_history:
+                try:
+                    history_entries = json.loads(raw_history)
+                    for entry in history_entries:
+                        recent_questions.extend(entry.get("questions", []))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Generate
+            questions = await sq_agent.generate(
+                language=language,
+                pet_count=len(pet_ids),
+                pets_json=pets_json,
+                trusted_context_json=trusted_json,
+                gap_list=gap_list,
+                recent_questions=recent_questions,
+                model=model,
+            )
+
+            if not questions:
+                questions = get_evergreen_questions(language, pet_count=len(pet_ids))
+                logger.debug("Suggested questions: LLM failed, using evergreen for user=%s", user_code)
+
+            # Validate
+            all_passed, failed_indices, reasons = validate_questions(
+                questions, language, len(pet_ids), recent_questions,
+            )
+
+            if not all_passed and questions[0].get("reason_type") != "evergreen":
+                # Try one regeneration
+                questions_retry = await sq_agent.generate(
+                    language=language,
+                    pet_count=len(pet_ids),
+                    pets_json=pets_json,
+                    trusted_context_json=trusted_json,
+                    gap_list=gap_list,
+                    recent_questions=recent_questions,
+                    model=model,
+                )
+                if questions_retry:
+                    passed2, _, _ = validate_questions(
+                        questions_retry, language, len(pet_ids), recent_questions,
+                    )
+                    if passed2:
+                        questions = questions_retry
+                    else:
+                        # Replace failed items with evergreen
+                        evergreen = get_evergreen_questions(language, pet_count=len(pet_ids))
+                        for idx in failed_indices:
+                            if idx < len(evergreen):
+                                questions[idx] = evergreen[idx]
+
+            # Cache the result
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cache_value = json.dumps({
+                "generated_at": now_iso,
+                "questions": questions,
+            })
+            await vk.setex(cache_key, jittered_ttl(TTL_SUGGESTED), cache_value)
+
+            # Update history — prune entries older than 4 weeks
+            current_week = datetime.now(timezone.utc).strftime("%G-W%V")
+            history_entries = [
+                e for e in history_entries
+                if e.get("week", "") >= history_cutoff_week
+            ]
+            history_entries.append({
+                "week": current_week,
+                "questions": [q["text"] for q in questions],
+            })
+            await vk.setex(
+                history_key,
+                jittered_ttl(TTL_SUGGESTED_HISTORY),
+                json.dumps(history_entries),
+            )
+
+            generated += 1
+            logger.debug("Suggested questions: generated for user=%s pets=%s", user_code, pet_ids)
+
+        except Exception as exc:
+            failed += 1
+            logger.error(
+                "Suggested questions: failed for user=%s pets=%s error=%s",
+                user_code, pet_ids, exc,
+            )
+
+    logger.info(
+        "Suggested questions: generated=%d skipped=%d failed=%d total=%d",
+        generated, skipped, failed, len(active_combos),
     )

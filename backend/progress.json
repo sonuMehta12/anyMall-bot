@@ -875,6 +875,19 @@
       "notes": "Alembic migration 1d20aafa64c5 applied: adds ix_fact_log_pet_id_extracted_at (composite) + ix_threads_expires_at. Also fixed models.py to declare ix_threads_one_active_per_pet partial unique index to prevent Alembic from dropping it on future autogenerate."
     },
     {
+      "id": "ft-017",
+      "name": "Replace session_id with thread_id in fact_log and active_profile",
+      "description": "fact_log.session_id and active_profile.session_id currently store the Flutter client-generated UUID (from ChatRequest.session_id). This is a dangling string — it references no DB row and cannot be JOINed. thread_id (the backend-generated UUID in anymall_chan_threads) represents the same conversation and IS a real FK-joinable value. Replacing session_id with thread_id in these two tables: (1) removes the confusion of two IDs for the same conversation, (2) makes fact_log.session_id a real reference to threads.thread_id, (3) allows HistoryBuilder and debug queries to JOIN fact_log → threads for metadata (started_at, expires_at, pet_id). Also requires Alembic migration to rename column (or keep name, just store thread_id value). count_distinct_sessions_since() in FactLogRepo continues to work unchanged — it counts distinct values, the value is just thread_id now instead of Flutter UUID.",
+      "files": [
+        "app/db/repositories.py",
+        "app/agents/aggregator.py",
+        "migrations/versions/<new_migration>.py"
+      ],
+      "status": "not-started",
+      "priority": "low",
+      "notes": "One-line change in repositories.py (FactLogRepo.append and append_bulk: use thread_id instead of fact.get('session_id')). One-line change in aggregator.py (ActiveProfile write: use thread_id). Optional: rename column session_id -> thread_id in a migration for clarity. AgentState already carries both session_id and thread_id — just switch which one is written to DB."
+    },
+    {
       "id": "ft-014",
       "name": "SSE compaction notifications + message queuing",
       "description": "Use Server-Sent Events (SSE) to notify the frontend when compaction is running. While compaction is in progress for a thread, incoming messages for that thread are queued (not dropped, not blocked silently). Frontend shows a 'processing' state. Once compaction finishes, queued messages are processed and frontend is notified it can resume. This replaces the current pattern where the per-thread lock makes Request B wait silently during compaction.",
@@ -909,7 +922,7 @@
     "complete": 76,
     "in_progress": 0,
     "blocked": 0,
-    "not_started": 4,
+    "not_started": 5,
     "note": "Phase 0-2 + API v1 + Sprint 2-6 + ft-005 (Valkey) + ft-013 (HistoryBuilder) + ft-015 (Sprint 6 pipeline) + ft-016 (AALDA alignment + user fields) complete. AALDA write-back decided unnecessary. User fields wired (display_name, language priority, owner_name). Next: Phase 4 (JWT auth + rate limiting)."
   }
 }

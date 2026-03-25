@@ -178,7 +178,8 @@ def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[Extracted
         try:
             confidence = float(item["confidence"])
         except (KeyError, TypeError, ValueError):
-            logger.warning("Compressor: fact[%d] has invalid confidence — skipped", i)
+            logger.warning(
+                "Compressor: fact[%d] has invalid confidence — skipped", i)
             continue
 
         if confidence < min_confidence:
@@ -191,7 +192,8 @@ def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[Extracted
         try:
             # Validate pet_label — must be "pet_a" or "pet_b", default "pet_a"
             raw_label = str(item.get("pet_label", "pet_a"))
-            pet_label = raw_label if raw_label in ("pet_a", "pet_b") else "pet_a"
+            pet_label = raw_label if raw_label in (
+                "pet_a", "pet_b") else "pet_a"
 
             fact = ExtractedFact(
                 key=str(item["key"]),
@@ -206,7 +208,8 @@ def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[Extracted
             )
             results.append(fact)
         except (KeyError, TypeError) as exc:
-            logger.warning("Compressor: fact[%d] malformed (%s) — skipped", i, exc)
+            logger.warning(
+                "Compressor: fact[%d] malformed (%s) — skipped", i, exc)
 
     return results
 
@@ -226,6 +229,12 @@ class CompressorAgent:
     # Minimum confidence for a fact to be returned at all.
     # Facts below this are discarded completely (too speculative to be useful).
     _MIN_CONFIDENCE: float = 0.50
+
+    # ── Model configuration ───────────────────────────────────────────────────
+    # Model to use for this agent. None = use provider default (set in .env).
+    # Change this to test a specific model, e.g. "gpt-5.4-nano".
+    # See design-docs/model-strategy.md for full rationale.
+    _MODEL: str | None = None
 
     def __init__(self, llm: LLMProvider) -> None:
         self._llm = llm
@@ -262,6 +271,7 @@ class CompressorAgent:
                 messages=[{"role": "user", "content": user_prompt}],
                 temperature=0.0,   # deterministic — extraction, not generation
                 max_tokens=600,    # enough for ~5 facts in JSON (dual-pet may return more)
+                model=self._MODEL, # None = provider default; set above to test a model
             )
         except LLMProviderError as exc:
             logger.error("Compressor: LLM call failed: %s", exc)

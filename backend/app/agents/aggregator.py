@@ -152,6 +152,17 @@ class AggregatorAgent:
                         json.dumps(profile),
                     )
 
+                # Bust suggested-questions cache for this user — profile data
+                # changed, so pre-generated questions may reference stale gaps.
+                # Wildcard delete hits all pet/language combos for this user.
+                if self._valkey is not None and user_code:
+                    pattern = CacheKeys.suggested_pattern(user_code)
+                    try:
+                        await self._valkey.delete_pattern(pattern)
+                    except Exception as sq_exc:
+                        # Non-fatal — questions will just be stale until nightly refresh
+                        logger.debug("Suggested-questions cache bust failed: %s", sq_exc)
+
             logger.info(
                 "Aggregator done — session=%s facts=%d changes=%d",
                 session_id, len(facts), changes,

@@ -25,7 +25,8 @@
       "WebFetch(domain:aiven.io)",
       "WebFetch(domain:leapcell.io)",
       "Bash(.venv/Scripts/python tests/run_e2e.py)",
-      "Bash(.venv/Scripts/python tests/test_sprint6.py)"
+      "Bash(.venv/Scripts/python tests/test_sprint6.py)",
+      "WebFetch(domain:platform.openai.com)"
     ]
   }
 }

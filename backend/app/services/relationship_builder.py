@@ -32,6 +32,12 @@ from app.types import UserProfileWriter
 
 logger = logging.getLogger(__name__)
 
+# ── Model configuration ────────────────────────────────────────────────────────
+# Model to use for this service. None = use provider default (set in .env).
+# Change this to test a specific model, e.g. "gpt-5.4-nano".
+# See design-docs/model-strategy.md for full rationale.
+_MODEL: str | None = None
+
 RELATIONSHIP_SYSTEM_PROMPT = """You are a relationship context builder for a pet companion app.
 
 Your job is to synthesize observations about how a pet owner communicates and write a
@@ -102,7 +108,8 @@ class RelationshipBuilder:
             system_prompt=RELATIONSHIP_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
             temperature=0.0,
-            max_tokens=200,
+            max_tokens=200,    # 2-4 sentence relationship summary
+            model=_MODEL,      # None = provider default; set above to test a model
         )
 
         summary = result.strip()

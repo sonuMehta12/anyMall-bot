@@ -24,8 +24,6 @@ from datetime import date
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any
 
-# time is still used in _fetch_from_aalda for elapsed_ms logging
-
 import httpx
 
 from app.cache.keys import CacheKeys, TTL_AALDA, jittered_ttl

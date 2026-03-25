@@ -38,8 +38,7 @@ class Settings(BaseSettings):
 
     # ── LLM Provider ──────────────────────────────────────────────────────────
     # Which LLM backend to use.  Matches LLM_PROVIDER in .env.
-    # Valid values: "azure"
-    # Phase 1 will add "openai" as a valid value.
+    # Valid values: "azure" | "openai"
     llm_provider: str = "azure"
 
     # ── Azure OpenAI ──────────────────────────────────────────────────────────
@@ -52,10 +51,12 @@ class Settings(BaseSettings):
     azure_openai_api_version: str = "2025-01-01-preview"
     azure_openai_deployment_chat: str = "gpt-4.1"
 
-    # ── Future: direct OpenAI (Phase 1+) ─────────────────────────────────────
-    # Not used yet.  Defined here so the Settings class is already ready.
+    # ── Direct OpenAI ──────────────────────────────────────────────────────
+    # Used when llm_provider == "openai".
+    # OPENAI_API_KEY is required. OPENAI_MODEL_CHAT sets the default model
+    # for all agents (overridable per-agent via _MODEL constant in each file).
     openai_api_key: str | None = None
-    openai_model_chat: str = "gpt-4o"
+    openai_model_chat: str = "gpt-5.4"
 
     # ── Database (Phase 1C) ────────────────────────────────────────────────
     # PostgreSQL connection string for async SQLAlchemy.

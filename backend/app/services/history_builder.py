@@ -28,6 +28,12 @@ from app.llm.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
+# ── Model configuration ────────────────────────────────────────────────────────
+# Model to use for this service. None = use provider default (set in .env).
+# Change this to test a specific model, e.g. "gpt-5.4-nano".
+# See design-docs/model-strategy.md for full rationale.
+_MODEL: str | None = None
+
 # ── Facts included in history narrative ────────────────────────────────────
 # These field_key values represent health-influencing events.
 # Stable current-state fields (e.g. diet_type without change context) are
@@ -142,7 +148,8 @@ class HistoryBuilder:
             system_prompt=HISTORY_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=500,    # 3-6 sentence narrative needs headroom
+            model=_MODEL,      # None = provider default; set above to test a model
         )
 
         narrative = result.strip()

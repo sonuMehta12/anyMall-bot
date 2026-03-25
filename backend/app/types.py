@@ -84,3 +84,4 @@ class StateBag(Protocol):
     scheduler: Any           # AsyncIOScheduler — nightly cron jobs (Sprint 6)
     history_builder: Any     # HistoryBuilder — fact_log → _pet_history narrative (ft-013)
     relationship_builder: Any  # RelationshipBuilder — USER STYLE → relationship_summary (Sprint 6)
+    suggested_questions_agent: Any  # SuggestedQuestionsAgent — home screen question generator

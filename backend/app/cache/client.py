@@ -257,6 +257,35 @@ class ValkeyClient:
         except _VALKEY_ERRORS:
             return False
 
+    async def delete_pattern(self, pattern: str) -> int:
+        """
+        Delete all keys matching a glob pattern using SCAN (non-blocking).
+
+        Uses SCAN instead of KEYS to avoid blocking the Valkey event loop
+        on large keyspaces.  Returns total number of keys deleted, or 0 on
+        connection failure.
+
+        Example:
+            await vk.delete_pattern("am:suggested:U-4421:*")
+        """
+        if not self._should_allow_request():
+            return 0
+        try:
+            total = 0
+            cursor = 0
+            while True:
+                cursor, keys = await self._client.scan(cursor, match=pattern, count=100)
+                if keys:
+                    total += await self._client.delete(*keys)
+                if cursor == 0:
+                    break
+            self._record_success()
+            return total
+        except _VALKEY_ERRORS as exc:
+            self._record_failure()
+            logger.warning("Valkey DELETE_PATTERN failed — pattern=%s error=%s", pattern, exc)
+            return 0
+
     async def aclose(self) -> None:
         """Close the underlying connection pool gracefully on shutdown."""
         await self._client.aclose()

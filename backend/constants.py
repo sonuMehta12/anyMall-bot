@@ -280,6 +280,9 @@ FIELD_LABELS: dict[str, str] = {
     "behavioral_traits": "Behavioral Traits",
     "microchipped":     "Microchipped",
     "insurance":        "Pet Insurance",
+    "meal_frequency":   "Meal Frequency",
+    "bathroom_habits":  "Bathroom Habits",
+    "indoor_outdoor":   "Indoor / Outdoor",
 }
 
 

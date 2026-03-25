@@ -48,6 +48,7 @@ from app.agents.conversation import ConversationAgent
 from app.agents.intent_classifier import IntentClassifier
 from app.agents.compressor import CompressorAgent
 from app.agents.aggregator import AggregatorAgent
+from app.agents.suggested_questions import SuggestedQuestionsAgent
 from app.services.pet_fetcher import PetFetcher
 from app.db.session import init_db, dispose_engine, get_session
 from app.db.repositories import UserRepo, ThreadRepo, ThreadMessageRepo
@@ -150,6 +151,7 @@ async def lifespan(app: FastAPI):
     app.state.aggregator = AggregatorAgent(get_session=get_session, valkey=app.state.valkey)
     app.state.thread_summarizer = ThreadSummarizer(llm=llm)
     app.state.history_builder = HistoryBuilder(llm=llm)
+    app.state.suggested_questions_agent = SuggestedQuestionsAgent(llm=llm)
 
     # ── RelationshipBuilder — USER STYLE summaries → relationship_summary ─
     # UserProfileWriter Protocol: current impl writes directly to PostgreSQL.

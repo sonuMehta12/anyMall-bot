@@ -17,7 +17,6 @@ import logging
 
 from app.core.config import Settings
 from app.llm.base import LLMProvider
-from app.llm.azure_openai import AzureOpenAIProvider
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +39,7 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
     logger.info("Creating LLM provider: %s", provider_name)
 
     if provider_name == "azure":
+        from app.llm.azure_openai import AzureOpenAIProvider
         # Validate that all Azure-specific vars are present.
         # We check here (not in Settings) because these vars are only required
         # when llm_provider == "azure" — future providers need different vars.

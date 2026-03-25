@@ -19,6 +19,12 @@ from app.llm.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
+# ── Model configuration ────────────────────────────────────────────────────────
+# Model to use for this service. None = use provider default (set in .env).
+# Change this to test a specific model, e.g. "gpt-5.4-nano".
+# See design-docs/model-strategy.md for full rationale.
+_MODEL: str | None = None
+
 SUMMARIZER_SYSTEM_PROMPT = """You are a conversation summarizer for a pet companion chat application.
 
 Summarize the conversation into EXACTLY two labeled sections:
@@ -88,7 +94,8 @@ class ThreadSummarizer:
             system_prompt=SUMMARIZER_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
             temperature=0.0,
-            max_tokens=500,  # two-section format needs slightly more room than single-section
+            max_tokens=500,    # two-section format needs slightly more room than single-section
+            model=_MODEL,      # None = provider default; set above to test a model
         )
 
         logger.info(

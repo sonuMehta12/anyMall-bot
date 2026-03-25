@@ -70,7 +70,8 @@ class UserRepo:
                 user_code,
             )
         else:
-            logger.debug("users: updated relationship_summary for user_code=%s", user_code)
+            logger.debug(
+                "users: updated relationship_summary for user_code=%s", user_code)
 
     async def upsert(self, data: dict) -> None:
         """Insert or update a user record.  Auto-called on every chat request."""
@@ -194,7 +195,8 @@ class ActiveProfileRepo:
                 ))
             else:
                 # Skip unrecognized entries (defensive).
-                logger.warning("Skipping unrecognized active_profile key: %s", field_key)
+                logger.warning(
+                    "Skipping unrecognized active_profile key: %s", field_key)
                 skipped += 1
                 continue
 
@@ -211,7 +213,6 @@ class ActiveProfileRepo:
             pet_id,
             skipped,
         )
-
 
     async def write_history(self, pet_id: int, history: str, last_updated: str, user_code: str = "") -> None:
         """
@@ -233,7 +234,8 @@ class ActiveProfileRepo:
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=["pet_id", "field_key"],
-                set_={"value": stmt.excluded.value, "user_code": stmt.excluded.user_code},
+                set_={"value": stmt.excluded.value,
+                      "user_code": stmt.excluded.user_code},
             )
             await self._session.execute(stmt)
 
@@ -281,7 +283,8 @@ class FactLogRepo:
                 uncertainty=fact.get("uncertainty", ""),
                 source_quote=fact.get("source_quote", ""),
                 timestamp=fact.get("timestamp"),
-                needs_clarification=bool(fact.get("needs_clarification", False)),
+                needs_clarification=bool(
+                    fact.get("needs_clarification", False)),
                 pet_label=fact.get("pet_label", "pet_a"),
                 extracted_at=fact.get("extracted_at", ""),
             )
@@ -289,7 +292,8 @@ class FactLogRepo:
         ]
         self._session.add_all(rows)
         await self._session.commit()
-        logger.debug("fact_log: appended %d facts for pet_id=%s", len(rows), pet_id)
+        logger.debug("fact_log: appended %d facts for pet_id=%s",
+                     len(rows), pet_id)
 
     async def append_bulk(self, facts_with_pets: list[tuple[list[dict], int]], user_code: str = "") -> None:
         """
@@ -318,7 +322,8 @@ class FactLogRepo:
                     uncertainty=fact.get("uncertainty", ""),
                     source_quote=fact.get("source_quote", ""),
                     timestamp=fact.get("timestamp"),
-                    needs_clarification=bool(fact.get("needs_clarification", False)),
+                    needs_clarification=bool(
+                        fact.get("needs_clarification", False)),
                     pet_label=fact.get("pet_label", "pet_a"),
                     extracted_at=fact.get("extracted_at", ""),
                 )
@@ -360,7 +365,6 @@ class FactLogRepo:
         rows = result.scalars().all()
 
         return [row.to_dict() for row in rows]
-
 
     async def read_since(
         self,
@@ -458,7 +462,8 @@ class ThreadRepo:
         )
         self._session.add(thread)
         await self._session.commit()
-        logger.info("Thread created: thread_id=%s pet_id=%s secondary=%s", thread_id, pet_id, secondary_pet_id)
+        logger.info("Thread created: thread_id=%s pet_id=%s secondary=%s",
+                    thread_id, pet_id, secondary_pet_id)
         return thread.to_dict()
 
     async def get_active(self, pet_id: int) -> dict | None:
@@ -507,7 +512,8 @@ class ThreadRepo:
         if thread:
             thread.secondary_pet_id = secondary_pet_id
             await self._session.commit()
-            logger.debug("Thread %s: set secondary_pet_id=%s", thread_id, secondary_pet_id)
+            logger.debug("Thread %s: set secondary_pet_id=%s",
+                         thread_id, secondary_pet_id)
 
     async def expire(self, thread_id: str) -> None:
         """Mark a thread as expired."""
@@ -558,7 +564,8 @@ class ThreadRepo:
         Returns list of thread dicts.
         """
         now = datetime.now(timezone.utc).isoformat()
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=hours_back)).isoformat()
         stmt = (
             select(Thread)
             .where(
@@ -617,7 +624,8 @@ class ThreadRepo:
         Returns list of thread dicts (deduplicate user_ids in the caller).
         """
         now = datetime.now(timezone.utc).isoformat()
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=hours_back)).isoformat()
         stmt = (
             select(Thread)
             .where(

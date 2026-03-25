@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 MAX_ATTEMPTS: int = 2         # 1 original + 1 retry
 CONFIDENCE_THRESHOLD: int = 5  # retry if confidence < 5 (scale 1–10)
 
+# ── Model configuration ──────────────────────────────────────────────────────
+# Model to use for this agent. None = use provider default (set in .env).
+# Change this to test a specific model, e.g. "gpt-5.4-nano".
+# See design-docs/model-strategy.md for full rationale.
+_MODEL: str | None = None
+
 _VALID_INTENTS: frozenset[str] = frozenset({INTENT_HEALTH, INTENT_FOOD, INTENT_GENERAL})
 _VALID_URGENCIES: frozenset[str] = frozenset({URGENCY_HIGH, URGENCY_MEDIUM, URGENCY_LOW})
 
@@ -136,6 +142,7 @@ class IntentClassifier:
                     messages=[{"role": "user", "content": message}],
                     temperature=0.0,   # deterministic — classification, not generation
                     max_tokens=48,     # {"intent":"health","urgency":"high","confidence":9} + slack
+                    model=_MODEL,      # None = provider default; set above to test a model
                 )
             except LLMProviderError as exc:
                 # Infrastructure problem — retrying won't help.
