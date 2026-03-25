@@ -406,7 +406,7 @@ def test_char_limit_latin():
 # ══════════════════════════════════════════════════════════════════════════════
 
 BASE = "http://127.0.0.1:8000"
-TEST_USER_CODE = "U-TEST-SQ-001"
+TEST_USER_CODE = "3AOU9K1PWH"
 
 
 def run_integration_tests():

@@ -19,11 +19,10 @@
 # which is populated by lifespan() in main.py. No module-level globals.
 
 # ── Standard library ───────────────────────────────────────────────────────────
-from app.routes.background import _create_tracked_task, _run_background, _run_compaction
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, List
 from uuid import uuid4
 
@@ -32,6 +31,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 # ── Our code ───────────────────────────────────────────────────────────────────
+from app.routes.background import _create_tracked_task, _run_background
 from app.agents.conversation import AgentResponse
 from app.agents.state import AgentState, PetInfo
 from app.services.guardrails import apply_guardrails

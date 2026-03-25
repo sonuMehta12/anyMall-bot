@@ -18,10 +18,19 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+# ── Third-party ─────────────────────────────────────────────────────────────
+from sqlalchemy import func, select
+
 # ── Our code ────────────────────────────────────────────────────────────────
 from app.cache.keys import CacheKeys, TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl
+from app.core.config import settings
+from app.db.models import ActiveProfile, Thread
+from app.db.repositories import ActiveProfileRepo, ThreadMessageRepo, ThreadRepo, UserRepo
 from app.db.session import get_session
-from app.db.repositories import ThreadRepo, ThreadMessageRepo, UserRepo, ActiveProfileRepo
+from app.services.context_builder import build_pet_context
+from app.services.pet_fetcher import PetFetchError
+from app.services.question_templates import get_evergreen_questions
+from app.services.question_validator import validate_questions
 
 logger = logging.getLogger(__name__)
 
@@ -235,14 +244,6 @@ async def _pregenerate_suggested_questions(app_state: Any) -> None:
         logger.info("_pregenerate_suggested_questions: pet_fetcher not available, skipping")
         return
 
-    from app.services.context_builder import build_pet_context
-    from app.services.question_validator import validate_questions
-    from app.services.question_templates import get_evergreen_questions
-    from app.services.pet_fetcher import PetFetchError
-    from app.core.config import settings
-    from app.db.models import Thread, ActiveProfile
-    from sqlalchemy import select, func
-
     # ── 1. Find active users with their pet combinations ─────────────────
     active_combos: list[dict] = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)
@@ -353,7 +354,6 @@ async def _pregenerate_suggested_questions(app_state: Any) -> None:
                 try:
                     pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pid)
                 except PetFetchError:
-                    logger.debug("Suggested questions: AALDA fetch failed for pet_id=%d", pid)
                     raise
 
                 pet_profiles.append(pet_profile)

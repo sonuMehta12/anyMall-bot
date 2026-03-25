@@ -44,10 +44,10 @@ from app.cache.client import ValkeyClient
 from app.cache.keys import CacheKeys, TTL_HEALTH, jittered_ttl
 from app.core.config import settings
 from app.llm.factory import create_llm_provider
+from app.agents.aggregator import AggregatorAgent
+from app.agents.compressor import CompressorAgent
 from app.agents.conversation import ConversationAgent
 from app.agents.intent_classifier import IntentClassifier
-from app.agents.compressor import CompressorAgent
-from app.agents.aggregator import AggregatorAgent
 from app.agents.suggested_questions import SuggestedQuestionsAgent
 from app.services.pet_fetcher import PetFetcher
 from app.db.session import init_db, dispose_engine, get_session
@@ -314,7 +314,7 @@ async def health_v1() -> dict[str, Any]:
 
     Checks LLM reachability via health_check() and caches the result in
     Valkey for 60 seconds (S-09 fix).  Monitoring tools hit /health every
-    10-30 seconds — without caching that's ~86K Azure API calls/month.
+    10-30 seconds — without caching that's ~86K LLM API calls/month.
     With a 60s TTL cache, that drops to ~1,440/month.
     """
     vk: ValkeyClient = getattr(app.state, "valkey", None)
