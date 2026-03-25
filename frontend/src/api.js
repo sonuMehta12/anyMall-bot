@@ -116,9 +116,21 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
 }
 
 
-// GET /api/v1/confidence — confidence score for one or more pets.
-// Accepts a single id or an array: fetchConfidence(101, ...) or fetchConfidence([101, 102], ...)
-// For dual-pet, the backend returns an averaged score automatically.
+// GET /api/v1/setup — confidence score + suggested questions.
+// Replaces the old /confidence endpoint. Returns confidence_score, confidence_color,
+// and suggested_questions (4 items for the home screen).
+export async function fetchSetup(petIds, userCode, language = 'auto') {
+  const ids = Array.isArray(petIds) ? petIds : [petIds]
+  const query = ids.map(id => `pet_id=${id}`).join('&') + `&language=${language}`
+  const res = await fetch(`${BASE}/api/v1/setup?${query}`, {
+    headers: { 'X-User-Code': userCode },
+  })
+  if (!res.ok) throw new Error(`${res.status} — failed to fetch setup`)
+  return res.json()
+}
+
+// GET /api/v1/confidence — backward-compatible alias (confidence only, no questions).
+// Still used by the post-chat refresh (only needs score, not questions).
 export async function fetchConfidence(petIds, userCode) {
   const ids = Array.isArray(petIds) ? petIds : [petIds]
   const query = ids.map(id => `pet_id=${id}`).join('&')

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ChatBubble from '../components/ChatBubble.jsx'
 import ConfidenceBar from '../components/ConfidenceBar.jsx'
-import { sendMessage, fetchConfidence, BASE } from '../api.js'
+import { sendMessage, fetchSetup, fetchConfidence, BASE } from '../api.js'
 import './Chat.css'
 
 const SPECIES_EMOJI = { dog: '🐕', cat: '🐱' }
@@ -19,6 +19,7 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
   const [confidenceScore, setConfidenceScore] = useState(0)
   const [confidenceColor, setConfidenceColor] = useState('red')
   const [activeRedirect, setActiveRedirect] = useState(null)
+  const [suggestedQuestions, setSuggestedQuestions] = useState([])
 
   const messagesEndRef = useRef(null)
   const textareaRef = useRef(null)
@@ -32,15 +33,18 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isTyping])
 
-  // Fetch confidence score on mount (averaged across all selected pets)
+  // Fetch setup (confidence + suggested questions) on mount
   useEffect(() => {
     if (!primaryPet) return
-    fetchConfidence(petIds, userCode)
+    fetchSetup(petIds, userCode, language)
       .then(data => {
         setConfidenceScore(data.confidence_score ?? 0)
         setConfidenceColor(data.confidence_color ?? 'red')
+        if (data.suggested_questions?.length) {
+          setSuggestedQuestions(data.suggested_questions)
+        }
       })
-      .catch(err => console.warn('Could not fetch initial confidence:', err))
+      .catch(err => console.warn('Could not fetch setup:', err))
   }, [])
 
   // Show opening greeting when chat first mounts
@@ -55,13 +59,14 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
     setMessages([{ id: 1, text: greeting, isUser: false }])
   }, [])
 
-  async function handleSend() {
-    const text = inputText.trim()
+  async function handleSend(overrideText) {
+    const text = (overrideText || inputText).trim()
     if (!text || isTyping) return
 
     setInputText('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
+    setSuggestedQuestions([])  // hide chips once user sends any message
     setMessages(prev => [...prev, { id: Date.now(), text, isUser: true }])
     setIsTyping(true)
 
@@ -74,9 +79,6 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
         language,
         displayName: 'Sarah',
       })
-
-      setConfidenceScore(data.confidence_score ?? 0)
-      setConfidenceColor(data.confidence_color ?? 'red')
 
       if (data.redirect) {
         console.log('[Redirect payload]', data.redirect)
@@ -109,6 +111,14 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
         isUser: false,
       }])
     }
+  }
+
+  function handleChipTap(questionText) {
+    if (isTyping) return
+    // Set the input text and let handleSend do the rest
+    setInputText(questionText)
+    // Use a microtask so React flushes the state update before handleSend reads it
+    setTimeout(() => handleSend(questionText), 0)
   }
 
   function handleKeyDown(e) {
@@ -146,6 +156,21 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
         {messages.map(msg => (
           <ChatBubble key={msg.id} message={msg.text} isUser={msg.isUser} />
         ))}
+
+        {/* Suggested question chips — shown only on blank state */}
+        {suggestedQuestions.length > 0 && messages.length <= 1 && !isTyping && (
+          <div className="chat-suggested-questions">
+            {suggestedQuestions.map((q, i) => (
+              <button
+                key={i}
+                className="suggested-chip"
+                onClick={() => handleChipTap(q.text)}
+              >
+                {q.text}
+              </button>
+            ))}
+          </div>
+        )}
 
         {isTyping && <ChatBubble isTyping />}
 
