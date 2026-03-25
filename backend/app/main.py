@@ -5,7 +5,7 @@
 # What lives here:
 #   - App creation + CORS config
 #   - Lifespan: connect DB, create LLM provider + agents + pet_fetcher, store on app.state
-#   - GET /health — liveness check (infrastructure, stays with the app)
+#   - GET /health_v1 — liveness check (infrastructure, stays with the app)
 #   - Error handlers — standardised error contract for Flutter
 #   - include_router() calls to wire in route modules
 #
@@ -307,8 +307,8 @@ app.include_router(simulator_router)
 
 # ── Infrastructure route (stays in main.py — no /api/v1 prefix) ──────────────
 
-@app.get("/health", summary="Liveness check")
-async def health() -> dict[str, Any]:
+@app.get("/health_v1", summary="Liveness check")
+async def health_v1() -> dict[str, Any]:
     """
     Returns 200 if server is up.
 
