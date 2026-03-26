@@ -14,7 +14,7 @@
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
 import dataclasses
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from typing import Any
@@ -22,14 +22,18 @@ from uuid import uuid4
 
 # ── Our code ───────────────────────────────────────────────────────────────────
 from app.agents.state import AgentState
+from app.agents.suggested_questions import _MODEL as _SQ_MODEL
 from app.cache.keys import (
     CacheKeys, LUA_APPEND_MESSAGES, LUA_RELEASE_LOCK,
-    TTL_COMPACTING, TTL_PENDING, TTL_SESSION, jittered_ttl,
+    TTL_COMPACTING, TTL_PENDING, TTL_SESSION, TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl,
 )
 from app.db.session import get_session
 from app.db.repositories import (
     ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo,
 )
+from app.services.context_builder import build_pet_context
+from app.services.question_validator import validate_questions
+from app.services.question_templates import get_evergreen_questions
 from app.types import StateBag
 from constants import THREAD_COMPACTION_THRESHOLD, THREAD_CONTEXT_WINDOW
 
@@ -208,6 +212,17 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
                 for label, pet_facts in high_by_pet.items()
             ])
 
+            # ── Immediately regenerate suggested questions (profile just changed) ──
+            # Aggregator already busted the cache above. Fill it now so the user
+            # sees fresh personalized questions on their very next /setup call —
+            # without waiting for the nightly job at midnight.
+            _create_tracked_task(
+                _regen_suggested_questions(
+                    state.user_code, [p.id for p in state.pets], state_bag,
+                ),
+                state_bag,
+            )
+
         # ── HistoryBuilder — rebuild pet history narrative (ft-013) ──────
         # Runs after Aggregator so both pipelines use the same high-confidence facts.
         # Each pet wrapped in its own try/except — a HistoryBuilder failure must NOT
@@ -287,6 +302,182 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
         logger.error(
             "Background pipeline failed — session=%s error=%s",
             state.session_id, exc,
+        )
+
+
+async def _regen_suggested_questions(
+    user_code: str,
+    pet_ids: list[int],
+    state_bag: StateBag,
+) -> None:
+    """
+    Immediately regenerate suggested questions after the aggregator updates the profile.
+
+    Called fire-and-forget from _run_background when high-confidence facts are merged.
+    The aggregator has already busted the suggested-questions cache (deleted the key).
+    This fills it back with fresh personalized questions so the user sees them on their
+    very next /setup call — without waiting until the nightly job at midnight.
+
+    Mirrors the per-combo generation logic in nightly._pregenerate_suggested_questions.
+    If generation fails for any reason it logs and returns silently — the endpoint will
+    serve evergreen on the next open and the nightly job will fill the cache overnight.
+    """
+    sq_agent = getattr(state_bag, "suggested_questions_agent", None)
+    vk = getattr(state_bag, "valkey", None)
+    pet_fetcher = getattr(state_bag, "pet_fetcher", None)
+
+    if sq_agent is None or vk is None or pet_fetcher is None:
+        logger.debug("_regen_suggested_questions: required services unavailable, skipping")
+        return
+
+    try:
+        # Resolve language from cached user record
+        language = "JA"
+        raw_user = await vk.get(CacheKeys.user(user_code))
+        if raw_user:
+            user_data = json.loads(raw_user)
+            lang = user_data.get("preferred_language", "JA")
+            language = lang if lang != "auto" else "JA"
+
+        # Fetch pet profiles and build context
+        pet_profiles = []
+        pet_contexts = []
+        for pid in pet_ids:
+            pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pid)
+            pet_profiles.append(pet_profile)
+
+            raw_profile = await vk.get(CacheKeys.profile(pid))
+            if raw_profile:
+                active_raw = json.loads(raw_profile)
+            else:
+                async with get_session() as db_session:
+                    ap_repo = ActiveProfileRepo(db_session)
+                    active_raw = await ap_repo.read_all(pid)
+
+            ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
+            pet_contexts.append(ctx)
+
+        # Build prompt context (mirrors nightly job)
+        pets_json = json.dumps(
+            [
+                {
+                    "name": p.get("name", ""),
+                    "species": p.get("species", ""),
+                    "breed": p.get("breed", ""),
+                    "age": c["active_profile"].get("age", {}).get("value", ""),
+                    "sex": p.get("sex", ""),
+                }
+                for p, c in zip(pet_profiles, pet_contexts)
+            ],
+            ensure_ascii=False,
+        )
+
+        trusted = {}
+        for c in pet_contexts:
+            for key, entry in c["active_profile"].items():
+                if isinstance(entry, dict) and entry.get("confidence", 0) >= 0.6:
+                    trusted[key] = entry.get("value", "")
+        trusted_json = json.dumps(trusted, ensure_ascii=False)
+
+        all_gaps: list[str] = []
+        for c in pet_contexts:
+            all_gaps.extend(c.get("gap_list", []))
+        gap_list = list(dict.fromkeys(all_gaps))
+
+        # Load recent history for anti-repeat
+        history_key = CacheKeys.suggested_history(user_code, pet_ids)
+        raw_history = await vk.get(history_key)
+        recent_questions: list[str] = []
+        history_entries: list[dict] = []
+        if raw_history:
+            try:
+                history_entries = json.loads(raw_history)
+                for entry in history_entries:
+                    recent_questions.extend(entry.get("questions", []))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Generate
+        questions = await sq_agent.generate(
+            language=language,
+            pet_count=len(pet_ids),
+            pets_json=pets_json,
+            trusted_context_json=trusted_json,
+            gap_list=gap_list,
+            recent_questions=recent_questions,
+            model=_SQ_MODEL,
+        )
+
+        if not questions:
+            logger.debug(
+                "_regen_suggested_questions: LLM returned nothing — "
+                "cache stays empty, nightly job will fill it (user=%s)",
+                user_code,
+            )
+            return
+
+        # Validate — one retry, then patch failed items with evergreen
+        all_passed, failed_indices, _ = validate_questions(
+            questions, language, len(pet_ids), recent_questions,
+        )
+        if not all_passed and questions[0].get("reason_type") != "evergreen":
+            questions_retry = await sq_agent.generate(
+                language=language,
+                pet_count=len(pet_ids),
+                pets_json=pets_json,
+                trusted_context_json=trusted_json,
+                gap_list=gap_list,
+                recent_questions=recent_questions,
+                model=_SQ_MODEL,
+            )
+            if questions_retry:
+                passed2, _, _ = validate_questions(
+                    questions_retry, language, len(pet_ids), recent_questions,
+                )
+                if passed2:
+                    questions = questions_retry
+                else:
+                    evergreen = get_evergreen_questions(language, pet_count=len(pet_ids))
+                    for idx in failed_indices:
+                        if idx < len(evergreen):
+                            questions[idx] = evergreen[idx]
+
+        # Cache the result
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cache_key = CacheKeys.suggested_questions(user_code, pet_ids, language)
+        await vk.setex(
+            cache_key,
+            jittered_ttl(TTL_SUGGESTED),
+            json.dumps({"generated_at": now_iso, "questions": questions}),
+        )
+
+        # Update history (prune entries older than 4 weeks)
+        current_week = datetime.now(timezone.utc).strftime("%G-W%V")
+        history_cutoff_week = (
+            datetime.now(timezone.utc) - timedelta(weeks=4)
+        ).strftime("%G-W%V")
+        history_entries = [
+            e for e in history_entries if e.get("week", "") >= history_cutoff_week
+        ]
+        history_entries.append({
+            "week": current_week,
+            "questions": [q["text"] for q in questions],
+        })
+        await vk.setex(
+            history_key,
+            jittered_ttl(TTL_SUGGESTED_HISTORY),
+            json.dumps(history_entries),
+        )
+
+        logger.info(
+            "_regen_suggested_questions: regenerated for user=%s pets=%s lang=%s",
+            user_code, pet_ids, language,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "_regen_suggested_questions: failed for user=%s pets=%s error=%s",
+            user_code, pet_ids, exc,
         )
 
 
