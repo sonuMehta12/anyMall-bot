@@ -21,6 +21,7 @@
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from app.agents.state import AgentState
@@ -159,6 +160,27 @@ def _parse_compressor_response(raw: str) -> list[dict] | None:
         return None
 
 
+# ── Schema validation constants (T1-04 Layer 2) ──────────────────────────────
+#
+# These protect against memory poisoning: a malicious message could trick the
+# LLM into extracting fake facts with arbitrary keys/values. We validate every
+# fact before it can reach the Aggregator and be written to the database.
+
+# Key must be snake_case: starts with a letter, only a-z / 0-9 / underscore,
+# max 100 chars. Rejects empty strings, keys starting with digits, injected
+# SQL/HTML, and excessively long keys.
+_VALID_KEY_RE = re.compile(r'^[a-z][a-z0-9_]{0,99}$')
+
+# Allowed source_rank values — anything else defaults to "explicit_owner".
+_VALID_SOURCE_RANKS: frozenset[str] = frozenset({
+    "vet_record", "user_correction", "explicit_owner",
+})
+
+# Maximum allowed length for a fact value. Prevents the LLM from writing
+# unbounded text into the active_profile table.
+_MAX_VALUE_LENGTH: int = 500
+
+
 # ── _build_facts ────────────────────────────────────────────────────────────────
 
 def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[ExtractedFact]:
@@ -169,8 +191,13 @@ def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[Extracted
       - are missing required keys
       - have confidence below min_confidence
       - have non-numeric confidence values
+      - have a key that does not match snake_case format (T1-04 schema check)
+      - have a value longer than _MAX_VALUE_LENGTH chars (T1-04 schema check)
 
-    Logs a warning for each skipped entry so we can see LLM format issues.
+    Normalises source_rank to "explicit_owner" if the LLM returns an unknown
+    value (T1-04 schema check).
+
+    Logs a warning for each skipped or normalised entry.
     """
     results: list[ExtractedFact] = []
 
@@ -190,19 +217,55 @@ def _build_facts(raw_facts: list[dict], min_confidence: float) -> list[Extracted
             continue
 
         try:
+            key = str(item["key"])
+            value = str(item["value"])
+
+            # ── Schema check: key format (T1-04) ─────────────────────────────
+            if not _VALID_KEY_RE.match(key):
+                logger.warning(
+                    "Compressor: fact[%d] key=%r failed schema check — skipped", i, key)
+                continue
+
+            # ── Schema check: value length (T1-04) ───────────────────────────
+            if len(value) > _MAX_VALUE_LENGTH:
+                logger.warning(
+                    "Compressor: fact[%d] key=%r value too long (%d chars > %d) — skipped",
+                    i, key, len(value), _MAX_VALUE_LENGTH,
+                )
+                continue
+
+            # ── Schema check: source_rank allowlist (T1-04) ──────────────────
+            raw_rank = str(item.get("source_rank", "explicit_owner"))
+            source_rank = raw_rank if raw_rank in _VALID_SOURCE_RANKS else "explicit_owner"
+            if source_rank != raw_rank:
+                logger.warning(
+                    "Compressor: fact[%d] key=%r unknown source_rank=%r — defaulting to explicit_owner",
+                    i, key, raw_rank,
+                )
+
             # Validate pet_label — must be "pet_a" or "pet_b", default "pet_a"
             raw_label = str(item.get("pet_label", "pet_a"))
-            pet_label = raw_label if raw_label in (
-                "pet_a", "pet_b") else "pet_a"
+            pet_label = raw_label if raw_label in ("pet_a", "pet_b") else "pet_a"
+
+            # ── Schema check: time_scope allowlist (T1-04) ──────────────────
+            # Normalize to lowercase so "Past" / "PAST" are caught by the
+            # Aggregator's Rule 0 exact match (fact.time_scope == "past").
+            raw_scope = str(item.get("time_scope", "unknown")).lower().strip()
+            time_scope = raw_scope if raw_scope in {"current", "past", "unknown"} else "unknown"
+
+            # ── Schema check: source_quote length cap (T1-04) ────────────────
+            # source_quote is written to active_profile via _build_entry().
+            # Cap at 200 chars — it is a short excerpt, not the full message.
+            source_quote = str(item.get("source_quote", ""))[:200]
 
             fact = ExtractedFact(
-                key=str(item["key"]),
-                value=str(item["value"]),
+                key=key,
+                value=value,
                 confidence=confidence,
-                source_rank=str(item.get("source_rank", "explicit_owner")),
-                time_scope=str(item.get("time_scope", "unknown")),
+                source_rank=source_rank,
+                time_scope=time_scope,
                 uncertainty=str(item.get("uncertainty", "")),
-                source_quote=str(item.get("source_quote", "")),
+                source_quote=source_quote,
                 timestamp=item.get("timestamp"),  # str or None
                 pet_label=pet_label,
             )

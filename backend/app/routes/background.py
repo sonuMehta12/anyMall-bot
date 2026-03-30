@@ -14,26 +14,39 @@
 # ── Standard library ───────────────────────────────────────────────────────────
 import asyncio
 import dataclasses
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 import logging
 from typing import Any
 from uuid import uuid4
 
+# ── Retry policy for the compressor/aggregator pipeline (T2-04) ───────────────
+#
+# Message persistence (DB write of user+assistant messages) runs ONCE — no retry
+# because retrying would write duplicate rows.
+#
+# The compressor + aggregator + fact logging section is retried up to 3 times:
+#   attempt 1 — immediate
+#   attempt 2 — after 3 seconds
+#   attempt 3 — after 10 seconds
+#
+# These delays cover transient DB blips (usually resolve in <5s) without holding
+# the background task alive for too long.  After 3 failures the error is logged
+# and the pipeline gives up — messages are already saved, only fact extraction
+# is missed for this turn.
+_PIPELINE_RETRY_DELAYS: list[int] = [3, 10]  # delays BETWEEN attempts
+
 # ── Our code ───────────────────────────────────────────────────────────────────
 from app.agents.state import AgentState
-from app.agents.suggested_questions import _MODEL as _SQ_MODEL
 from app.cache.keys import (
     CacheKeys, LUA_APPEND_MESSAGES, LUA_RELEASE_LOCK,
-    TTL_COMPACTING, TTL_PENDING, TTL_SESSION, TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl,
+    TTL_COMPACTING, TTL_PENDING, TTL_SESSION, jittered_ttl,
 )
 from app.db.session import get_session
 from app.db.repositories import (
-    ActiveProfileRepo, FactLogRepo, ThreadRepo, ThreadMessageRepo,
+    ActiveProfileRepo, FactLogRepo, SuggestedQuestionsRepo, ThreadRepo, ThreadMessageRepo,
 )
-from app.services.context_builder import build_pet_context
-from app.services.question_validator import validate_questions
-from app.services.question_templates import get_evergreen_questions
+from app.services.question_generation.generator import regen_for_user
 from app.types import StateBag
 from constants import THREAD_COMPACTION_THRESHOLD, THREAD_CONTEXT_WINDOW
 
@@ -131,11 +144,38 @@ async def _run_background(state: AgentState, state_bag: StateBag) -> None:
                     state_bag,
                 )
 
-        # ── Compressor pipeline ─────────────────────────────────────────
+        # ── Compressor pipeline (with retry) ────────────────────────────
+        # Message persistence above runs once. From here on we retry — a
+        # transient DB blip or LLM error should not silently drop facts.
         if compressor is None:
             return
 
-        facts = await compressor.run(state)
+        facts = None
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate([0] + _PIPELINE_RETRY_DELAYS, start=1):
+            if delay:
+                logger.warning(
+                    "Background pipeline retry %d — session=%s sleeping %ds",
+                    attempt, state.session_id, delay,
+                )
+                await asyncio.sleep(delay)
+            try:
+                facts = await compressor.run(state)
+                break  # success — exit retry loop
+            except Exception as exc:
+                last_exc = exc
+                logger.error(
+                    "Background pipeline attempt %d failed — session=%s error=%s%s",
+                    attempt, state.session_id, exc,
+                    " — retrying" if attempt <= len(_PIPELINE_RETRY_DELAYS) else " — giving up",
+                )
+
+        if facts is None:
+            logger.error(
+                "Background pipeline gave up after %d attempts — session=%s last_error=%s",
+                len(_PIPELINE_RETRY_DELAYS) + 1, state.session_id, last_exc,
+            )
+            return
 
         high = [f for f in facts if f.confidence > 0.70]
         low  = [f for f in facts if 0.50 <= f.confidence <= 0.70]
@@ -314,13 +354,11 @@ async def _regen_suggested_questions(
     Immediately regenerate suggested questions after the aggregator updates the profile.
 
     Called fire-and-forget from _run_background when high-confidence facts are merged.
-    The aggregator has already busted the suggested-questions cache (deleted the key).
-    This fills it back with fresh personalized questions so the user sees them on their
+    The aggregator has already busted the suggested-questions cache (deleted the keys).
+    This fills them back with fresh personalized questions so the user sees them on their
     very next /setup call — without waiting until the nightly job at midnight.
 
-    Mirrors the per-combo generation logic in nightly._pregenerate_suggested_questions.
-    If generation fails for any reason it logs and returns silently — the endpoint will
-    serve evergreen on the next open and the nightly job will fill the cache overnight.
+    Regens each pet separately (per-pet design): one regen_for_user() call per pet_id.
     """
     sq_agent = getattr(state_bag, "suggested_questions_agent", None)
     vk = getattr(state_bag, "valkey", None)
@@ -330,155 +368,32 @@ async def _regen_suggested_questions(
         logger.debug("_regen_suggested_questions: required services unavailable, skipping")
         return
 
-    try:
-        # Resolve language from cached user record
-        language = "JA"
-        raw_user = await vk.get(CacheKeys.user(user_code))
-        if raw_user:
+    # Resolve language from cached user record
+    language = "JA"
+    raw_user = await vk.get(CacheKeys.user(user_code))
+    if raw_user:
+        try:
             user_data = json.loads(raw_user)
             lang = user_data.get("preferred_language", "JA")
             language = lang if lang != "auto" else "JA"
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        # Fetch pet profiles and build context
-        pet_profiles = []
-        pet_contexts = []
-        for pid in pet_ids:
-            pet_profile, aalda_facts = await pet_fetcher.fetch_pet_profile(user_code, pid)
-            pet_profiles.append(pet_profile)
-
-            raw_profile = await vk.get(CacheKeys.profile(pid))
-            if raw_profile:
-                active_raw = json.loads(raw_profile)
-            else:
-                async with get_session() as db_session:
-                    ap_repo = ActiveProfileRepo(db_session)
-                    active_raw = await ap_repo.read_all(pid)
-
-            ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
-            pet_contexts.append(ctx)
-
-        # Build prompt context (mirrors nightly job)
-        pets_json = json.dumps(
-            [
-                {
-                    "name": p.get("name", ""),
-                    "species": p.get("species", ""),
-                    "breed": p.get("breed", ""),
-                    "age": c["active_profile"].get("age", {}).get("value", ""),
-                    "sex": p.get("sex", ""),
-                }
-                for p, c in zip(pet_profiles, pet_contexts)
-            ],
-            ensure_ascii=False,
-        )
-
-        trusted = {}
-        for c in pet_contexts:
-            for key, entry in c["active_profile"].items():
-                if isinstance(entry, dict) and entry.get("confidence", 0) >= 0.6:
-                    trusted[key] = entry.get("value", "")
-        trusted_json = json.dumps(trusted, ensure_ascii=False)
-
-        all_gaps: list[str] = []
-        for c in pet_contexts:
-            all_gaps.extend(c.get("gap_list", []))
-        gap_list = list(dict.fromkeys(all_gaps))
-
-        # Load recent history for anti-repeat
-        history_key = CacheKeys.suggested_history(user_code, pet_ids)
-        raw_history = await vk.get(history_key)
-        recent_questions: list[str] = []
-        history_entries: list[dict] = []
-        if raw_history:
-            try:
-                history_entries = json.loads(raw_history)
-                for entry in history_entries:
-                    recent_questions.extend(entry.get("questions", []))
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        # Generate
-        questions = await sq_agent.generate(
-            language=language,
-            pet_count=len(pet_ids),
-            pets_json=pets_json,
-            trusted_context_json=trusted_json,
-            gap_list=gap_list,
-            recent_questions=recent_questions,
-            model=_SQ_MODEL,
-        )
-
-        if not questions:
-            logger.debug(
-                "_regen_suggested_questions: LLM returned nothing — "
-                "cache stays empty, nightly job will fill it (user=%s)",
-                user_code,
-            )
-            return
-
-        # Validate — one retry, then patch failed items with evergreen
-        all_passed, failed_indices, _ = validate_questions(
-            questions, language, len(pet_ids), recent_questions,
-        )
-        if not all_passed and questions[0].get("reason_type") != "evergreen":
-            questions_retry = await sq_agent.generate(
+    # Regen each pet separately — each gets its own 10-question set
+    for i, pid in enumerate(pet_ids):
+        async with get_session() as db_session:
+            sq_repo = SuggestedQuestionsRepo(db_session)
+            await regen_for_user(
+                user_code=user_code,
+                pet_id=pid,
                 language=language,
-                pet_count=len(pet_ids),
-                pets_json=pets_json,
-                trusted_context_json=trusted_json,
-                gap_list=gap_list,
-                recent_questions=recent_questions,
-                model=_SQ_MODEL,
+                suggested_agent=sq_agent,
+                suggested_repo=sq_repo,
+                valkey=vk,
+                aalda_client=pet_fetcher,
+                db_session=db_session,
+                is_pet_b=(i == 1),
             )
-            if questions_retry:
-                passed2, _, _ = validate_questions(
-                    questions_retry, language, len(pet_ids), recent_questions,
-                )
-                if passed2:
-                    questions = questions_retry
-                else:
-                    evergreen = get_evergreen_questions(language, pet_count=len(pet_ids))
-                    for idx in failed_indices:
-                        if idx < len(evergreen):
-                            questions[idx] = evergreen[idx]
-
-        # Cache the result
-        now_iso = datetime.now(timezone.utc).isoformat()
-        cache_key = CacheKeys.suggested_questions(user_code, pet_ids, language)
-        await vk.setex(
-            cache_key,
-            jittered_ttl(TTL_SUGGESTED),
-            json.dumps({"generated_at": now_iso, "questions": questions}),
-        )
-
-        # Update history (prune entries older than 4 weeks)
-        current_week = datetime.now(timezone.utc).strftime("%G-W%V")
-        history_cutoff_week = (
-            datetime.now(timezone.utc) - timedelta(weeks=4)
-        ).strftime("%G-W%V")
-        history_entries = [
-            e for e in history_entries if e.get("week", "") >= history_cutoff_week
-        ]
-        history_entries.append({
-            "week": current_week,
-            "questions": [q["text"] for q in questions],
-        })
-        await vk.setex(
-            history_key,
-            jittered_ttl(TTL_SUGGESTED_HISTORY),
-            json.dumps(history_entries),
-        )
-
-        logger.info(
-            "_regen_suggested_questions: regenerated for user=%s pets=%s lang=%s",
-            user_code, pet_ids, language,
-        )
-
-    except Exception as exc:
-        logger.error(
-            "_regen_suggested_questions: failed for user=%s pets=%s error=%s",
-            user_code, pet_ids, exc,
-        )
 
 
 async def _maybe_run_history_builder(

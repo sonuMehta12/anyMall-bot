@@ -50,6 +50,7 @@ from app.agents.conversation import ConversationAgent
 from app.agents.intent_classifier import IntentClassifier
 from app.agents.suggested_questions import SuggestedQuestionsAgent
 from app.services.pet_fetcher import PetFetcher
+from sqlalchemy import text
 from app.db.session import init_db, dispose_engine, get_session
 from app.db.repositories import UserRepo, ThreadRepo, ThreadMessageRepo
 from app.services.thread_summarizer import ThreadSummarizer
@@ -148,7 +149,8 @@ async def lifespan(app: FastAPI):
     app.state.agent = ConversationAgent(llm=llm)
     app.state.intent_classifier = IntentClassifier(llm=llm)
     app.state.compressor = CompressorAgent(llm=llm)
-    app.state.aggregator = AggregatorAgent(get_session=get_session, valkey=app.state.valkey)
+    app.state.aggregator = AggregatorAgent(
+        get_session=get_session, valkey=app.state.valkey)
     app.state.thread_summarizer = ThreadSummarizer(llm=llm)
     app.state.history_builder = HistoryBuilder(llm=llm)
     app.state.suggested_questions_agent = SuggestedQuestionsAgent(llm=llm)
@@ -176,11 +178,16 @@ async def lifespan(app: FastAPI):
     # reads from it directly — those paths are updated in chat.py to use Valkey.
     app.state.sessions = {}
     app.state.session_meta = {}   # kept for fallback when Valkey is down
-    app.state.compaction_in_progress = set()  # local fallback when Valkey is down (W3)
-    app.state.thread_locks: dict[str, asyncio.Lock] = {}  # per-thread locks (C2)
-    app.state.pet_locks: dict[int, asyncio.Lock] = {}     # per-pet locks (race condition safety)
-    app.state.background_tasks: set[asyncio.Task] = set() # tracked tasks for graceful shutdown (W8)
-    app.state.pending_clarifications: dict[str, list] = {} # local fallback when Valkey is down (C4)
+    # local fallback when Valkey is down (W3)
+    app.state.compaction_in_progress = set()
+    # per-thread locks (C2)
+    app.state.thread_locks: dict[str, asyncio.Lock] = {}
+    # per-pet locks (race condition safety)
+    app.state.pet_locks: dict[int, asyncio.Lock] = {}
+    # tracked tasks for graceful shutdown (W8)
+    app.state.background_tasks: set[asyncio.Task] = set()
+    # local fallback when Valkey is down (C4)
+    app.state.pending_clarifications: dict[str, list] = {}
 
     # ── Register nightly cron job — after all services are initialised ────
     # Jobs run at 00:00 UTC. replace_existing=True so restart doesn't duplicate.
@@ -199,7 +206,8 @@ async def lifespan(app: FastAPI):
     # to finish their DB writes before the connection pool is disposed.
     pending = app.state.background_tasks
     if pending:
-        logger.info("Shutting down — waiting for %d background task(s)...", len(pending))
+        logger.info(
+            "Shutting down — waiting for %d background task(s)...", len(pending))
         done, timed_out = await asyncio.wait(pending, timeout=10)
         if timed_out:
             logger.warning(
@@ -307,43 +315,81 @@ app.include_router(simulator_router)
 
 # ── Infrastructure route (stays in main.py — no /api/v1 prefix) ──────────────
 
-@app.get("/health_v1", summary="Liveness check")
-async def health_v1() -> dict[str, Any]:
+@app.get("/health", summary="Deep health check")
+async def health_v1() -> JSONResponse:
     """
-    Returns 200 if server is up.
+    Returns 200 if all critical dependencies are healthy, 503 if DB is down.
 
-    Checks LLM reachability via health_check() and caches the result in
-    Valkey for 60 seconds (S-09 fix).  Monitoring tools hit /health every
-    10-30 seconds — without caching that's ~86K LLM API calls/month.
-    With a 60s TTL cache, that drops to ~1,440/month.
+    Checks three things:
+      1. DB  — SELECT 1 (not cached: must reflect real-time DB state)
+      2. Valkey — ping (not cached: fast, real-time)
+      3. LLM — health_check() cached in Valkey for 60s (S-09 fix, expensive)
+
+    Status rules:
+      - db_ok=False → 503 (DB is critical; every request needs it)
+      - valkey_ok=False → 200 with status "degraded" (app still runs, just slower)
+      - llm_ok=False → 200 with status "degraded" (users get errors but app is up)
+      - all ok → 200 with status "ok"
+
+    Why no cache on DB/Valkey checks?
+      SELECT 1 takes ~1ms and uses a pool connection — near-zero cost.
+      Valkey ping is a single TCP round-trip.  Caching these would defeat the
+      purpose: a monitoring tool must see a DB outage within one poll cycle.
     """
     vk: ValkeyClient = getattr(app.state, "valkey", None)
 
-    # Check Valkey cache first (S-09 fix)
+    # ── 1. DB check (SELECT 1) ────────────────────────────────────────────
+    db_ok = False
+    try:
+        async with get_session() as db_session:
+            await db_session.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as db_exc:
+        logger.error("Health check: DB unreachable — %s", db_exc)
+
+    # ── 2. Valkey check ───────────────────────────────────────────────────
+    valkey_ok = False
     if vk is not None:
+        valkey_ok = await vk.ping()
+
+    # ── 3. LLM check (cached 60s to avoid burning API quota) ─────────────
+    llm_ok = False
+    if vk is not None and valkey_ok:
         cached_raw = await vk.get(CacheKeys.health_llm())
         if cached_raw is not None:
-            cached = json.loads(cached_raw)
-            return cached
+            llm_ok = json.loads(cached_raw).get("llm_reachable", False)
 
-    # Cache miss → call LLM
-    llm_ok = False
-    llm_provider = getattr(app.state, "llm_provider", None)
-    if llm_provider is not None:
-        llm_ok = await llm_provider.health_check()
+    if not llm_ok:
+        llm_provider = getattr(app.state, "llm_provider", None)
+        if llm_provider is not None:
+            llm_ok = await llm_provider.health_check()
+        if vk is not None and valkey_ok:
+            await vk.setex(
+                CacheKeys.health_llm(),
+                jittered_ttl(TTL_HEALTH),
+                json.dumps({"llm_reachable": llm_ok}),
+            )
+
+    # ── Determine overall status and HTTP code ────────────────────────────
+    if not db_ok:
+        status = "unavailable"
+    elif not valkey_ok or not llm_ok:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    http_code = 503 if not db_ok else 200
 
     result: dict[str, Any] = {
-        "status": "ok",
+        "status": status,
+        "db": db_ok,
+        "valkey": valkey_ok,
         "llm_provider": settings.llm_provider,
         "llm_reachable": llm_ok,
-        "version": "1.0.0",
+        "version": "1.1.0",
     }
 
-    # Store in Valkey for TTL_HEALTH seconds (60s)
-    if vk is not None:
-        await vk.setex(CacheKeys.health_llm(), jittered_ttl(TTL_HEALTH), json.dumps(result))
-
-    return result
+    return JSONResponse(status_code=http_code, content=result)
 
 
 # ── Serve React frontend build (production only) ────────────────────────────
@@ -363,7 +409,8 @@ if not _FRONTEND_DIST.is_dir():
     _FRONTEND_DIST = _BACKEND_ROOT / "frontend_dist"               # Render
 
 if _FRONTEND_DIST.is_dir():
-    logger.info("Frontend build found at %s — serving static files.", _FRONTEND_DIST)
+    logger.info(
+        "Frontend build found at %s — serving static files.", _FRONTEND_DIST)
 
     # Serve JS/CSS bundles from dist/assets/
     app.mount(

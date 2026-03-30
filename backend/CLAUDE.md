@@ -33,6 +33,7 @@ AnyMall-chat/
 | Auth | X-User-Code header (JWT planned for Phase 4) |
 | Frontend (dev) | React + Vite |
 | Containers | Docker Compose (PostgreSQL + Valkey) |
+| Deployment | AWS Cloud |
 
 ---
 
@@ -89,8 +90,8 @@ User message + X-User-Code header + pet_ids[]
 | `am:meta:{thread_id}` | 7200s | Gap question counter, redirect cooldown |
 | `am:user:{user_code}` | 7200s | User record (language, relationship_summary) |
 | `am:aalda:{user_code}:{pet_id}` | 300s | AALDA API response cache |
-| `am:suggested:{user_code}:{pet_ids}:{lang}` | 10 days | Pre-generated suggested questions |
-| `am:suggested_history:{user_code}:{pet_ids}` | 30 days | 4-week question history (anti-repeat) |
+| `am:suggested:{user_code}:{lang}` | 10 days | Pre-generated suggested questions (10 questions, all modules) |
+| `am:suggested_history:{user_code}:{lang}` | 30 days | 4-week question history (anti-repeat) |
 
 All keys use `jittered_ttl()` to prevent stampede expiration.
 

@@ -1,30 +1,31 @@
 # app/agents/suggested_questions.py
 #
-# Generates 4 suggested starter questions for the AnyMall-chan home screen.
+# Generates 10 suggested questions for ONE pet (per-pet redesign).
 #
 # Used by:
-#   - Nightly job (primary): pre-generates questions for all active users
-#   - /api/v1/setup endpoint: validates + serves the cached result
+#   - Nightly job (primary): pre-generates questions for all active users, per pet
+#   - Background regen: triggered by aggregator after high-confidence fact
 #
 # How it works:
-#   1. Receives pet context (profile, active_profile, gap_list)
-#   2. Builds a prompt tailored to the pet(s)
+#   1. Receives context for ONE pet (pet_id, language, pets_json, trusted_context_json, gap_list)
+#   2. Builds a prompt tailored to that specific pet
 #   3. Calls a cheap/fast LLM (gpt-4.1-nano or similar)
-#   4. Parses the JSON response into structured questions
-#   5. Caller validates + caches
+#   4. Parses the JSON response into 10 structured questions
+#   5. Caller validates + patches failed slots + caches (keyed by pet_id)
 #
 # Design decisions (see design-docs/suggested-questions.md):
 #   - Questions are FROM the user's perspective, sent TO the AI
 #   - Gap list is silent topic guidance, never explicit data-collection
-#   - temperature=0.9 — we want creative variety, not deterministic output
-#   - max_tokens=400 — 4 short questions in JSON is well under this
+#   - temperature=0.9 — creative variety, not deterministic output
+#   - max_tokens=800 — 10 short questions in JSON fit well under this
+#   - Slot layout: 3 dedicated + 1 both per module (food/health/anymall)
 
 import json
 import logging
 from typing import Any
 
 from app.llm.base import LLMProvider, LLMProviderError
-from app.services.question_validator import get_char_limit
+from app.services.question_generation.validator import get_char_limit
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ SUGGESTED_QUESTIONS_SYSTEM_PROMPT = """\
 You are generating suggested starter questions for the home screen of AnyMall-chan, \
 a pet care AI assistant.
 
-Your job is to create 4 short questions that a pet owner might tap to start a conversation.
+Your job is to create 10 short questions that a pet owner might tap to start a conversation.
 
 These questions are FROM the owner's perspective, sent TO the AI assistant. \
 The owner taps a question chip and it becomes their first message.
@@ -70,19 +71,31 @@ Trusted context from profile:
 Recently shown questions (avoid repeating these):
 {recent_questions}
 
-{mix_instruction}
+SLOT LAYOUT — generate exactly 10 questions in this order:
+Slots 0-2  (3 questions): module="food"    — dedicated to THIS pet (target = {this_pet_target})
+Slot  3    (1 question):  module="food"    — covers both pets  (target = "both")
+Slots 4-6  (3 questions): module="health"  — dedicated to THIS pet (target = {this_pet_target})
+Slot  7    (1 question):  module="health"  — covers both pets  (target = "both")
+Slot  8    (1 question):  module="anymall" — dedicated to THIS pet (target = {this_pet_target})
+Slot  9    (1 question):  module="anymall" — covers both pets  (target = "both")
 
 Return ONLY valid JSON — no markdown, no explanation. Use this exact format:
 [
-  {{"text": "...", "target": "pet_a", "reason_type": "known_context"}},
-  {{"text": "...", "target": "pet_a", "reason_type": "known_context"}},
-  {{"text": "...", "target": "pet_a", "reason_type": "evergreen"}},
-  {{"text": "...", "target": "pet_a", "reason_type": "evergreen"}}
+  {{"text": "...", "module": "food",    "target": "{this_pet_target}"}},
+  {{"text": "...", "module": "food",    "target": "{this_pet_target}"}},
+  {{"text": "...", "module": "food",    "target": "{this_pet_target}"}},
+  {{"text": "...", "module": "food",    "target": "both"}},
+  {{"text": "...", "module": "health",  "target": "{this_pet_target}"}},
+  {{"text": "...", "module": "health",  "target": "{this_pet_target}"}},
+  {{"text": "...", "module": "health",  "target": "{this_pet_target}"}},
+  {{"text": "...", "module": "health",  "target": "both"}},
+  {{"text": "...", "module": "anymall", "target": "{this_pet_target}"}},
+  {{"text": "...", "module": "anymall", "target": "both"}}
 ]
 
 Allowed values:
+- module: food | health | anymall
 - target: pet_a | pet_b | both
-- reason_type: known_context | missing_context | evergreen
 """
 
 
@@ -101,22 +114,10 @@ No significant gaps in the pet profile. Focus on questions relevant to the \
 known context above."""
 
 
-# ── Mix instructions ────────────────────────────────────────────────────────
-
-_SINGLE_PET_MIX = "All 4 questions must be about this single pet."
-
-_DUAL_PET_MIX = """\
-Question mix for two pets:
-- 1 question about pet_a (target: "pet_a")
-- 1 question about pet_b (target: "pet_b")
-- 1 question about both pets together (target: "both")
-- 1 additional question based on strongest relevance or biggest context gap"""
-
-
 # ── Model configuration ─────────────────────────────────────────────────────
 # Model to use for this agent. None = use provider default (set in .env).
 # Change this to test a specific model, e.g. "gpt-5.4-nano".
-# This is a Fast-tier agent (structured JSON output, no creativity needed).
+# Creative-variety agent (temperature=0.9 for variety, not deterministic output).
 _MODEL: str | None = None
 
 
@@ -124,8 +125,10 @@ _MODEL: str | None = None
 
 class SuggestedQuestionsAgent:
     """
-    LLM-powered generator for suggested home screen questions.
+    LLM-powered generator for 10 suggested home screen questions (per-pet).
 
+    Generates 3 dedicated food + 1 food/both + 3 dedicated health + 1 health/both
+    + 1 anymall/this_pet + 1 anymall/both in a single LLM call for ONE specific pet.
     Uses a cheap/fast model (configurable via model parameter).
     """
 
@@ -136,40 +139,40 @@ class SuggestedQuestionsAgent:
     async def generate(
         self,
         language: str,
-        pet_count: int,
+        pet_id: int,
         pets_json: str,
         trusted_context_json: str,
         gap_list: list[str] | None = None,
         recent_questions: list[str] | None = None,
         model: str | None = None,
+        is_pet_b: bool = False,
     ) -> list[dict[str, str]]:
         """
-        Generate 4 suggested questions.
+        Generate 10 suggested questions for ONE specific pet.
 
         Args:
             language: Resolved language code (EN, JA, KO, etc.)
-            pet_count: 1 or 2
-            pets_json: JSON string of pet profile data
+            pet_id: The single pet to generate questions for
+            pets_json: JSON string of pet profile data (for this pet)
             trusted_context_json: JSON string of high-confidence active profile facts
             gap_list: List of field names we don't know yet (silent guidance)
             recent_questions: List of question texts shown in last 4 weeks
             model: Optional model override for the LLM call
+            is_pet_b: True if this pet is the second pet in the user's list (target="pet_b")
 
         Returns:
-            List of 4 question dicts: [{text, target, reason_type}, ...]
-            Returns [] on failure (caller falls back to evergreen).
+            List of 10 question dicts: [{text, module, target}, ...]
+            Returns [] on failure (caller patches with evergreen).
         """
         max_chars = get_char_limit(language)
-        pet_setup = "1 pet" if pet_count == 1 else "2 pets"
+        this_pet_target = "pet_b" if is_pet_b else "pet_a"
+        pet_setup = f"Generating for 1 pet (target label: {this_pet_target})"
 
         # Build gap instruction
         if gap_list:
             gap_instruction = _GAP_INSTRUCTION.format(gap_list=", ".join(gap_list[:10]))
         else:
             gap_instruction = _NO_GAP_INSTRUCTION
-
-        # Build mix instruction
-        mix_instruction = _SINGLE_PET_MIX if pet_count == 1 else _DUAL_PET_MIX
 
         # Format recent questions
         recent_str = "None" if not recent_questions else "\n".join(
@@ -184,29 +187,44 @@ class SuggestedQuestionsAgent:
             trusted_context_json=trusted_context_json,
             gap_instruction=gap_instruction,
             recent_questions=recent_str,
-            mix_instruction=mix_instruction,
+            this_pet_target=this_pet_target,
         )
 
-        try:
-            raw = await self._llm.complete(
-                system_prompt=system_prompt,
-                messages=[{"role": "user", "content": "Generate 4 suggested questions now."}],
-                temperature=0.9,
-                max_tokens=400,
-                model=model,
-            )
-            return self._parse_response(raw)
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                raw = await self._llm.complete(
+                    system_prompt=system_prompt,
+                    messages=[{"role": "user", "content": "Generate 10 suggested questions now."}],
+                    temperature=0.9,
+                    max_tokens=800,
+                    model=model,
+                )
+                result = self._parse_response(raw)
+                if result:
+                    return result
+                if attempt < max_attempts:
+                    logger.warning(
+                        "SuggestedQuestionsAgent: parse returned empty, retrying "
+                        "(attempt %d/%d pet_id=%s lang=%s)",
+                        attempt, max_attempts, pet_id, language,
+                    )
+            except LLMProviderError as exc:
+                logger.error("SuggestedQuestionsAgent LLM call failed: %s", exc)
+                return []
+            except Exception as exc:
+                logger.error("SuggestedQuestionsAgent unexpected error: %s", exc)
+                return []
 
-        except LLMProviderError as exc:
-            logger.error("SuggestedQuestionsAgent LLM call failed: %s", exc)
-            return []
-        except Exception as exc:
-            logger.error("SuggestedQuestionsAgent unexpected error: %s", exc)
-            return []
+        logger.warning(
+            "SuggestedQuestionsAgent: all %d attempts failed (pet_id=%s lang=%s) — caller uses evergreen",
+            max_attempts, pet_id, language,
+        )
+        return []
 
     def _parse_response(self, raw: str) -> list[dict[str, str]]:
         """
-        Parse the LLM response JSON into a list of question dicts.
+        Parse the LLM response JSON into a list of 10 question dicts.
 
         Strips markdown fences if present. Returns [] on parse failure.
         """
@@ -215,7 +233,6 @@ class SuggestedQuestionsAgent:
         # Strip markdown code fences
         if text.startswith("```"):
             lines = text.split("\n")
-            # Remove first and last lines (```json and ```)
             lines = [l for l in lines if not l.strip().startswith("```")]
             text = "\n".join(lines).strip()
 
@@ -235,20 +252,20 @@ class SuggestedQuestionsAgent:
             if (
                 isinstance(q, dict)
                 and isinstance(q.get("text"), str)
+                and isinstance(q.get("module"), str)
                 and isinstance(q.get("target"), str)
-                and isinstance(q.get("reason_type"), str)
             ):
                 valid.append({
                     "text": q["text"].strip(),
+                    "module": q["module"],
                     "target": q["target"],
-                    "reason_type": q["reason_type"],
                 })
             else:
                 logger.debug("SuggestedQuestionsAgent skipping malformed item: %r", q)
 
-        if len(valid) != 4:
+        if len(valid) != 10:
             logger.warning(
-                "SuggestedQuestionsAgent expected 4 valid questions, got %d", len(valid),
+                "SuggestedQuestionsAgent expected 10 valid questions, got %d", len(valid),
             )
             return []
 

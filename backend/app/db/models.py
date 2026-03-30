@@ -21,8 +21,12 @@
 #   All metadata columns (confidence, source_rank, etc.) are NULL.
 #   to_dict_entry() returns the raw string for this key.
 
+from datetime import datetime
+
 from sqlalchemy import (
+    BigInteger,
     Boolean,
+    DateTime,
     Float,
     ForeignKey,
     Index,
@@ -31,6 +35,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.types import ActiveProfileEntry
@@ -76,6 +81,10 @@ class User(Base):
         String(64), nullable=False, default="")
     updated_at: Mapped[str] = mapped_column(
         String(64), nullable=False, default="")
+    last_known_pet_ids: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True, default=list)
+    # Full list of pet IDs the user owns — written on every POST /chat.
+    # Used by nightly job to regen suggested questions without a chat request.
 
     def __repr__(self) -> str:
         return f"<User user_code={self.user_code!r}>"
@@ -90,6 +99,7 @@ class User(Base):
             "preferred_language": self.preferred_language,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "last_known_pet_ids": self.last_known_pet_ids or [],
         }
 
 
@@ -327,4 +337,49 @@ class ThreadMessage(Base):
             "role": self.role,
             "content": self.content,
             "timestamp": self.timestamp,
+        }
+
+
+# ── SuggestedQuestion ─────────────────────────────────────────────────────────
+
+class SuggestedQuestion(Base):
+    """
+    Cold storage for per-pet suggested questions (v2 per-pet redesign).
+
+    One row per (user_code, language, pet_id). Each pet has its own 10-question
+    set: 3 dedicated food + 1 food/both + 3 dedicated health + 1 health/both +
+    1 anymall/this_pet + 1 anymall/both.
+
+    Valkey is the hot cache (10-day TTL, keyed by pet_id). This table is the
+    fallback: Valkey miss → check here → load into Valkey → serve. Regen only
+    happens when profile changed or questions are older than 7 days.
+    """
+    __tablename__ = "anymall_chan_suggested_questions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    language: Mapped[str] = mapped_column(String(10), nullable=False)
+    pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    questions: Mapped[list] = mapped_column(JSONB, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_code", "language", "pet_id", name="uq_suggested_questions"),
+        Index("idx_sq_user_code", "user_code"),
+        Index("idx_sq_generated_at", "generated_at"),
+        Index("idx_sq_pet_id", "pet_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SuggestedQuestion user_code={self.user_code!r} language={self.language!r} pet_id={self.pet_id!r}>"
+
+    def to_dict(self) -> dict:
+        """Return the stored blob as a plain dict."""
+        return {
+            "user_code": self.user_code,
+            "language": self.language,
+            "pet_id": self.pet_id,
+            "questions": self.questions,
+            "generated_at": self.generated_at,
         }

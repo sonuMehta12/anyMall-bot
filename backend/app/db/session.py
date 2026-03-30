@@ -60,9 +60,10 @@ async def init_db(database_url: str) -> AsyncEngine:
 
     _engine = create_async_engine(
         database_url,
-        echo=False,       # True = log every SQL statement (noisy, useful for debugging)
-        pool_size=5,      # Max persistent connections (reasonable for single-server dev)
-        max_overflow=10,  # Extra connections allowed under burst load
+        echo=False,        # True = log every SQL statement (noisy, useful for debugging)
+        pool_size=10,      # Persistent connections always kept alive in the pool
+        max_overflow=20,   # Extra connections created under spike load (total max = 30)
+        pool_timeout=30,   # Seconds to wait for a free connection before raising an error
     )
 
     _session_factory = async_sessionmaker(

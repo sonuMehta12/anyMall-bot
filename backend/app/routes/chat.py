@@ -28,13 +28,13 @@ from uuid import uuid4
 
 # ── Third-party ────────────────────────────────────────────────────────────────
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ── Our code ───────────────────────────────────────────────────────────────────
 from app.routes.background import _create_tracked_task, _run_background
 from app.agents.conversation import AgentResponse
 from app.agents.state import AgentState, PetInfo
-from app.services.guardrails import apply_guardrails
+from app.services.guardrails import apply_guardrails, detect_prompt_injection
 from app.services.deeplink import build_deeplink
 from app.services.context_builder import build_pet_context
 from app.services.pet_fetcher import PetFetchError
@@ -44,13 +44,14 @@ from app.cache.keys import (
     TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl,
 )
 from constants import (
-    INTENT_HEALTH, INTENT_FOOD, URGENCY_HIGH, URGENCY_MEDIUM,
+    INTENT_HEALTH, INTENT_FOOD, INTENT_UNTRUSTED, URGENCY_HIGH, URGENCY_MEDIUM,
     THREAD_CONTEXT_WINDOW, THREAD_EXPIRY_HOURS,
 )
 from app.db.session import get_session
-from app.db.repositories import ActiveProfileRepo, ThreadRepo, ThreadMessageRepo, UserRepo
+from app.db.repositories import ActiveProfileRepo, SuggestedQuestionsRepo, ThreadRepo, ThreadMessageRepo, UserRepo
 from app.services.confidence_calculator import calculate_confidence_score, confidence_color
-from app.services.question_templates import get_evergreen_questions
+from app.services.question_generation.templates import get_evergreen_questions
+from app.services.question_generation.generator import _build_full_evergreen
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,21 @@ class ChatRequest(BaseModel):
         max_length=128,
         description="Owner's display name from Flutter UI.",
     )
+
+    @field_validator("message")
+    @classmethod
+    def message_not_whitespace(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("Message must contain non-whitespace characters.")
+        return stripped
+
+    @field_validator("language")
+    @classmethod
+    def normalize_language(cls, v: str) -> str:
+        # Strip and uppercase so "en", " JA ", "auto" all normalise correctly.
+        normalized = v.strip().upper()
+        return normalized if normalized in ("EN", "JA") else "auto"
 
 
 class RedirectDisplay(BaseModel):
@@ -218,7 +234,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
       1. Auth — extract X-User-Code header.
       2. Fetch pet data from AALDA (parallel for 2 pets).
       3. Thread boundary — resolve session_id → thread_id (24h windows).
-      4. IntentClassifier — LLM: intent_type + urgency (health/food/general).
+      4. IntentClassifier — LLM: intent_type + urgency (health/food/general/untrusted).
       5. Agent 1          — build prompt from context + intent, call LLM.
       6. apply_guardrails  — regex: strip blocked jargon + preachy phrases.
       7. build_deeplink    — build redirect payload if health or food intent.
@@ -237,6 +253,13 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
     sessions: dict = state_bag.sessions
     pet_ids = request_body.pet_ids
+
+    # ── Layer 1a: Pattern-based injection check (T1-04) ───────────────────────
+    # Runs before AALDA fetch, before any LLM call. Zero cost.
+    # Catches obvious attacks immediately — no pipeline created, no DB touched.
+    if detect_prompt_injection(request_body.message):
+        raise HTTPException(
+            status_code=400, detail="I can't help with that.")
 
     # ── 1. Fetch pet data from AALDA (parallel for 2 pets) ────────────────────
     try:
@@ -406,6 +429,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                     "preferred_language": request_body.language if request_body.language != "auto" else "auto",
                     "created_at": now_iso,
                     "updated_at": now_iso,
+                    "all_pet_ids": pet_ids,
                 })
                 user_record = await user_repo.read(user_code)
                 if user_record:
@@ -420,6 +444,13 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                     if request_body.language != "auto"
                     else user_record.get("preferred_language", "auto")
                 )
+                # Merge pet IDs: preserve canonical order, never shrink the list.
+                # If a user chats with only pet B, we must NOT overwrite [101, 102]
+                # with [102] — that would make pet 102 regenerate as pet_a next nightly.
+                current_known: list[int] = user_record.get("last_known_pet_ids") or []
+                merged_pet_ids: list[int] = list(
+                    dict.fromkeys(current_known + pet_ids)  # order-preserving dedup
+                )
                 updated = {
                     "user_code": user_code,
                     "display_name": new_display,
@@ -428,6 +459,7 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
                     "session_count": user_record.get("session_count", 0) + (1 if new_thread else 0),
                     "relationship_summary": user_record.get("relationship_summary", ""),
                     "preferred_language": new_lang,
+                    "all_pet_ids": merged_pet_ids,
                 }
                 await user_repo.upsert(updated)
                 user_record = {**user_record, **updated}
@@ -514,6 +546,18 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
 
         # ── 5. Intent classification (LLM) ──────────────────────────────────
         intent_type, urgency = await intent_classifier.classify(request_body.message)
+
+        # ── Layer 1b: LLM-based injection check (T1-04) ──────────────────────
+        # Catches subtle attacks that patterns miss ("pretend to be a different AI",
+        # indirect jailbreaks, etc.). No background task is created for untrusted
+        # messages — the pipeline exits here, so no DB poisoning is possible.
+        if intent_type == INTENT_UNTRUSTED:
+            logger.warning(
+                "Untrusted intent detected — rejecting. user=%s snippet=%r",
+                user_code, request_body.message[:80],
+            )
+            raise HTTPException(
+                status_code=400, detail="I can't help with that.")
 
         # ── 6. Agent 1 ──────────────────────────────────────────────────────
         pet_a_context = pet_contexts[0]
@@ -639,6 +683,77 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     )
 
 
+# ── Suggested questions pick rule ────────────────────────────────────────────
+
+def _pick_questions(
+    rows: dict[int, list[dict]],
+    pet_ids: list[int],
+    module: str,
+    language: str,
+) -> list[dict]:
+    """
+    Select 3 questions from per-pet question rows for a given module.
+
+    Each pet has its own 10-question row (keyed by pet_id). The pick rule reads
+    from those rows and falls back to evergreen for any missing slot.
+
+    Pick rule:
+      food   / single pet → primary row food/this_pet[0,1,2]    (3 dedicated)
+      food   / dual pet   → primary food/pet_a[0] + secondary food/pet_b[0] + primary food/both[0]
+      health / single pet → primary row health/this_pet[0,1,2]
+      health / dual pet   → primary health/pet_a[0] + secondary health/pet_b[0] + primary health/both[0]
+      anymall / single    → primary food/tgt[0] + primary health/tgt[0] + primary anymall/tgt[0]
+      anymall / dual      → primary food/pet_a[0] + secondary health/pet_b[0] + primary anymall/both[0]
+
+    Always returns exactly 3 items.
+    """
+    primary = rows.get(pet_ids[0], []) if pet_ids else []
+    secondary = rows.get(pet_ids[1], []) if len(pet_ids) >= 2 else []
+
+    # Detect the target label each row actually uses for its dedicated questions.
+    # A pet_a row has target="pet_a" on slots 0-2; a pet_b row uses target="pet_b".
+    # We infer rather than hardcode so that selecting pet B alone works correctly.
+    _primary_dedicated = [q for q in primary if q.get("target") in ("pet_a", "pet_b")]
+    primary_tgt = _primary_dedicated[0]["target"] if _primary_dedicated else "pet_a"
+    _secondary_dedicated = [q for q in secondary if q.get("target") in ("pet_a", "pet_b")]
+    secondary_tgt = _secondary_dedicated[0]["target"] if _secondary_dedicated else "pet_b"
+
+    def pick_from(questions: list[dict], mod: str, tgt: str, n: int = 1) -> list[dict]:
+        """Take up to n from questions matching mod+tgt, fill remainder with evergreen."""
+        matches = [q for q in questions if q.get("module") == mod and q.get("target") == tgt]
+        result = matches[:n]
+        while len(result) < n:
+            ev = get_evergreen_questions(mod, language, tgt, count=1)
+            result.append(ev[0] if ev else {"text": "", "module": mod, "target": tgt})
+        return result
+
+    if module == "food":
+        if secondary:
+            return (pick_from(primary, "food", primary_tgt) +
+                    pick_from(secondary, "food", secondary_tgt) +
+                    pick_from(primary, "food", "both"))
+        else:
+            return pick_from(primary, "food", primary_tgt, 3)
+
+    elif module == "health":
+        if secondary:
+            return (pick_from(primary, "health", primary_tgt) +
+                    pick_from(secondary, "health", secondary_tgt) +
+                    pick_from(primary, "health", "both"))
+        else:
+            return pick_from(primary, "health", primary_tgt, 3)
+
+    else:  # anymall
+        if secondary:
+            return (pick_from(primary, "food", primary_tgt) +
+                    pick_from(secondary, "health", secondary_tgt) +
+                    pick_from(primary, "anymall", "both"))
+        else:
+            return (pick_from(primary, "food", primary_tgt) +
+                    pick_from(primary, "health", primary_tgt) +
+                    pick_from(primary, "anymall", primary_tgt))
+
+
 # ── Setup endpoint (confidence + suggested questions) ────────────────────────
 
 @router.get("/setup", summary="Confidence bar + suggested questions")
@@ -646,6 +761,7 @@ async def get_setup(
     request: Request,
     pet_id: List[int] = Query(default=[]),
     language: str = Query(default="auto"),
+    module: str = Query(default="anymall", pattern="^(anymall|food|health)$"),
 ) -> dict[str, Any]:
     """
     Returns confidence score + suggested home screen questions.
@@ -701,11 +817,10 @@ async def get_setup(
     avg_score = round(sum(scores) / len(scores))
     color = confidence_color(avg_score)
 
-    # ── 2. Suggested questions — cache-first, evergreen fallback ────────────
+    # ── 2. Suggested questions — Valkey → Postgres → evergreen ──────────────
     # Resolve language
     resolved_lang = language
     if resolved_lang == "auto":
-        # Try to load user's preferred language
         raw_user = await vk.get(CacheKeys.user(user_code))
         if raw_user:
             user_data = json.loads(raw_user)
@@ -714,30 +829,59 @@ async def get_setup(
         else:
             resolved_lang = "JA"
 
-    pet_ids_list = list(pet_id)
-    cache_key = CacheKeys.suggested_questions(
-        user_code, pet_ids_list, resolved_lang)
-
-    # Try cache first
     questions_cached = True
     questions_generated_at = ""
-    raw_cached_questions = await vk.get(cache_key)
+    # Per-pet rows: pet_id → list of 10 questions for that pet
+    per_pet_rows: dict[int, list[dict]] = {}
 
-    if raw_cached_questions is not None:
+    # Step 1: Valkey hot cache — load each pet's row separately
+    for pid in pet_id:
+        cache_key = CacheKeys.suggested_questions(user_code, resolved_lang, pid)
+        raw = await vk.get(cache_key)
+        if raw is not None:
+            try:
+                cached = json.loads(raw)
+                per_pet_rows[pid] = cached.get("questions", [])
+                if not questions_generated_at:
+                    questions_generated_at = cached.get("generated_at", "")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    # Step 2: Valkey miss per pet → try Postgres cold storage
+    missing_pids = [pid for pid in pet_id if pid not in per_pet_rows]
+    if missing_pids:
         try:
-            cached = json.loads(raw_cached_questions)
-            suggested_questions = cached.get("questions", [])
-            questions_generated_at = cached.get("generated_at", "")
-        except (json.JSONDecodeError, AttributeError):
-            suggested_questions = []
-    else:
-        suggested_questions = []
+            async with get_session() as db_session:
+                sq_repo = SuggestedQuestionsRepo(db_session)
+                for pid in missing_pids:
+                    pg_row = await sq_repo.get(user_code, resolved_lang, pid)
+                    if pg_row:
+                        per_pet_rows[pid] = pg_row["questions"]
+                        if not questions_generated_at and pg_row["generated_at"]:
+                            questions_generated_at = pg_row["generated_at"].isoformat()
+                        # Warm Valkey from Postgres (best-effort)
+                        try:
+                            await vk.setex(
+                                CacheKeys.suggested_questions(user_code, resolved_lang, pid),
+                                jittered_ttl(TTL_SUGGESTED),
+                                json.dumps({
+                                    "generated_at": questions_generated_at,
+                                    "questions": pg_row["questions"],
+                                }),
+                            )
+                        except Exception:
+                            pass
+        except Exception as db_exc:
+            logger.warning("/setup: Postgres fallback failed: %s", db_exc)
 
-    # Cache miss → serve evergreen immediately (no LLM call on mount)
-    if not suggested_questions:
-        questions_cached = False
-        suggested_questions = get_evergreen_questions(
-            resolved_lang, pet_count=len(pet_id))
+    # Step 3: Cold start per pet — neither Valkey nor Postgres has this pet → evergreen
+    for i, pid in enumerate(pet_id):
+        if pid not in per_pet_rows:
+            questions_cached = False
+            per_pet_rows[pid] = _build_full_evergreen(resolved_lang, is_pet_b=(i == 1))
+
+    # Apply module pick rule → return 3 questions
+    suggested_questions = _pick_questions(per_pet_rows, list(pet_id), module, resolved_lang)
 
     return {
         "status": "ok",

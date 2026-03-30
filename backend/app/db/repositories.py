@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db.models import (
-    User, ActiveProfile, FactLog, Thread, ThreadMessage,
+    User, ActiveProfile, FactLog, Thread, ThreadMessage, SuggestedQuestion,
 )
 from app.types import ActiveProfileEntry
 
@@ -75,7 +75,7 @@ class UserRepo:
 
     async def upsert(self, data: dict) -> None:
         """Insert or update a user record.  Auto-called on every chat request."""
-        stmt = pg_insert(User).values(
+        insert_values: dict = dict(
             user_code=data["user_code"],
             display_name=data.get("display_name", ""),
             session_count=data.get("session_count", 0),
@@ -84,15 +84,32 @@ class UserRepo:
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
         )
+        update_set: dict = {
+            "display_name": "excluded.display_name",
+            "session_count": "excluded.session_count",
+            "relationship_summary": "excluded.relationship_summary",
+            "preferred_language": "excluded.preferred_language",
+            "updated_at": "excluded.updated_at",
+        }
+
+        # Write last_known_pet_ids when caller provides all_pet_ids
+        if "all_pet_ids" in data and data["all_pet_ids"] is not None:
+            insert_values["last_known_pet_ids"] = data["all_pet_ids"]
+
+        stmt = pg_insert(User).values(**insert_values)
+        on_conflict_set = {
+            "display_name": stmt.excluded.display_name,
+            "session_count": stmt.excluded.session_count,
+            "relationship_summary": stmt.excluded.relationship_summary,
+            "preferred_language": stmt.excluded.preferred_language,
+            "updated_at": stmt.excluded.updated_at,
+        }
+        if "all_pet_ids" in data and data["all_pet_ids"] is not None:
+            on_conflict_set["last_known_pet_ids"] = stmt.excluded.last_known_pet_ids
+
         stmt = stmt.on_conflict_do_update(
             index_elements=["user_code"],
-            set_={
-                "display_name": stmt.excluded.display_name,
-                "session_count": stmt.excluded.session_count,
-                "relationship_summary": stmt.excluded.relationship_summary,
-                "preferred_language": stmt.excluded.preferred_language,
-                "updated_at": stmt.excluded.updated_at,
-            },
+            set_=on_conflict_set,
         )
         await self._session.execute(stmt)
         await self._session.commit()
@@ -141,12 +158,16 @@ class ActiveProfileRepo:
         """
         Write the entire active_profile dict to the database.
 
-        Strategy: DELETE all existing rows then INSERT fresh, within a single
-        transaction (the session auto-begins one).  This means a concurrent
-        reader between DELETE and INSERT would see an empty profile.  This is
-        acceptable in Phase 1C (single pet, single user, asyncio Lock in
-        Aggregator prevents concurrent writes).  For multi-user production,
-        consider upsert-per-row or a serializable isolation level.
+        Strategy: upsert each row (INSERT ON CONFLICT DO UPDATE) then delete
+        stale keys no longer in the new profile — all within one transaction.
+
+        Why not DELETE+INSERT?
+          DELETE then INSERT creates an empty window between the two statements.
+          Even though both are in the same transaction, a concurrent writer
+          (second background pipeline for the same pet) can issue its own DELETE
+          after ours, then INSERT only its own facts — silently discarding ours
+          when it commits.  Upsert eliminates this: each field_key is atomically
+          replaced and the profile is never empty.
 
         Used for:
           - Seeding defaults on first startup
@@ -156,29 +177,21 @@ class ActiveProfileRepo:
             pet_id: The pet this profile belongs to.
             profile_dict: Full profile dict (same shape as active_profile.json).
         """
-        # Delete existing rows for this pet.
-        await self._session.execute(
-            delete(ActiveProfile).where(ActiveProfile.pet_id == pet_id)
-        )
-
-        # Build all rows first, then add in bulk.
-        rows: list[ActiveProfile] = []
+        new_keys: set[str] = set()
         skipped = 0
+
         for field_key, entry in profile_dict.items():
             if field_key in ("_pet_history", "_history_last_updated"):
-                # These are stored as plain strings (not metadata dicts).
-                # _pet_history: narrative text.  _history_last_updated: ISO timestamp.
-                # Both must be preserved through every write_all() so the HistoryBuilder
-                # pointer is not erased each time the Aggregator runs.
-                rows.append(ActiveProfile(
+                # Plain string rows — no metadata columns.
+                values = dict(
                     pet_id=pet_id,
                     user_code=user_code,
                     field_key=field_key,
                     value=entry if isinstance(entry, str) else str(entry),
-                ))
+                )
+                update_set = {"value": values["value"], "user_code": user_code}
             elif isinstance(entry, dict) and "value" in entry:
-                # Regular fact entry with metadata.
-                rows.append(ActiveProfile(
+                values = dict(
                     pet_id=pet_id,
                     user_code=user_code,
                     field_key=field_key,
@@ -192,20 +205,36 @@ class ActiveProfileRepo:
                     status=entry.get("status"),
                     change_detected=entry.get("change_detected"),
                     trend_flag=entry.get("trend_flag"),
-                ))
+                )
+                update_set = {k: values[k] for k in values if k not in ("pet_id", "field_key")}
             else:
-                # Skip unrecognized entries (defensive).
-                logger.warning(
-                    "Skipping unrecognized active_profile key: %s", field_key)
+                logger.warning("Skipping unrecognized active_profile key: %s", field_key)
                 skipped += 1
                 continue
 
-        self._session.add_all(rows)
+            stmt = pg_insert(ActiveProfile).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["pet_id", "field_key"],
+                set_=update_set,
+            )
+            await self._session.execute(stmt)
+            new_keys.add(field_key)
+
+        # Delete rows for keys that no longer exist in the new profile.
+        # This is the only DELETE — it removes stale fields, not all fields.
+        if new_keys:
+            await self._session.execute(
+                delete(ActiveProfile).where(
+                    ActiveProfile.pet_id == pet_id,
+                    ActiveProfile.field_key.not_in(new_keys),
+                )
+            )
+
         await self._session.commit()
 
         _internal_keys = {"_pet_history", "_history_last_updated"}
-        fact_count = sum(1 for r in rows if r.field_key not in _internal_keys)
-        has_history = any(r.field_key == "_pet_history" for r in rows)
+        fact_count = sum(1 for k in new_keys if k not in _internal_keys)
+        has_history = "_pet_history" in new_keys
         logger.debug(
             "active_profile: wrote %d fact entries%s for pet_id=%s (skipped %d)",
             fact_count,
@@ -772,3 +801,146 @@ class ThreadMessageRepo:
         )
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
+
+
+# ── SuggestedQuestionsRepo ────────────────────────────────────────────────────
+
+class SuggestedQuestionsRepo:
+    """
+    Read/write the anymall_chan_suggested_questions table.
+
+    Per-pet cold storage: one row per (user_code, language, pet_id).
+    Each pet has its own 10-question set (3 dedicated + 1 both per module).
+    Valkey is the hot cache (10-day TTL, keyed by pet_id); this table is the
+    fallback so questions survive Valkey TTL expiry without triggering an LLM call.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def upsert(
+        self,
+        user_code: str,
+        language: str,
+        pet_id: int,
+        questions: list[dict],
+        generated_at: datetime,
+    ) -> None:
+        """
+        Insert or update the suggested questions for a user+language+pet.
+
+        ON CONFLICT (user_code, language, pet_id) DO UPDATE — always overwrites
+        with the freshest generation result.
+        """
+        stmt = pg_insert(SuggestedQuestion).values(
+            user_code=user_code,
+            language=language,
+            pet_id=pet_id,
+            questions=questions,
+            generated_at=generated_at,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["user_code", "language", "pet_id"],
+            set_={
+                "questions": stmt.excluded.questions,
+                "generated_at": stmt.excluded.generated_at,
+            },
+        )
+        await self._session.execute(stmt)
+        await self._session.commit()
+        logger.debug(
+            "suggested_questions: upserted %d questions for user=%s lang=%s pet_id=%s",
+            len(questions), user_code, language, pet_id,
+        )
+
+    async def get(self, user_code: str, language: str, pet_id: int) -> dict | None:
+        """
+        Fetch the stored questions for a user+language+pet.
+
+        Returns {"questions": [...], "generated_at": datetime} or None if not found.
+        """
+        stmt = (
+            select(SuggestedQuestion)
+            .where(
+                SuggestedQuestion.user_code == user_code,
+                SuggestedQuestion.language == language,
+                SuggestedQuestion.pet_id == pet_id,
+            )
+        )
+        result = await self._session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "questions": row.questions,
+            "generated_at": row.generated_at,
+        }
+
+    async def get_all_stale(self, age_days: int = 7) -> list[dict]:
+        """
+        Find all per-pet rows that need regen.
+
+        Two conditions (either triggers regen):
+          1. generated_at < NOW() - age_days  (weekly refresh)
+          2. A high-confidence fact was written AFTER the questions were generated
+             (profile changed → questions are stale)
+
+        Returns one dict per (user_code, language, pet_id) row — the nightly job
+        calls regen_for_user once per row.
+
+        CRITICAL: The IS NOT NULL guard on lf.last_fact_at is mandatory.
+        Without it, every user with zero high-confidence facts would satisfy
+        'NULL < generated_at' which is always false — but COALESCE(NULL, NOW())
+        would make it always true. The IS NOT NULL guard ensures we only regen
+        when a real fact timestamp exists.
+        """
+        sql = text(f"""
+            WITH last_fact AS (
+                SELECT user_code, MAX(created_at) AS last_fact_at
+                FROM anymall_chan_fact_log
+                WHERE confidence >= 0.8
+                GROUP BY user_code
+            )
+            SELECT sq.user_code, sq.language, sq.pet_id, u.last_known_pet_ids
+            FROM anymall_chan_suggested_questions sq
+            JOIN anymall_chan_users u ON sq.user_code = u.user_code
+            LEFT JOIN last_fact lf ON sq.user_code = lf.user_code
+            WHERE sq.language = u.preferred_language
+              AND (
+                sq.generated_at < NOW() - INTERVAL '{age_days} days'
+                OR (lf.last_fact_at IS NOT NULL AND sq.generated_at < lf.last_fact_at)
+              )
+        """)
+        result = await self._session.execute(sql)
+        rows = result.fetchall()
+        return [
+            {
+                "user_code": row[0],
+                "language": row[1],
+                "pet_id": row[2],
+                "last_known_pet_ids": row[3] or [],
+            }
+            for row in rows
+        ]
+
+    async def cleanup_stale_language_rows(self) -> int:
+        """
+        Delete suggested-question rows whose language no longer matches the user's
+        preferred_language. Called by the nightly job after regen to keep storage clean.
+
+        Returns the number of rows deleted.
+
+        Why this is safe: the nightly job only regens rows that match preferred_language
+        (via get_all_stale), so by the time this runs the current language already has
+        fresh rows. Deleting the old-language rows will never leave the user with no
+        questions — /setup will always find the current-language rows.
+        """
+        sql = text("""
+            DELETE FROM anymall_chan_suggested_questions sq
+            USING anymall_chan_users u
+            WHERE sq.user_code = u.user_code
+              AND sq.language != u.preferred_language
+        """)
+        result = await self._session.execute(sql)
+        await self._session.commit()
+        return result.rowcount
