@@ -36,7 +36,7 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
   // Fetch setup (confidence + suggested questions) on mount
   useEffect(() => {
     if (!primaryPet) return
-    fetchSetup(petIds, userCode, language)
+    fetchSetup(petIds, userCode, language, 'anymall')
       .then(data => {
         setConfidenceScore(data.confidence_score ?? 0)
         setConfidenceColor(data.confidence_color ?? 'red')
@@ -105,11 +105,10 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
       }, 4000)
     } catch (err) {
       setIsTyping(false)
-      setMessages(prev => [...prev, {
-        id: Date.now() + 1,
-        text: `I'm having trouble connecting right now. Please try again! 🐢`,
-        isUser: false,
-      }])
+      const text = err.isRejection
+        ? err.message
+        : `I'm having trouble connecting right now. Please try again! 🐢`
+      setMessages(prev => [...prev, { id: Date.now() + 1, text, isUser: false }])
     }
   }
 

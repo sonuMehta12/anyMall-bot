@@ -28,7 +28,15 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
       display_name: displayName,
     }),
   })
-  if (!res.ok) throw new Error(`${res.status} — failed to send message`)
+  if (!res.ok) {
+    if (res.status === 400) {
+      const body = await res.json().catch(() => ({}))
+      const err = new Error(body.detail || "I can't help with that.")
+      err.isRejection = true
+      throw err
+    }
+    throw new Error(`${res.status} — failed to send message`)
+  }
   const data = await res.json()
 
   // ── Agent 1 — logged immediately (synchronous, in the /chat response) ───────
@@ -118,10 +126,11 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
 
 // GET /api/v1/setup — confidence score + suggested questions.
 // Replaces the old /confidence endpoint. Returns confidence_score, confidence_color,
-// and suggested_questions (4 items for the home screen).
-export async function fetchSetup(petIds, userCode, language = 'auto') {
+// and suggested_questions (3 items for the home screen, filtered by module).
+// module: 'anymall' (default) | 'food' | 'health'
+export async function fetchSetup(petIds, userCode, language = 'auto', module = 'anymall') {
   const ids = Array.isArray(petIds) ? petIds : [petIds]
-  const query = ids.map(id => `pet_id=${id}`).join('&') + `&language=${language}`
+  const query = ids.map(id => `pet_id=${id}`).join('&') + `&language=${language}&module=${module}`
   const res = await fetch(`${BASE}/api/v1/setup?${query}`, {
     headers: { 'X-User-Code': userCode },
   })
