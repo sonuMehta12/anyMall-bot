@@ -888,23 +888,32 @@ class SuggestedQuestionsRepo:
         Returns one dict per (user_code, language, pet_id) row — the nightly job
         calls regen_for_user once per row.
 
+        "High-confidence" here means confidence > 0.70 (strictly greater), matching
+        the pipeline split in background.py. Facts at exactly 0.70 belong to the
+        low/clarification band (0.50 <= confidence <= 0.70) and must NOT trigger regen.
+
+        Staleness condition 2 is evaluated per-pet: last_fact is the most recent
+        high-confidence fact for THAT pet specifically (grouped by pet_id, joined on
+        pet_id). This prevents Pet A getting new facts from incorrectly marking
+        Pet B's questions stale.
+
         CRITICAL: The IS NOT NULL guard on lf.last_fact_at is mandatory.
-        Without it, every user with zero high-confidence facts would satisfy
+        Without it, every pet with zero high-confidence facts would satisfy
         'NULL < generated_at' which is always false — but COALESCE(NULL, NOW())
         would make it always true. The IS NOT NULL guard ensures we only regen
         when a real fact timestamp exists.
         """
         sql = text(f"""
             WITH last_fact AS (
-                SELECT user_code, MAX(created_at) AS last_fact_at
+                SELECT pet_id, MAX(extracted_at) AS last_fact_at
                 FROM anymall_chan_fact_log
-                WHERE confidence >= 0.8
-                GROUP BY user_code
+                WHERE confidence > 0.70
+                GROUP BY pet_id
             )
             SELECT sq.user_code, sq.language, sq.pet_id, u.last_known_pet_ids
             FROM anymall_chan_suggested_questions sq
             JOIN anymall_chan_users u ON sq.user_code = u.user_code
-            LEFT JOIN last_fact lf ON sq.user_code = lf.user_code
+            LEFT JOIN last_fact lf ON sq.pet_id = lf.pet_id
             WHERE sq.language = u.preferred_language
               AND (
                 sq.generated_at < NOW() - INTERVAL '{age_days} days'

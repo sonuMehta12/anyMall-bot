@@ -1,6 +1,6 @@
 # app/services/question_generation/validator.py
 #
-# Per-slot validation for v2 suggested questions (10-question universal cache).
+# Per-slot validation for v2 suggested questions (10-question per-pet cache).
 #
 # Public API:
 #   validate_slot(question, slot_index, all_questions, language, pet_count, history)
@@ -16,6 +16,7 @@
 #   6. module in {"food", "health", "anymall"}
 #   7. target in {"pet_a", "pet_b", "both"}
 #   8. single-pet guard: if pet_count==1, reject multi-pet language in the text
+#      (checked against text regardless of target — a mislabelled target must not bypass this)
 
 from __future__ import annotations
 
@@ -71,8 +72,12 @@ _MULTI_PET_PHRASES = [
     "both pets",
     "two pets",
     "both my",
-    "両方",   # "both" (JA)
-    "二匹",   # "two animals" (JA)
+    "other pet",   # "my other pet", "other pet's" — used in all pet_b templates
+    "second pet",  # "my second pet", "second pet's" — used in all pet_b templates
+    "両方",        # "both" (JA)
+    "二匹",        # "two animals" (JA)
+    "2匹目",       # "second pet" (JA) — used in all JA pet_b templates
+    "もう1匹",     # "another pet" (JA) — used in JA pet_b templates
 ]
 
 
@@ -85,7 +90,6 @@ def _has_multi_pet_language(text: str) -> bool:
 
 _VALID_MODULES = {"food", "health", "anymall"}
 _VALID_TARGETS = {"pet_a", "pet_b", "both"}
-_MULTI_PET_TARGETS = {"pet_b", "both"}
 
 
 def validate_slot(
@@ -150,9 +154,10 @@ def validate_slot(
     if target not in _VALID_TARGETS:
         return f"invalid_target: {target!r}"
 
-    # 8. Single-pet guard
-    if pet_count == 1 and target in _MULTI_PET_TARGETS:
-        if _has_multi_pet_language(text):
-            return "single_pet_multi_pet_language"
+    # 8. Single-pet guard: reject multi-pet language in text regardless of target.
+    # Checking target first (as before) would miss questions mislabelled as pet_a
+    # whose text still says "other pet" / "second pet" / "both my".
+    if pet_count == 1 and _has_multi_pet_language(text):
+        return "single_pet_multi_pet_language"
 
     return None

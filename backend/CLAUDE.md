@@ -75,7 +75,8 @@ User message + X-User-Code header + pet_ids[]
   |
   v  [fire-and-forget, user does NOT wait]
   -> Compressor (LLM: extract facts)
-  -> Aggregator (no LLM: merge facts into active_profile, bust suggested-questions cache)
+  -> Aggregator (no LLM: merge facts into active_profile)
+  -> Suggested questions regen (one regen_for_user() call per pet, fire-and-forget)
   -> Clarification management (low-confidence facts)
 ```
 
@@ -90,8 +91,8 @@ User message + X-User-Code header + pet_ids[]
 | `am:meta:{thread_id}` | 7200s | Gap question counter, redirect cooldown |
 | `am:user:{user_code}` | 7200s | User record (language, relationship_summary) |
 | `am:aalda:{user_code}:{pet_id}` | 300s | AALDA API response cache |
-| `am:suggested:{user_code}:{lang}` | 10 days | Pre-generated suggested questions (10 questions, all modules) |
-| `am:suggested_history:{user_code}:{lang}` | 30 days | 4-week question history (anti-repeat) |
+| `am:suggested:{user_code}:{lang}:{pet_id}` | 10 days | 10 pre-generated questions for one pet (per-pet row) |
+| `am:suggested_history:{user_code}:{lang}` | 30 days | 4-week question history shared across all pets (anti-repeat) |
 
 All keys use `jittered_ttl()` to prevent stampede expiration.
 
@@ -101,11 +102,12 @@ All keys use `jittered_ttl()` to prevent stampede expiration.
 
 | Table | Write Pattern | Purpose |
 |-------|--------------|---------|
-| `anymall_chan_users` | UPSERT per chat | Owner data, relationship_summary |
+| `anymall_chan_users` | UPSERT per chat | Owner data, `last_known_pet_ids`, `preferred_language`, relationship_summary |
 | `anymall_chan_fact_log` | APPEND only | Every extracted fact (audit trail) |
 | `anymall_chan_active_profile` | DELETE+INSERT per pet | Current best-known value per field |
 | `anymall_chan_threads` | INSERT + UPDATE | 24h conversation windows |
 | `anymall_chan_thread_messages` | APPEND only | Individual messages within threads |
+| `anymall_chan_suggested_questions` | UPSERT per pet per regen | 10-question row per `(user_code, language, pet_id)` |
 
 ---
 
@@ -133,11 +135,13 @@ backend/app/
     confidence_calculator.py # Pure arithmetic scoring (0-100)
     guardrails.py           # Regex-based reply filtering
     deeplink.py             # Redirect payload builder
-    question_templates.py   # Evergreen fallback questions (8 languages)
-    question_validator.py   # Validates suggested questions
     thread_summarizer.py    # LLM thread compaction
     history_builder.py      # fact_log -> _pet_history narrative
     relationship_builder.py # USER STYLE -> relationship_summary
+    question_generation/
+      generator.py          # regen_for_user() — orchestrates one pet's 10-question regen
+      templates.py          # Evergreen fallback pools (food/health/anymall × EN/JA × pet_a/pet_b/both)
+      validator.py          # validate_slot() — per-slot validation, 8 rules
   db/
     models.py               # SQLAlchemy ORM models
     session.py              # Async session factory

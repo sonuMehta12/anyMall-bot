@@ -28,7 +28,6 @@ from typing import Any
 from app.agents.suggested_questions import SuggestedQuestionsAgent, _MODEL as _SQ_MODEL
 from app.cache.keys import CacheKeys, TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl
 from app.db.repositories import ActiveProfileRepo, SuggestedQuestionsRepo
-from app.db.session import get_session
 from app.services.context_builder import build_pet_context
 from app.services.question_generation.templates import get_evergreen_questions
 from app.services.question_generation.validator import validate_slot
@@ -58,9 +57,11 @@ async def regen_for_user(
       5. If empty → fill all 10 slots from evergreen pools
       6. Validate each slot with validate_slot()
       7. Patch any failed slot with get_evergreen_questions()
-      8. Write to Valkey (hot cache, keyed by pet_id)
-      9. Write to Postgres (cold storage via SuggestedQuestionsRepo, keyed by pet_id)
-     10. Append question texts to 4-week history
+      8. Write to Postgres first (cold storage, source of truth)
+      9. Write to Valkey (hot cache) — only after DB succeeds
+     10. Append all 10 question texts to 4-week history (not just the 3 served by
+         /setup — storing all 10 prevents the LLM regenerating the same questions
+         next cycle, even for questions the user never saw)
 
     Args:
         is_pet_b: True if this pet is the second pet in the user's list.
@@ -78,9 +79,8 @@ async def regen_for_user(
         if raw_profile:
             active_raw = json.loads(raw_profile)
         else:
-            async with get_session() as fallback_session:
-                ap_repo = ActiveProfileRepo(fallback_session)
-                active_raw = await ap_repo.read_all(pet_id)
+            ap_repo = ActiveProfileRepo(db_session)
+            active_raw = await ap_repo.read_all(pet_id)
 
         ctx = build_pet_context(pet_profile, aalda_facts, active_raw)
 
@@ -174,17 +174,10 @@ async def regen_for_user(
             )
             return
 
-        # ── 9a: Write to Valkey (keyed by pet_id) ───────────────────────────
         now_utc = datetime.now(timezone.utc)
         now_iso = now_utc.isoformat()
-        cache_key = CacheKeys.suggested_questions(user_code, language, pet_id)
-        await valkey.setex(
-            cache_key,
-            jittered_ttl(TTL_SUGGESTED),
-            json.dumps({"generated_at": now_iso, "questions": final}),
-        )
 
-        # ── 9b: Write to Postgres (keyed by pet_id) ─────────────────────────
+        # ── 9a: Write to Postgres first (source of truth) ───────────────────
         await suggested_repo.upsert(
             user_code=user_code,
             language=language,
@@ -193,7 +186,18 @@ async def regen_for_user(
             generated_at=now_utc,
         )
 
-        # ── 10: Update 4-week history (shared across all pets) ───────────────
+        # ── 9b: Write to Valkey (hot cache) — after DB succeeds ─────────────
+        cache_key = CacheKeys.suggested_questions(user_code, language, pet_id)
+        await valkey.setex(
+            cache_key,
+            jittered_ttl(TTL_SUGGESTED),
+            json.dumps({"generated_at": now_iso, "questions": final}),
+        )
+
+        # ── 10: Update 4-week history (shared across all pets) ─────────────────
+        # All 10 generated questions are stored, not only the 3 served by /setup.
+        # This ensures next-cycle regen never reproduces the same pool — the LLM
+        # is told "avoid these" regardless of whether each question was displayed.
         current_week = now_utc.strftime("%G-W%V")
         cutoff_week = (now_utc - timedelta(weeks=4)).strftime("%G-W%V")
         history_entries = [

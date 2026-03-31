@@ -44,7 +44,7 @@ from app.cache.keys import (
 )
 from app.db.session import get_session
 from app.db.repositories import (
-    ActiveProfileRepo, FactLogRepo, SuggestedQuestionsRepo, ThreadRepo, ThreadMessageRepo,
+    ActiveProfileRepo, FactLogRepo, SuggestedQuestionsRepo, ThreadRepo, ThreadMessageRepo, UserRepo,
 )
 from app.services.question_generation.generator import regen_for_user
 from app.types import StateBag
@@ -368,7 +368,7 @@ async def _regen_suggested_questions(
         logger.debug("_regen_suggested_questions: required services unavailable, skipping")
         return
 
-    # Resolve language from cached user record
+    # Resolve language: Valkey first, DB fallback if cache is cold
     language = "JA"
     raw_user = await vk.get(CacheKeys.user(user_code))
     if raw_user:
@@ -378,6 +378,17 @@ async def _regen_suggested_questions(
             language = lang if lang != "auto" else "JA"
         except (json.JSONDecodeError, TypeError):
             pass
+    else:
+        # Valkey cold — load preferred_language from DB to avoid serving the wrong language
+        try:
+            async with get_session() as db_session:
+                user_repo = UserRepo(db_session)
+                user_record = await user_repo.read(user_code)
+            if user_record:
+                lang = user_record.get("preferred_language", "JA")
+                language = lang if lang != "auto" else "JA"
+        except Exception:
+            pass  # last resort: keep default "JA"
 
     # Regen each pet separately — each gets its own 10-question set
     for i, pid in enumerate(pet_ids):

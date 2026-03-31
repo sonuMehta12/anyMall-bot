@@ -2700,8 +2700,8 @@ def test_setup_returns_confidence_and_questions():
         return
 
     questions = data["suggested_questions"]
-    if not isinstance(questions, list) or len(questions) != 4:
-        fail(f"expected 4 questions, got {type(questions).__name__} with {len(questions) if isinstance(questions, list) else 'N/A'}")
+    if not isinstance(questions, list) or len(questions) != 3:
+        fail(f"expected 3 questions, got {type(questions).__name__} with {len(questions) if isinstance(questions, list) else 'N/A'}")
         return
 
     # Validate each question structure (v2: no reason_type — uses module/target/text)

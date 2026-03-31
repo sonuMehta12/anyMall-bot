@@ -26,7 +26,10 @@
 
 from __future__ import annotations
 
+import logging
 import random
+
+logger = logging.getLogger(__name__)
 
 
 # ── Question pools ───────────────────────────────────────────────────────────
@@ -236,7 +239,13 @@ def get_evergreen_questions(
 
     Returns deep-copied dicts so callers can mutate without affecting shared pools.
     """
-    module_pool = EVERGREEN.get(module, EVERGREEN["anymall"])
+    module_pool = EVERGREEN.get(module)
+    if module_pool is None:
+        logger.warning(
+            "get_evergreen_questions: unknown module %r — falling back to 'anymall'",
+            module,
+        )
+        module_pool = EVERGREEN["anymall"]
     lang_pool = module_pool.get(language, module_pool.get("EN", {}))
     target_pool = lang_pool.get(target, lang_pool.get("pet_a", []))
 

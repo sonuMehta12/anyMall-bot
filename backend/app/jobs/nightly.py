@@ -218,8 +218,8 @@ async def _pregenerate_suggested_questions(app_state: Any) -> None:
     """
     Pre-generate suggested home screen questions for all stale users (v2).
 
-    Uses SuggestedQuestionsRepo.get_all_stale() to find users whose 10-question
-    universal cache is either >7 days old or pre-dates their last high-confidence
+    Uses SuggestedQuestionsRepo.get_all_stale() to find per-pet rows whose 10-question
+    per-pet cache is either >7 days old or pre-dates that pet's last high-confidence
     fact. Delegates generation to generator.regen_for_user().
 
     Rate-limited to 0.1s per user to avoid LLM quota spikes at midnight.

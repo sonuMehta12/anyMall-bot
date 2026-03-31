@@ -827,7 +827,18 @@ async def get_setup(
             db_lang = user_data.get("preferred_language", "auto")
             resolved_lang = db_lang if db_lang != "auto" else "JA"
         else:
-            resolved_lang = "JA"
+            # Valkey cold — fall back to DB before defaulting to JA
+            try:
+                async with get_session() as db_session:
+                    user_repo = UserRepo(db_session)
+                    user_record = await user_repo.read(user_code)
+                if user_record:
+                    db_lang = user_record.get("preferred_language", "auto")
+                    resolved_lang = db_lang if db_lang != "auto" else "JA"
+                else:
+                    resolved_lang = "JA"
+            except Exception:
+                resolved_lang = "JA"
 
     questions_cached = True
     questions_generated_at = ""
@@ -865,7 +876,7 @@ async def get_setup(
                                 CacheKeys.suggested_questions(user_code, resolved_lang, pid),
                                 jittered_ttl(TTL_SUGGESTED),
                                 json.dumps({
-                                    "generated_at": questions_generated_at,
+                                    "generated_at": pg_row["generated_at"].isoformat() if pg_row.get("generated_at") else "",
                                     "questions": pg_row["questions"],
                                 }),
                             )
