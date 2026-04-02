@@ -2,15 +2,15 @@
 #
 # POST /api/v1/chat — the core endpoint.
 # GET  /api/v1/pets — list user's pets from AALDA.
-# GET  /api/v1/setup — confidence bar + suggested questions (replaces /confidence).
-# GET  /api/v1/confidence — alias for /setup (backward compat).
+# POST /api/v1/pets/setup/query — confidence bar + suggested questions.
+# GET  /api/v1/confidence — backward-compat alias (confidence score only).
 #
 # What lives here:
-#   - Pydantic request/response models (ChatRequest, ChatResponse, RedirectPayload)
+#   - Pydantic request/response models (ChatRequest, ChatResponse, RedirectPayload, SetupRequest)
 #   - POST /api/v1/chat route
 #   - GET /api/v1/pets route (fetches from AALDA)
-#   - GET /api/v1/setup route (confidence + suggested questions)
-#   - GET /api/v1/confidence route (alias for /setup)
+#   - POST /api/v1/pets/setup/query route (confidence + suggested questions)
+#   - GET /api/v1/confidence route (alias, backward compat)
 #
 # Background pipeline (_run_background, _run_compaction) lives in background.py.
 #
@@ -183,6 +183,13 @@ class ChatResponse(BaseModel):
     # ── Confidence bar ────────────────────────────────────────────────────────
     confidence_score: int  # 0-100, how well AnyMall-chan knows the pet
     confidence_color: str  # "green" (80-100) | "yellow" (50-79) | "red" (0-49)
+
+
+class SetupRequest(BaseModel):
+    """Body for POST /api/v1/pets/setup/query."""
+    pet_ids: List[int] = Field(..., min_length=1, description="One or more pet IDs")
+    language: str = Field(default="auto")
+    module: str = Field(default="anymall", pattern="^(anymall|food|health)$")
 
 
 def _to_redirect_payload(deeplink) -> RedirectPayload:
@@ -756,29 +763,31 @@ def _pick_questions(
 
 # ── Setup endpoint (confidence + suggested questions) ────────────────────────
 
-@router.get("/setup", summary="Confidence bar + suggested questions")
+@router.post("/pets/setup/query", summary="Confidence bar + suggested questions")
 async def get_setup(
     request: Request,
-    pet_id: List[int] = Query(default=[]),
-    language: str = Query(default="auto"),
-    module: str = Query(default="anymall", pattern="^(anymall|food|health)$"),
+    body: SetupRequest,
 ) -> dict[str, Any]:
     """
     Returns confidence score + suggested home screen questions.
 
-    Single pet:  GET /setup?pet_id=101
-    Dual pet:    GET /setup?pet_id=101&pet_id=102
+    Accepts 1–N pet IDs in the JSON body.
+    Single pet:  {"pet_ids": [101], "module": "food"}
+    Dual pet:    {"pet_ids": [101, 102], "module": "food"}
 
     Requires X-User-Code header. Called by the frontend on mount.
-    Replaces the old /confidence endpoint with additional question data.
     """
+    pet_id = body.pet_ids
+    language = body.language
+    module = body.module
+
     user_code = _require_user_code(request)
     pet_fetcher = request.app.state.pet_fetcher
     vk: ValkeyClient = request.app.state.valkey
 
     if not pet_id:
         raise HTTPException(
-            status_code=400, detail="pet_id query parameter is required.")
+            status_code=400, detail="pet_ids must contain at least one pet ID.")
 
     # ── 1. Confidence scoring (unchanged logic) ─────────────────────────────
     scores: list[int] = []

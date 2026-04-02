@@ -386,7 +386,7 @@ async def health_v1() -> JSONResponse:
         "valkey": valkey_ok,
         "llm_provider": settings.llm_provider,
         "llm_reachable": llm_ok,
-        "version": "1.1.0",
+        "version": "1.2.0",
     }
 
     return JSONResponse(status_code=http_code, content=result)

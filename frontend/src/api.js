@@ -124,15 +124,19 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
 }
 
 
-// GET /api/v1/setup — confidence score + suggested questions.
-// Replaces the old /confidence endpoint. Returns confidence_score, confidence_color,
-// and suggested_questions (3 items for the home screen, filtered by module).
+// POST /api/v1/pets/setup/query — confidence score + suggested questions.
+// Returns confidence_score, confidence_color, and suggested_questions (3 items,
+// filtered by module). Works for 1 or more pet IDs.
 // module: 'anymall' (default) | 'food' | 'health'
 export async function fetchSetup(petIds, userCode, language = 'auto', module = 'anymall') {
   const ids = Array.isArray(petIds) ? petIds : [petIds]
-  const query = ids.map(id => `pet_id=${id}`).join('&') + `&language=${language}&module=${module}`
-  const res = await fetch(`${BASE}/api/v1/setup?${query}`, {
-    headers: { 'X-User-Code': userCode },
+  const res = await fetch(`${BASE}/api/v1/pets/setup/query`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Code': userCode,
+    },
+    body: JSON.stringify({ pet_ids: ids, language, module }),
   })
   if (!res.ok) throw new Error(`${res.status} — failed to fetch setup`)
   return res.json()
