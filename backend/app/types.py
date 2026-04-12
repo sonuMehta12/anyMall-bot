@@ -79,6 +79,8 @@ class StateBag(Protocol):
     aggregator: Any
     thread_summarizer: Any
     pet_fetcher: Any
+    recipe_fetcher: Any      # RecipeFetcher — MCP client for recipe recommendations (Phase 3)
+    food_agent: Any          # FoodAgent — specialized food intent node (Phase 4)
     llm_provider: Any
     valkey: "ValkeyClient"
     scheduler: Any           # AsyncIOScheduler — nightly cron jobs (Sprint 6)

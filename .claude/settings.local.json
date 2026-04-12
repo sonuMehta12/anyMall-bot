@@ -28,7 +28,13 @@
       "Bash(.venv/Scripts/python tests/test_sprint6.py)",
       "WebFetch(domain:platform.openai.com)",
       "Bash(.venv/Scripts/python -m alembic heads)",
-      "Bash(.venv/Scripts/python tests/test_suggested_questions.py --unit)"
+      "Bash(.venv/Scripts/python tests/test_suggested_questions.py --unit)",
+      "Bash(python -m py_compile backend/app/services/recipe_fetcher.py backend/app/main.py backend/app/routes/chat.py)",
+      "Bash(python -X utf8 -c ':*)",
+      "Bash(.venv/Scripts/python tests/test_food_ai.py unit)",
+      "Read(//tmp/**)",
+      "Bash(.venv/Scripts/pip show:*)",
+      "Bash(.venv/Scripts/python tests/test_food_ai.py --unit)"
     ]
   }
 }

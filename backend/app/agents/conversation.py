@@ -23,7 +23,6 @@ from constants import (
     MAX_QUESTIONS_PER_MESSAGE,
     GAP_PRIORITY_LADDER,
     INTENT_HEALTH,
-    INTENT_FOOD,
     URGENCY_HIGH,
 )
 
@@ -130,8 +129,13 @@ Follow this flow internally. Do not show the structure to the user.
 1. Empathy or acknowledgement (1 sentence, emotion-first. Do not just \
 repeat the user's words)
 2. Helpful content or options (2-5 short sentences)
-3. End with exactly 1 gentle follow-up question. \
-Exceptions (you may skip the question): (a) emergency/urgent health, \
+3. End with exactly 1 gentle follow-up question.
+   - For FOOD intent: guide to next step (e.g., "Which of these sounds \
+most appealing?", "Would you like help cooking one of these?", "Does \
+{pet_name_a}{pet_suffix_a} have a preference?")
+   - For OTHER intents: ask a gap question if one is available and \
+questions_asked_so_far < max limit
+   Exceptions (skip follow-up): (a) emergency/urgent health, \
 (b) user explicitly said goodbye or "thanks, that's all", \
 (c) you have asked {max_questions_per_session} consecutive gap questions \
 that the user did not engage with
@@ -227,6 +231,8 @@ HEALTH AND FOOD SECTIONS:
 These are learning and research tools for the user. They are NOT expert \
 consultation or a way to contact a vet. Do not over-recommend them.
 
+{recipes_section}
+
 If health concern:
   - Validate the user's worry briefly (1 sentence)
   - Say that a vet visit is the safest for proper assessment
@@ -238,14 +244,36 @@ If health concern:
 for a proper check. If you'd like, the Health section has some useful \
 info to help you prepare."
 
-If nutrition question:
-  - Give general, non-medical guidance in plain language
-  - Suggest the Food section for tailored product recommendations
-  - You may ask one question if needed (e.g., "dry or wet food?")
-  - Example (JA): 「ごはんの相談なら、Foodで今の体格や年齢に合わせた\
-候補も見られるよ。気になる点があれば一緒に整理しよっか。」
-  - Example (EN): "For food questions, the Food section can suggest options \
-based on {pet_name_a}{pet_suffix_a}'s size and age. Want to check it out?"
+If nutrition / diet / recipe question:
+  - You ARE the food expert now — recipes are YOUR answer, not a referral
+  - RECIPES ARE LISTED ABOVE (under "RECIPES (from MCP...)") with complete details
+  - Available recipe details: title, type, cooking method, ingredients, nutrition, \
+health benefits, allergens, description
+  - If recipes are shown above, use ALL relevant details to answer the user:
+    * Reference ALL THREE recipes by name naturally in your response
+    * Use recipe descriptions to explain why each fits {pet_name_a}{pet_suffix_a}'s needs
+    * For cooking method questions: explain the cooking method (煮る, etc.) and why it's suitable
+    * For ingredient questions: mention the ingredients and their benefits
+    * For allergen concerns: reference the allergen tags to help the user
+    * For health questions: use health tags (#高たんぱく, #低脂質, etc.) to explain benefits
+    * For precautions: explain any relevant handling or preparation information
+    * Example (EN): "I found three great options for Node-kun:
+      1. 白菜とツナのうま煮 (Boiled salmon stew) — low-fat (85 kcal/100g), boiled method \
+is gentle. Contains salmon and soy - watch for allergies.
+      2. スイートポテト (Sweet potato) — easy to digest, steamed, perfect for \
+gentle nutrition.
+      3. ささみのパリパリチップス (Crispy chicken breast) — high protein, baked crispy, \
+ideal for active dogs."
+    * IMPORTANT: Always mention the recipes. The recipes are THE ANSWER.
+    * NEVER invent missing ingredients, cooking steps, substitutions, or recipe modifications
+  - If NO recipes listed above (or empty):
+    * Ask a clarifying food-specific follow-up question
+    * Examples: "Which of these recipes sounds most appealing?" or \
+"Does {pet_name_a}{pet_suffix_a} prefer boiled or steamed food?" or \
+"Would {pet_name_a}{pet_suffix_a} have any allergies to watch for?"
+    * Do NOT ask generic gap questions here — ask recipe/food-relevant questions
+  - Give guidance in plain, actionable language
+  - Do NOT suggest "Food section could help you compare..." — you ARE the food expert
 
 Emergency override (clear urgent signs):
   - Be direct and kind
@@ -615,6 +643,10 @@ class ConversationAgent:
         flag_section = self._build_flag_section(intent_type, urgency)
         todays_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+        # FoodAgent now owns all food responses — ConversationAgent never sees food intents.
+        # recipes_section is kept as empty string so the prompt template still renders cleanly.
+        recipes_section = ""
+
         # Extract last_answer from session history (S7: trim at word boundary)
         last_answer = ""
         msgs = session_messages or []
@@ -677,6 +709,7 @@ class ConversationAgent:
             gap_section_b_block=gap_section_b_block,
             relationship_context=relationship_context,
             flag_section=flag_section,
+            recipes_section=recipes_section,
             language_str=language_str,
             todays_date=todays_date,
             date_format_str="YYYY-MM-DD",
@@ -782,15 +815,6 @@ class ConversationAgent:
                 "validate briefly, suggest a vet visit is safest, gently offer the "
                 "Health section as a learning resource. Do not diagnose or give "
                 "treatment instructions. Keep your response empathetic and concise.\n\n"
-            )
-
-        if intent_type == INTENT_FOOD:
-            return (
-                "THIS MESSAGE FLAGS:\n"
-                "FOOD/NUTRITION QUESTION DETECTED. Follow the Food section rules "
-                "above: give general non-medical guidance, suggest the Food section "
-                "for tailored recommendations. Do not design medical diets or give "
-                "supplement dosing.\n\n"
             )
 
         # General intent — no special instructions needed.

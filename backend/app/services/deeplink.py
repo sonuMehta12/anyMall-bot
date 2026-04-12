@@ -13,7 +13,7 @@
 # to give good advice. This is intentional, not a hack.
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from constants import (
     INTENT_HEALTH,
@@ -40,6 +40,7 @@ class DeeplinkPayload:
     query: str            # user's original message, pre-filled in the module
     pet_id: int           # which pet, so the module can fetch its own data
     pet_summary: str      # full NL pet context — by design, module needs this
+    recipes_by_pet: dict[int, list[dict]] = field(default_factory=dict)  # Phase 3: recipes keyed by pet_id
 
 
 # ── build_deeplink ─────────────────────────────────────────────────────────────
@@ -50,6 +51,7 @@ def build_deeplink(
     user_message: str,
     pet_summary: str,
     pet_id: int,
+    recipes_by_pet: dict[int, list[dict]] | None = None,
 ) -> DeeplinkPayload | None:
     """
     Build a redirect payload if the intent requires one. Returns None for general messages.
@@ -60,12 +62,14 @@ def build_deeplink(
         user_message:  The raw user message, pre-filled in the target module.
         pet_summary:   NL string describing the pet (from context_builder.py).
         pet_id:        Which pet this conversation is about.
+        recipes_by_pet: Dict of recipes keyed by pet_id (Phase 3 — food intent only).
 
     Returns:
         DeeplinkPayload if intent is health or food.
         None if intent is general — no redirect needed.
     """
     style = "urgent" if urgency == URGENCY_HIGH else "suggestion"
+    recipes = recipes_by_pet or {}
 
     if intent_type == INTENT_HEALTH:
         payload = DeeplinkPayload(
@@ -76,6 +80,7 @@ def build_deeplink(
             query=user_message,
             pet_id=pet_id,
             pet_summary=pet_summary,
+            recipes_by_pet=recipes,
         )
         logger.info("build_deeplink → health redirect built, urgency=%s", urgency)
         return payload
@@ -89,6 +94,7 @@ def build_deeplink(
             query=user_message,
             pet_id=pet_id,
             pet_summary=pet_summary,
+            recipes_by_pet=recipes,
         )
         logger.info("build_deeplink → food redirect built, urgency=%s", urgency)
         return payload

@@ -38,13 +38,18 @@ from app.services.guardrails import apply_guardrails, detect_prompt_injection
 from app.services.deeplink import build_deeplink
 from app.services.context_builder import build_pet_context
 from app.services.pet_fetcher import PetFetchError
+from app.services.recipe_fetcher import RecipeFetcher, RecipeFetchError
+from app.services.food_query_planner import plan_food_queries
+from app.agents.food_agent import FoodAgent, FoodAgentResult
 from app.cache.client import ValkeyClient
 from app.cache.keys import (
     CacheKeys, TTL_SESSION, TTL_META, TTL_PENDING, TTL_USER, TTL_PROFILE,
     TTL_SUGGESTED, TTL_SUGGESTED_HISTORY, jittered_ttl,
 )
 from constants import (
-    INTENT_HEALTH, INTENT_FOOD, INTENT_UNTRUSTED, URGENCY_HIGH, URGENCY_MEDIUM,
+    INTENT_HEALTH, INTENT_FOOD,
+    INTENT_FOOD_RECIPES, INTENT_FOOD_RECIPES_INFO, INTENT_FOOD_INFO,
+    INTENT_UNTRUSTED, URGENCY_HIGH, URGENCY_MEDIUM,
     THREAD_CONTEXT_WINDOW, THREAD_EXPIRY_HOURS,
 )
 from app.db.session import get_session
@@ -146,6 +151,7 @@ class RedirectContext(BaseModel):
     query: str        # user's original message, pre-filled in the module
     pet_id: int       # which pet, so the module can fetch its own data
     pet_summary: str  # full NL pet context — by design, module needs this
+    recipes_by_pet: dict[str, list[dict]] = Field(default_factory=dict)
 
 
 class RedirectPayload(BaseModel):
@@ -165,8 +171,10 @@ class ChatResponse(BaseModel):
     """Body returned by POST /api/v1/chat."""
     status: str = "ok"
     message: str
+    output_mode: str = "general"  # "food_recipes"|"food_recipes_info"|"food_info"|"general"
     # present only for health/food intents
     redirect: RedirectPayload | None = None
+    recipes_by_pet: dict[str, list[dict]] = Field(default_factory=dict)  # Phase 3: recipes for food intent
     session_id: str
     # ── Phase 2: Thread management ─────────────────────────────────────────────
     thread_id: str                # backend's thread UUID
@@ -205,6 +213,7 @@ def _to_redirect_payload(deeplink) -> RedirectPayload:
             query=deeplink.query,
             pet_id=deeplink.pet_id,
             pet_summary=deeplink.pet_summary,
+            recipes_by_pet={str(k): v for k, v in deeplink.recipes_by_pet.items()}
         ),
     )
 
@@ -314,6 +323,10 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         # Populate Valkey after the DB session closes (no connection held during cache write)
         for _, pid, raw in db_hits:
             await vk.setex(CacheKeys.profile(pid), jittered_ttl(TTL_PROFILE), json.dumps(raw))
+
+    # Normalize: replace any None entries with {} so downstream code never
+    # crashes on .get() — happens when a pet has no active profile in DB yet.
+    active_profiles_raw = [p if p is not None else {} for p in active_profiles_raw]
 
     # ── 3. Build context for each pet ─────────────────────────────────────────
     pet_contexts = []
@@ -552,7 +565,10 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         questions_so_far = meta["gap_questions_asked"]
 
         # ── 5. Intent classification (LLM) ──────────────────────────────────
-        intent_type, urgency = await intent_classifier.classify(request_body.message)
+        intent_type, urgency = await intent_classifier.classify(
+            request_body.message,
+            recent_history=list(session_messages[-4:]),
+        )
 
         # ── Layer 1b: LLM-based injection check (T1-04) ──────────────────────
         # Catches subtle attacks that patterns miss ("pretend to be a different AI",
@@ -566,28 +582,209 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
             raise HTTPException(
                 status_code=400, detail="I can't help with that.")
 
-        # ── 6. Agent 1 ──────────────────────────────────────────────────────
-        pet_a_context = pet_contexts[0]
-        pet_b_context = pet_contexts[1] if len(pet_contexts) > 1 else None
-
-        # ── Load pending clarifications — Valkey GET (ft-005, Step 5) ───────
-        # Written by background pipeline after Compressor finds low-confidence facts.
-        # Read next turn to inject hedged facts into Agent 1's prompt.
-        # Acceptable to lose on Valkey down: returns [] (no clarification this turn).
-        raw_pending = await vk.get(CacheKeys.pending(thread_id))
-        if raw_pending is not None:
-            pending_clars = json.loads(raw_pending)
-        else:
-            # Local dict fallback when Valkey is down
-            pending_clars = state_bag.pending_clarifications.get(thread_id, [])
-
-        # ── Language priority: request explicit > DB stored > auto-detect ────
+        # ── Language priority (hoisted — needed by FoodAgent too) ────────────
         if request_body.language != "auto":
             language_str = request_body.language
         else:
             db_lang = (user_record or {}).get("preferred_language", "auto")
             language_str = db_lang if db_lang != "auto" else _detect_language(
                 request_body.message)
+
+        # ── 5b. Food AI routing ───────────────────────────────────────────────
+        # food_recipes  → MCP only, return cards, message="", no LLM
+        # food_recipes_info → FoodAgent (handles MCP + Tavily + LLM internally)
+        # food_info     → FoodAgent (Tavily + LLM only, no recipe cards)
+        # health/general → ConversationAgent (below, unchanged)
+        _FOOD_INTENTS = {INTENT_FOOD_RECIPES, INTENT_FOOD_RECIPES_INFO, INTENT_FOOD_INFO, INTENT_FOOD}
+
+        if intent_type in _FOOD_INTENTS:
+            # Normalize legacy "food" intent (old classifier behavior / backward compat)
+            # → treat as food_info so it reaches FoodAgent rather than silently falling
+            # through to ConversationAgent.
+            if intent_type == INTENT_FOOD:
+                logger.warning("Received legacy intent 'food' — normalising to food_info")
+                intent_type = INTENT_FOOD_INFO
+            output_mode: str = intent_type
+
+            # Species override: if ALL pets are non-dog → force food_info
+            if all(p.get("species") != "dog" for p in pet_profiles):
+                intent_type = INTENT_FOOD_INFO
+                output_mode = INTENT_FOOD_INFO
+
+            food_agent: FoodAgent = state_bag.food_agent
+            recipe_fetcher_inst: RecipeFetcher = state_bag.recipe_fetcher
+
+            if intent_type == INTENT_FOOD_RECIPES:
+                # ── Mode 1: MCP only, no LLM ────────────────────────────────
+                # Build the MCP query via the planner (nano LLM) so Mode 1 gets
+                # the same query quality as Modes 2 and 3.
+                _m1_plan = await plan_food_queries(
+                    llm=state_bag.llm_provider,
+                    mode=INTENT_FOOD_RECIPES,
+                    user_message=request_body.message,
+                    pet_profile=pet_profiles[0] if pet_profiles else {},
+                    active_profile=active_profiles_raw[0] if active_profiles_raw else {},
+                    conversation_history=list(session_messages[-6:]),
+                    language=language_str,
+                )
+                recipes_by_pet_mode1: dict[int, list[dict]] = {}
+                try:
+                    raw_m1 = await recipe_fetcher_inst.fetch_for_pets(
+                        pre_built_query=_m1_plan.mcp_query,
+                        pet_profiles=pet_profiles,
+                        active_profiles=active_profiles_raw,
+                        conversation_history=list(session_messages[-6:]),
+                    )
+                    for pid, (rs, _fb) in raw_m1.items():
+                        recipes_by_pet_mode1[pid] = [dict(r) for r in rs]
+                    logger.info(
+                        "Food Mode 1 (food_recipes): %s",
+                        {pid: len(v) for pid, v in recipes_by_pet_mode1.items()},
+                    )
+                except RecipeFetchError as exc:
+                    logger.warning("Food Mode 1: MCP unavailable — returning empty: %s", exc)
+                    # MCP is down — return a text fallback so the user gets a response
+                    # instead of a blank turn (empty message + empty cards).
+                    fallback_text = (
+                        "レシピを取得できませんでした。しばらくしてからもう一度お試しください。"
+                        if language_str == "JA"
+                        else "I couldn't load recipes right now. Please try again in a moment."
+                    )
+                    user_msg_err = {"role": "user", "content": request_body.message, "timestamp": now_iso}
+                    asst_msg_err = {"role": "assistant", "content": fallback_text, "timestamp": now_iso}
+                    sessions[thread_id].append(user_msg_err)
+                    sessions[thread_id].append(asst_msg_err)
+                    agent_state.agent_reply = fallback_text
+                    agent_state.recent_history = list(sessions[thread_id])
+                    _create_tracked_task(_run_background(agent_state, state_bag), state_bag)
+                    return ChatResponse(
+                        message=fallback_text,
+                        output_mode=INTENT_FOOD_RECIPES,
+                        recipes_by_pet={},
+                        redirect=None,
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        new_thread=new_thread,
+                        questions_asked_count=questions_so_far,
+                        was_guardrailed=False,
+                        is_entity=False,
+                        intent_type=intent_type,
+                        urgency=urgency,
+                        confidence_score=conf_score,
+                        confidence_color=conf_color,
+                    )
+
+                # Build a synthetic assistant message so ConversationAgent knows what
+                # recipe cards were shown on the next turn (follow-up handling).
+                # Format: "[Recipe cards shown for <Pet>: <title1>, <title2>, ...]"
+                recipe_card_lines = []
+                for pid, recipes_for_pet in recipes_by_pet_mode1.items():
+                    pet_match = next((p for p in pet_profiles if p.get("pet_id") == int(pid)), None)
+                    pet_label = pet_match.get("name", f"pet {pid}") if pet_match else f"pet {pid}"
+                    titles = ", ".join(r.get("title_ja", "Unknown") for r in recipes_for_pet)
+                    if titles:
+                        recipe_card_lines.append(f"{pet_label}: {titles}")
+                if recipe_card_lines:
+                    recipe_card_summary = "[Recipe cards shown — " + "; ".join(recipe_card_lines) + "]"
+                else:
+                    recipe_card_summary = "[Recipe cards requested but no results found]"
+
+                user_msg_m1 = {"role": "user", "content": request_body.message, "timestamp": now_iso}
+                asst_msg_m1 = {"role": "assistant", "content": recipe_card_summary, "timestamp": now_iso}
+                sessions[thread_id].append(user_msg_m1)
+                sessions[thread_id].append(asst_msg_m1)
+
+                # Fire-and-forget: persist to Valkey + DB so the session survives restart
+                agent_state.agent_reply = recipe_card_summary
+                agent_state.recent_history = list(sessions[thread_id])
+                _create_tracked_task(_run_background(agent_state, state_bag), state_bag)
+
+                recipes_str_m1 = {str(k): v for k, v in recipes_by_pet_mode1.items()}
+                return ChatResponse(
+                    message="",
+                    output_mode=INTENT_FOOD_RECIPES,
+                    recipes_by_pet=recipes_str_m1,
+                    redirect=None,
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    new_thread=new_thread,
+                    questions_asked_count=questions_so_far,
+                    was_guardrailed=False,
+                    is_entity=False,
+                    intent_type=intent_type,
+                    urgency=urgency,
+                    confidence_score=conf_score,
+                    confidence_color=conf_color,
+                )
+
+            # ── Modes 2 and 3: FoodAgent ────────────────────────────────────
+            food_result: FoodAgentResult = await food_agent.run(
+                mode=intent_type,
+                user_message=request_body.message,
+                recipe_fetcher=recipe_fetcher_inst,
+                pet_profiles=pet_profiles,
+                active_profiles=active_profiles_raw,
+                session_messages=list(session_messages[-20:]),
+                language=language_str,
+            )
+
+            food_reply_raw = food_result.message
+            food_recipes_by_pet = food_result.recipes_by_pet  # {pet_id: [recipe_dict, ...]}
+            # Use the mode the agent actually ran — may be downgraded from food_recipes_info
+            # to food_info when MCP returned 0 recipes. This keeps output_mode truthful.
+            if food_result.effective_mode:
+                output_mode = food_result.effective_mode
+
+            # Apply guardrails
+            guardrail_food = apply_guardrails(food_reply_raw)
+            final_food_reply = guardrail_food.reply
+            food_guardrailed = guardrail_food.was_modified
+
+            # Save to session synchronously
+            user_msg_food = {"role": "user", "content": request_body.message, "timestamp": now_iso}
+            asst_msg_food = {"role": "assistant", "content": final_food_reply, "timestamp": now_iso}
+            sessions[thread_id].append(user_msg_food)
+            sessions[thread_id].append(asst_msg_food)
+
+            # Fire-and-forget: Valkey + DB persistence (same pattern as ConversationAgent)
+            agent_state.agent_reply = final_food_reply
+            agent_state.recent_history = list(sessions[thread_id])
+            _create_tracked_task(_run_background(agent_state, state_bag), state_bag)
+
+            recipes_str_food = {str(k): v for k, v in food_recipes_by_pet.items()}
+            logger.info(
+                "Food complete — mode=%s | session=%s | recipe_count=%d | guardrailed=%s",
+                intent_type, session_id, sum(len(v) for v in food_recipes_by_pet.values()),
+                food_guardrailed,
+            )
+            return ChatResponse(
+                message=final_food_reply,
+                output_mode=output_mode,
+                recipes_by_pet=recipes_str_food,
+                redirect=None,
+                session_id=session_id,
+                thread_id=thread_id,
+                new_thread=new_thread,
+                questions_asked_count=questions_so_far,
+                was_guardrailed=food_guardrailed,
+                is_entity=False,
+                asked_gap_question=False,
+                intent_type=intent_type,
+                urgency=urgency,
+                confidence_score=conf_score,
+                confidence_color=conf_color,
+            )
+
+        # ── 6. Agent 1 (health / general) ───────────────────────────────────
+        pet_a_context = pet_contexts[0]
+        pet_b_context = pet_contexts[1] if len(pet_contexts) > 1 else None
+
+        # Load pending clarifications — Valkey GET (ft-005, Step 5)
+        raw_pending = await vk.get(CacheKeys.pending(thread_id))
+        if raw_pending is not None:
+            pending_clars = json.loads(raw_pending)
+        else:
+            pending_clars = state_bag.pending_clarifications.get(thread_id, [])
 
         agent_response: AgentResponse = await agent.run(
             user_message=request_body.message,
@@ -621,12 +818,13 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
         final_reply = guardrail_result.reply
         was_guardrailed = guardrail_result.was_modified
 
-        # ── 7b. Build deeplink with urgency gating ─────────────────────────
+        # ── 7b. Build deeplink (health intent only) ──────────────────────────
+        # Food intent no longer uses redirect — recipes are handled via agent context
         MEDIUM_COOLDOWN = 3
 
         redirect_payload = None
         pet_summary_primary = primary_ctx["pet_summary"]
-        if intent_type in (INTENT_HEALTH, INTENT_FOOD):
+        if intent_type == INTENT_HEALTH:
             tracker = meta.setdefault("redirect_turn_tracker", {})
             current_turn = len(session_messages) // 2
 
@@ -675,7 +873,9 @@ async def chat(request_body: ChatRequest, request: Request) -> ChatResponse:
     # ── 10. Return ───────────────────────────────────────────────────────────
     return ChatResponse(
         message=final_reply,
+        output_mode="general",
         redirect=redirect_payload,
+        recipes_by_pet={},  # health/general intents never carry recipe cards
         session_id=session_id,
         thread_id=thread_id,
         new_thread=new_thread,

@@ -289,3 +289,47 @@
   flex-shrink: 0;
   margin-left: 0;
 }
+
+/* ── Recipe carousel (Phase 3) — displayed inside messages ────────────── */
+.chat-recipe-carousel {
+  background: linear-gradient(135deg, #fff8f3 0%, #fffbf7 100%);
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin: 12px 0;
+  border: 1px solid #f0e6dc;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.chat-recipe-label {
+  font-size: 13px;
+  color: #333;
+  margin-bottom: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.chat-recipe-scroll {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: #ddd transparent;
+}
+
+.chat-recipe-scroll::-webkit-scrollbar {
+  height: 4px;
+}
+
+.chat-recipe-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-recipe-scroll::-webkit-scrollbar-thumb {
+  background: #ddd;
+  border-radius: 2px;
+}
+
+.chat-recipe-scroll::-webkit-scrollbar-thumb:hover {
+  background: #bbb;
+}

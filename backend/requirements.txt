@@ -24,3 +24,9 @@ valkey[hiredis]>=6.0.0      # Valkey client (Redis-compatible, BSD licence).
 # ── Nightly scheduler (Sprint 6) ────────────────────────────────────────────
 apscheduler>=3.10.0          # AsyncIOScheduler runs jobs inside the asyncio event loop.
                              # Midnight UTC cron for HistoryBuilder + RelationshipBuilder.
+
+# ── Recipe MCP (Phase 3 — Recipe Integration) ──────────────────────────────
+mcp>=1.0.0                  # MCP Python SDK — Streamable HTTP client for Recipe MCP server
+
+# ── Tavily Web Search (Food AI — Phase 4) ──────────────────────────────────
+tavily-python>=0.5.0        # Tavily async search client — used by FoodAgent for web context

@@ -50,6 +50,9 @@ from app.agents.conversation import ConversationAgent
 from app.agents.intent_classifier import IntentClassifier
 from app.agents.suggested_questions import SuggestedQuestionsAgent
 from app.services.pet_fetcher import PetFetcher
+from app.services.recipe_fetcher import RecipeFetcher
+from app.agents.food_agent import FoodAgent
+from app.services.web_searcher import WebSearcher
 from sqlalchemy import text
 from app.db.session import init_db, dispose_engine, get_session
 from app.db.repositories import UserRepo, ThreadRepo, ThreadMessageRepo
@@ -155,6 +158,25 @@ async def lifespan(app: FastAPI):
     app.state.history_builder = HistoryBuilder(llm=llm)
     app.state.suggested_questions_agent = SuggestedQuestionsAgent(llm=llm)
 
+    # ── Recipe MCP client (Phase 3 — recipe integration) ────────────────────
+    # Query building is handled by FoodQueryPlanner — RecipeFetcher only calls MCP.
+    app.state.recipe_fetcher = RecipeFetcher(
+        settings.recipe_mcp_url,
+        timeout=settings.recipe_mcp_timeout_seconds,
+    )
+    logger.info("RecipeFetcher initialised — mcp_url=%s", settings.recipe_mcp_url)
+
+    # ── Food AI (Phase 4 — FoodAgent) ────────────────────────────────────────
+    # FoodAgent handles food_recipes_info and food_info intents.
+    # WebSearcher wraps Tavily for nutrition/vet web search context.
+    # If tavily_api_key is empty, WebSearcher silently skips searches.
+    web_searcher = WebSearcher(
+        api_key=settings.tavily_api_key,
+        timeout=5.0,
+    )
+    app.state.food_agent = FoodAgent(llm=llm, web_searcher=web_searcher)
+    logger.info("FoodAgent initialised — tavily_key_set=%s", bool(settings.tavily_api_key))
+
     # ── RelationshipBuilder — USER STYLE summaries → relationship_summary ─
     # UserProfileWriter Protocol: current impl writes directly to PostgreSQL.
     # Swap _DBUserWriter for an AALDA-backed writer later — zero changes here.
@@ -230,6 +252,8 @@ async def lifespan(app: FastAPI):
         logger.info("APScheduler shut down.")
 
     await app.state.pet_fetcher.close()
+    await app.state.recipe_fetcher.close()
+    await app.state.food_agent.close()
     await app.state.valkey.aclose()
     await dispose_engine()
     logger.info("Shutdown complete.")

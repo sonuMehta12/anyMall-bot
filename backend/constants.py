@@ -464,6 +464,11 @@ INTENT_HEALTH: str    = "health"     # medical concern → redirect to Health mo
 INTENT_FOOD: str      = "food"       # diet / nutrition question → redirect to Food module
 INTENT_UNTRUSTED: str = "untrusted"  # injection/jailbreak attempt → reject, no pipeline
 
+# Food sub-intents (Food AI — Phase 4)
+INTENT_FOOD_RECIPES: str      = "food_recipes"       # pure browse — MCP only, no LLM
+INTENT_FOOD_RECIPES_INFO: str = "food_recipes_info"  # MCP + FoodAgent + Tavily
+INTENT_FOOD_INFO: str         = "food_info"           # FoodAgent + Tavily, no recipes
+
 
 # ── 12. Urgency Level Constants ───────────────────────────────────────────────
 #

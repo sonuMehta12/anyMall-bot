@@ -77,6 +77,18 @@ class Settings(BaseSettings):
     # Format: valkey://:password@host:port/db
     valkey_url: str = "valkey://:valkey_dev@localhost:6379/0"
 
+    # ── Recipe MCP Server (Phase 3 — Recipe Integration) ────────────────────
+    # External MCP server for recipe recommendations based on pet profiles.
+    # Runs on the Streamable HTTP protocol; one pet per call.
+    recipe_mcp_url: str = "https://afa.stagingapp.in/mcp"
+    # slightly shorter than AALDA to fail fast
+    recipe_mcp_timeout_seconds: float = 8.0
+
+    # ── Tavily Web Search (Food AI — Phase 4) ────────────────────────────────
+    # API key for Tavily web search, used by FoodAgent in modes 2 and 3.
+    # If empty, web search is skipped (FoodAgent still runs but without web context).
+    tavily_api_key: str = ""
+
     # ── pydantic-settings configuration ──────────────────────────────────────
     # env_file: which file to read from disk.
     # env_file_encoding: always utf-8.

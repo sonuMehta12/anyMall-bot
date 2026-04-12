@@ -53,7 +53,7 @@ def _is_reasoning_model(model_name: str) -> bool:
 _LLM_SEMAPHORE = asyncio.Semaphore(30)
 
 # How long (seconds) to wait for a single OpenAI call before giving up.
-_LLM_TIMEOUT = 10.0
+_LLM_TIMEOUT = 30.0
 
 # Retry delays in seconds: attempt 1 → wait 1s → attempt 2 → wait 2s →
 # attempt 3 → wait 4s → attempt 4 → give up.
