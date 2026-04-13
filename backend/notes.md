@@ -1083,3 +1083,371 @@ works correctly with `user_code` as the identity key.
 `chat.py` went from 734 lines to 522 lines after extracting background functions to
 `app/routes/background.py` (251 lines). The extraction is a pure refactor — zero
 behavior changes.
+
+---
+
+## ft-005 — Valkey Hot Storage — Completed 2026-03-19 ✓
+
+### What we built
+
+Replaced all in-memory Python dicts on `app.state` with **Valkey** — an open-source
+Redis fork (BSD license) — as a shared, TTL-aware hot cache in front of PostgreSQL.
+
+The problem: `app.state.sessions`, `app.state.session_meta`, `app.state.pending_clarifications`,
+`app.state.compaction_in_progress`, and `PetFetcher._cache` all lived in a single Python process.
+This works for one server but breaks horizontal scaling (two instances don't share state), leaks
+memory (no TTL means expired threads accumulate forever), and forces a slow full-reload from DB
+every server restart.
+
+Valkey solves all three: shared across instances, every key has a TTL, and cache misses rebuild
+from PostgreSQL on demand.
+
+**PostgreSQL stays the source of truth. Valkey is the fast layer in front of it.**
+
+### What lives where now
+
+| Key pattern | TTL | What it stores |
+|---|---|---|
+| `am:session:{thread_id}` | 7200s | Thread message list (JSON array) |
+| `am:meta:{thread_id}` | 7200s | Gap question counter + redirect tracker |
+| `am:pending:{thread_id}` | 7200s | Low-confidence facts waiting for clarification |
+| `am:profile:{pet_id}` | 3600s | Active profile (current best-known facts) |
+| `am:aalda:{user_code}:{pet_id}` | 300s | AALDA API fetch result |
+| `am:user:{user_code}` | 7200s | User record |
+| `am:health:llm` | 60s | LLM health check result |
+| `am:compacting:{thread_id}` | 300s | Distributed compaction lock (SETNX) |
+
+### New files
+
+- **`app/cache/__init__.py`** — package marker
+- **`app/cache/keys.py`** — `CacheKeys` class: all key patterns in one place so typos are
+  impossible. Also defines `jittered_ttl(base)` (±10% random jitter), TTL constants, and two
+  Lua script constants (`LUA_APPEND_MESSAGES`, `LUA_RELEASE_LOCK`)
+- **`app/cache/client.py`** — `ValkeyClient` wrapper around `valkey.asyncio.Valkey`. Every method
+  catches `ConnectionError`/`TimeoutError` and returns `None`/`False` — callers never see
+  exceptions. Also contains a circuit breaker: 5 consecutive failures -> 30s open -> half-open
+  single-probe recovery
+
+### Key design decisions
+
+**Write-through rule — DB first, always.** Every write goes to PostgreSQL first, then Valkey.
+A cache miss is never a data loss — it just means the next read rebuilds from DB. We enforced
+this by ensuring session message writes only happen in `background.py` (after `append_batch()`
+commits to DB), never in `chat.py`. The previous design had a Valkey write in `chat.py` before
+the background DB write — a latent correctness bug we caught and fixed.
+
+**Lua atomic append for session messages.** A full-list SETEX for session messages is non-atomic
+across two concurrent instances: both read the list, both append, the slower one overwrites the
+faster one's message. `LUA_APPEND_MESSAGES` runs as a single Redis server command — GET +
+JSON-parse + append + SETEX — so no message can be lost.
+
+**Circuit breaker half-open exclusivity.** When the circuit transitions from open to half-open,
+only one coroutine should send the probe. We enforce this by resetting `_last_failure_time` to
+`time.monotonic()` inside a synchronous (non-yielding) method `_should_allow_request()`. Because
+asyncio is single-threaded, a synchronous function cannot be interrupted — so only the first
+caller can claim the probe slot.
+
+**UUID token for compaction lock.** The distributed compaction lock stores a UUID as its value
+(not just `"1"`). `LUA_RELEASE_LOCK` checks the token before deleting — so a slow compaction that
+finishes after its TTL expired cannot delete a lock that another instance already acquired.
+
+**TTL jitter.** `jittered_ttl(base)` returns `base ± 10%` (random). Without jitter, all sessions
+created in the same batch expire at exactly the same second, causing a thundering herd of DB
+reloads. Jitter spreads the load.
+
+**Graceful degradation.** Every Valkey call is wrapped. If Valkey is down, `get()` returns `None`
+(cache miss), `set()`/`setex()` returns `False` (skip write), `eval()` returns `None` (skip Lua).
+Callers check the return value and fall back to PostgreSQL. The circuit breaker prevents 5s
+timeout stacking across all concurrent requests when Valkey is down.
+
+### Review process
+
+ft-005 went through two full external code reviews before tests were written:
+- **Review 1**: 11 issues found and fixed (architecture, type safety, dead code, etc.)
+- **Review 2**: 15 issues found and fixed (write-through violation, half-open exclusivity, token-checked lock, per-pet aggregator locks, session_count semantics, DB connection held across Valkey calls, etc.)
+- **26 total fixes** across 8 files before a single test ran
+
+### Test results
+
+- `tests/test_valkey.py` — **17/17 pass** (dedicated Valkey suite, uses direct Valkey client to bypass the wrapper and verify raw truth)
+- `tests/run_e2e.py` — **68/70 pass** (same 2 pre-existing LLM timeout flakes as before ft-005; not caused by these changes)
+
+### How to verify in production
+
+```bash
+# Start both containers
+docker compose up -d
+
+# Confirm Valkey is running
+docker exec anymall-valkey valkey-cli -a valkey_dev ping
+# -> PONG
+
+# After a chat message, inspect the session key
+docker exec anymall-valkey valkey-cli -a valkey_dev KEYS "am:*"
+docker exec anymall-valkey valkey-cli -a valkey_dev GET "am:session:<thread_id>"
+
+# Test graceful degradation
+docker stop anymall-valkey
+# Send a message -> still works, logs show "Valkey unavailable, falling back to DB"
+docker start anymall-valkey
+# Send another message -> Valkey resumes automatically
+```
+
+---
+
+## Sprint 6 — Background Intelligence Pipeline ✓
+
+### What we built
+
+Three context fields in Agent 1's prompt (`pet_history`, `relationship_context`,
+`conversation_summary`) were always empty. Sprint 6 fills all three, making Agent 1
+genuinely context-aware across sessions.
+
+Before Sprint 6: Agent 1 knew what was said this session. After: it knows what happened
+to this pet over weeks, how this owner communicates, and a summary of past conversations.
+
+### The two independent pipelines
+
+```
+fact_log table
+  └── HistoryBuilder reads → active_profile._pet_history (narrative of what changed over time)
+
+threads.compaction_summary  ← ThreadSummarizer writes (enhanced: HEALTH CONTEXT + USER STYLE)
+  └── RelationshipBuilder reads USER STYLE sections → users.relationship_summary
+```
+
+These two pipelines never touch each other. HistoryBuilder only reads `fact_log`.
+RelationshipBuilder only reads `threads.compaction_summary`.
+
+### Task 1 — ThreadSummarizer enhanced prompt
+
+`app/services/thread_summarizer.py` — the summarize prompt now produces exactly two sections:
+
+```
+HEALTH CONTEXT:
+[3-4 sentences: diagnoses, medications, vet visits, unresolved concerns]
+
+USER STYLE:
+[1-2 sentences: anxiety level, preferred detail, question patterns, emotional tone]
+```
+
+Both sections are passed to Agent 1 as `conversation_summary` (good context). The
+`USER STYLE:` section is separately parsed by RelationshipBuilder for the relationship pipeline.
+No signature changes — `summarize(messages, existing_summary)` is identical to callers.
+
+### Task 2 — HistoryBuilder
+
+`app/services/history_builder.py` — new LLM service (temperature=0.0, deterministic).
+
+**What it does:** Reads health-relevant facts from `fact_log` since last build, merges
+them with the existing `_pet_history` narrative using a focused LLM prompt, writes the
+updated narrative back to `active_profile._pet_history`.
+
+**Health-relevant facts only:** diagnoses, symptoms, medications (start/stop), weight
+changes, energy level changes, vet visits. Excludes: stable current states, owner
+preferences, facts with no time dimension.
+
+**Hybrid trigger** (in `background.py` after Aggregator):
+- **Condition A:** `>= 3 new high-confidence facts` in this session → build immediately
+- **Condition B:** `>= 1 new fact` AND `>= 2 sessions` have passed since last build
+
+**Conditional write:** `build()` returns the unchanged narrative when no health-relevant
+facts were found. `background.py` checks `if new == existing: return` — so
+`_history_last_updated` is NOT advanced (pointer stays accurate).
+
+**What gets written to `active_profile`:**
+- `_pet_history` — plain text narrative (3-6 sentences)
+- `_history_last_updated` — ISO timestamp (plain string, not metadata dict)
+
+### Task 3 — Closing summary nightly job
+
+Threads that expire before hitting 50 messages never trigger the in-message compaction.
+They end up with `compaction_summary = NULL`, so RelationshipBuilder has nothing to read.
+
+The nightly job finds threads where `expires_at <= now` AND `compaction_summary IS NULL`,
+runs `ThreadSummarizer` on their messages, and writes the result. After this, every expired
+thread has a summary — RelationshipBuilder can always read USER STYLE sections.
+
+**Key fix:** The original design filtered `WHERE status = 'expired'`. But threads are only
+marked expired when a new chat request finds them past their expiry (lazy expiry). A thread
+that expires and is never revisited stays `status='active'` forever. Changed to filter by
+`expires_at <= now` instead.
+
+### Task 4 — RelationshipBuilder
+
+`app/services/relationship_builder.py` — new LLM service.
+
+**What it does:** Reads the USER STYLE sections from the last 5 `threads.compaction_summary`
+entries for a user, merges them with the existing `users.relationship_summary`, produces
+an updated summary of how this owner communicates.
+
+**UserProfileWriter Protocol:** `RelationshipBuilder` depends on an abstract
+`UserProfileWriter` interface (in `app/types.py`). The concrete implementation in `main.py`
+writes directly to PostgreSQL via `UserRepo`. Swappable for an AALDA-backed writer later
+with zero changes to `RelationshipBuilder` or nightly.py.
+
+**Result:** `users.relationship_summary` — a paragraph like "The owner tends to be mildly
+anxious about health issues. They prefer detailed explanations and often ask follow-up
+questions..." Agent 1 reads this as `relationship_context` on every request.
+
+### Task 5 — APScheduler
+
+`app/jobs/nightly.py` + `app/jobs/__init__.py` — new package.
+
+`AsyncIOScheduler` (APScheduler 3.x) runs inside the existing asyncio event loop — no
+threads. Cron job registered at `hour=0, minute=0` UTC. Calls `run_nightly_jobs(app.state)`
+which runs Task 3 and Task 4.
+
+Both jobs are wrapped in independent `try/except` — a failure in closing summaries does
+NOT prevent relationship summaries from running.
+
+Shutdown: `scheduler.shutdown(wait=True)` — waits for any in-flight nightly job to finish
+its DB writes before `dispose_engine()` closes the connection pool. `wait=False` would
+cause pool errors if a midnight job was mid-flight on shutdown.
+
+### Task 6 — DB write batching
+
+Dual-pet sessions previously opened two DB sessions to write to `fact_log` (one per pet).
+Pet A committed before Pet B — no atomicity if Pet B failed.
+
+New: `FactLogRepo.append_bulk(facts_with_pets: list[tuple[list, int]])` — collects all
+rows for all pets, does one `add_all` + one `commit`. Either both pets' facts write or
+neither does.
+
+### Debug trigger endpoints
+
+Two new endpoints in `app/routes/debug.py` for testing Sprint 6 without waiting for
+midnight or sending 50 messages:
+
+- `POST /api/v1/debug/trigger_nightly` — runs `run_nightly_jobs(app.state)` immediately
+- `POST /api/v1/debug/trigger_summarizer?thread_id=X` — runs ThreadSummarizer on any
+  thread and writes the two-section summary to `threads.compaction_summary`
+
+These are the endpoints used by `test_sprint6.py` to verify all Sprint 6 features.
+Remove in Phase 4 (production hardening).
+
+### Bugs found and fixed (13 total, via two-agent code review)
+
+**Critical (would have caused silent failures):**
+1. `history_builder.py` filtered `f.get("field_key")` but `FactLog.to_dict()` returns
+   `"key"` — health_facts was always empty, history never built
+2. `models.py to_dict_entry()` only special-cased `_pet_history`; `_history_last_updated`
+   returned as a metadata dict → crash on second HistoryBuilder run
+3. `high_by_pet` defined inside `if aggregator is not None:` block but used in outer
+   `if high:` block → NameError when aggregator present
+4. Task 6 loop called `append()` (has internal commit) per pet in one session → Pet A
+   committed before Pet B, no atomicity — fixed with `append_bulk()`
+
+**Major (correctness issues):**
+5. HistoryBuilder failure aborted low-confidence persistence block — fixed with isolated
+   `try/except` per call
+6. `read_since()` used `>= 0.70` but pipeline defines "high" as `> 0.70` — facts at
+   exactly 0.70 (clarification candidates) could enter history
+7. Nightly job filtered `WHERE status = 'expired'` — lazy expiry means never-revisited
+   threads stay `status='active'` forever → changed to `expires_at <= now`
+8. No top-level isolation in `run_nightly_jobs()` — job 1 failure skipped job 2
+9. `scheduler.shutdown(wait=False)` — in-flight jobs continued after pool disposed
+10. `nightly.py` accessed `relationship_builder._writer` directly (private attribute
+    from external module) — added public `write_summary()` method
+
+**Regression (introduced by earlier fix):**
+11. After fixing `to_dict_entry()` for `_history_last_updated`, `write_all()`'s
+    DELETE+INSERT silently deleted the row on every Aggregator run (it wasn't in the
+    special-case list) — extended special-case to both `_pet_history` and
+    `_history_last_updated`
+
+**Minor (style/safety):**
+12. `CacheKeys` imported inside for-loop in nightly.py → moved to module level
+13. `update_relationship_summary()` committed silently with 0 rows if user deleted →
+    added `rowcount == 0` warning
+
+### New files
+
+- `app/jobs/__init__.py` — package marker
+- `app/jobs/nightly.py` — APScheduler entry point + `_close_expired_thread_summaries` + `_rebuild_relationship_summaries`
+- `app/services/history_builder.py` — HistoryBuilder: fact_log → _pet_history narrative
+- `app/services/relationship_builder.py` — RelationshipBuilder: USER STYLE summaries → relationship_summary
+- `tests/test_sprint6.py` — 21-test dedicated suite (6 sections)
+- `migrations/versions/1d20aafa64c5_...py` — adds `ix_fact_log_pet_id_extracted_at` + `ix_threads_expires_at`
+
+### Key models.py fix
+
+`ix_threads_one_active_per_pet` (partial unique index, one active thread per pet) was added
+in Sprint 5 via Alembic migration but never declared in `models.py`. Alembic autogenerate
+would have silently dropped it on the next `--autogenerate` run. Fixed by declaring the
+index in the Thread model's `__table_args__` with a comment explaining why.
+
+### Test results
+
+- `tests/test_sprint6.py` — **21/21** (20 PASS + 1 SKIP — T09 skipped by design: thread
+  too new to have expired, which is correct behaviour)
+- `tests/run_e2e.py` — **69/70** (1 pre-existing clarification-loop flake — unchanged
+  from before Sprint 6, no regressions introduced)
+- `tests/test_valkey.py` — **17/17** (unchanged)
+
+---
+
+## AALDA DB Alignment + User Fields Wiring — Completed ✓
+
+### What we decided
+
+Had a planning session about how AnyMall-chan should interact with the AALDA platform's
+pet data (nutrition, diet, vaccination). Three design docs were created:
+
+1. `aalda-writeback-design.md` — explored writing chat-learned facts back to AALDA APIs
+2. `aalda-db-alignment-questions.md` — questions for the AALDA backend team
+3. Updated `aalda-integration.md` reference (existing, covers the read path)
+
+### The decision: No write-back
+
+After discussion with the AALDA team, we decided **not to write back** to AALDA APIs.
+
+**Why it's unnecessary:** `context_builder.py` already merges data in 3 layers:
+1. AALDA facts as BASE (nutrition, diet, vaccinations from AALDA API)
+2. Chat-learned facts OVERWRITE AALDA (user tells us something newer)
+3. Static identity (name, species, breed from AALDA)
+
+So our chat system always sees the latest truth. AALDA fills gaps for fields the user
+hasn't mentioned. No write-back needed for chat to work correctly.
+
+**`user_context_memory` resolved:** `relationship_summary` (already on users table,
+populated by nightly RelationshipBuilder) IS the user context memory. No new field needed.
+
+### What we built: User fields wiring
+
+Two dormant fields on the `users` table (`display_name`, `preferred_language`) were wired up:
+
+**1. ChatRequest now accepts `display_name`** (optional, from Flutter UI)
+- Persisted to users table on every request
+- Only overwrites existing value if Flutter sends non-empty string
+
+**2. Language 3-step priority chain:**
+```
+Request explicit ("JA") > DB stored preference > auto-detect from message text
+```
+- If Flutter sends `language: "JA"` → use it, persist to DB
+- If Flutter sends `language: "auto"` → check DB `preferred_language` → if set, use it
+- If DB also "auto" → fall back to `_detect_language()` (Unicode char counting, already built)
+
+**3. Owner name in Agent 1 prompt:**
+- New `OWNER:` section in system prompt template
+- Agent 1 can now address the owner by name: "Shara-san, Luna-chan is doing great~"
+- Sanitized via `_sanitize_for_prompt()` to prevent format string injection
+
+**4. Fixed UserRepo.upsert bug:**
+- `display_name` was missing from `on_conflict_do_update` set — it was never updated
+  on existing users. Added to the conflict resolution dict.
+
+### Files modified
+
+- `app/routes/chat.py` — ChatRequest + user upsert + language chain + owner_name pass-through
+- `app/db/repositories.py` — Fixed upsert conflict set
+- `app/agents/conversation.py` — Added owner_name to prompt
+- `design-docs/aalda-db-alignment-questions.md` — Decision record
+- `design-docs/aalda-writeback-design.md` — Why no write-back
+
+### No breaking changes
+
+- `display_name` defaults to `""` — existing clients work unchanged
+- `language` defaults to `"auto"` — existing behaviour preserved
+- No DB migration needed — columns already existed from W18

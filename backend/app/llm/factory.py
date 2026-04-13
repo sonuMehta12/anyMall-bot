@@ -17,7 +17,6 @@ import logging
 
 from app.core.config import Settings
 from app.llm.base import LLMProvider
-from app.llm.azure_openai import AzureOpenAIProvider
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +39,7 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
     logger.info("Creating LLM provider: %s", provider_name)
 
     if provider_name == "azure":
+        from app.llm.azure_openai import AzureOpenAIProvider
         # Validate that all Azure-specific vars are present.
         # We check here (not in Settings) because these vars are only required
         # when llm_provider == "azure" — future providers need different vars.
@@ -65,18 +65,17 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
             deployment=settings.azure_openai_deployment_chat,
         )
 
-    # ── Future providers ───────────────────────────────────────────────────────
-    # elif provider_name == "openai":
-    #     from app.llm.openai import OpenAIProvider
-    #     if not settings.openai_api_key:
-    #         raise ValueError("LLM_PROVIDER=openai requires OPENAI_API_KEY")
-    #     return OpenAIProvider(
-    #         api_key=settings.openai_api_key,
-    #         model=settings.openai_model_chat,
-    #     )
+    elif provider_name == "openai":
+        from app.llm.openai_provider import OpenAIProvider
+        if not settings.openai_api_key:
+            raise ValueError("LLM_PROVIDER=openai requires OPENAI_API_KEY")
+        return OpenAIProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model_chat,
+        )
 
     else:
         raise ValueError(
             f"Unknown LLM_PROVIDER: {provider_name!r}. "
-            f"Valid values: 'azure'."
+            f"Valid values: 'azure', 'openai'."
         )

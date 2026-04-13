@@ -146,7 +146,7 @@ def section(title: str) -> None:
 def test_health_endpoint() -> bool:
     """GET /health returns 200 with status=ok and llm_reachable=True."""
     try:
-        resp = requests.get(f"{BASE_URL}/health", timeout=10)
+        resp = requests.get(f"{BASE_URL}/health_v1", timeout=10)
         if resp.status_code != 200:
             return failed("GET /health -- HTTP 200", f"got {resp.status_code}")
         data = resp.json()
@@ -155,7 +155,7 @@ def test_health_endpoint() -> bool:
         if not data.get("llm_reachable"):
             return failed(
                 "GET /health -- llm_reachable",
-                "False -- check Azure credentials in .env",
+                "False -- check LLM credentials in .env",
             )
         return passed("GET /health", f"version={data.get('version')} llm_reachable=True")
     except Exception as exc:
@@ -1645,7 +1645,7 @@ def test_hedged_fact_needs_clarification() -> bool:
     sid = new_sid()
     try:
         data = post_chat(
-            "I think maybe Node weighs about 3kg or so",
+            "I'm not really sure but Node might weigh somewhere around 3kg, could be more or less",
             sid, pet_ids=[149],
         )
         wait_background("hedged fact clarification")
@@ -1706,7 +1706,7 @@ def test_clarification_full_loop() -> bool:
     try:
         # ── Turn 1: Hedged message (should produce low-confidence fact) ──────
         data1 = post_chat(
-            "I think maybe Node weighs around 3kg, not totally sure though",
+            "I'm not really sure but Node might weigh somewhere around 3kg, could be more or less",
             sid, pet_ids=[149],
         )
         thread_id = data1.get("thread_id")
@@ -2025,7 +2025,7 @@ def main() -> None:
 
     # ── Pre-flight: is server up? ──────────────────────────────────────────────
     try:
-        requests.get(f"{BASE_URL}/health", timeout=5)
+        requests.get(f"{BASE_URL}/health_v1", timeout=5)
     except Exception:
         print(f"\n{RED}ERROR: Cannot reach {BASE_URL}.{RESET}")
         print("Start the backend first:")

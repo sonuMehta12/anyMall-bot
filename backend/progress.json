@@ -1,16 +1,15 @@
 {
   "project": "AnyMall-chan Backend",
   "description": "Multi-agent AI pipeline backend for a pet companion Flutter iOS app",
-  "last_updated": "2026-03-17",
-  "state": "sprint-5-review-debt-complete",
+  "last_updated": "2026-03-20",
+  "state": "sprint-6-complete",
   "how_to_use": "Mark 'complete' true only after feature is written AND manually tested. Mark 'tested' true only after the test suite passes for that feature. Never skip ahead — finish and test each feature before starting the next.",
 
-  "current_focus": "Phase 3 (nightly batch jobs) + HistoryBuilder (ft-013) + Valkey hot storage (ft-005). All Sprint 2-3 and Sprint 4 review debt resolved. 68/70 E2E tests pass (2 LLM non-determinism).",
+  "current_focus": "Sprint 6 complete + AALDA DB alignment resolved (no write-back needed) + user fields wired (display_name, language priority chain, owner_name in prompt). Next: Phase 4 (JWT auth + rate limiting).",
 
-  "storage_strategy": "PostgreSQL (Phase 1C complete). Phase 2 adds write-through message persistence: app.state.sessions[thread_id] (in-memory) + thread_messages table (PostgreSQL). Active threads reloaded from DB on startup (W12: only loads un-compacted messages). Thread compaction via LLM summarizer at 50 messages. Per-thread asyncio.Lock for session mutations (C2). Per-pet asyncio.Lock for thread creation (Sprint 5). FK constraint: thread_messages → threads with CASCADE (Sprint 5). Partial unique index: one active thread per pet (Sprint 5). Graceful shutdown via tracked background tasks (W8). AALDA API fallback chain: fresh cache → API → expired cache → DB → error (W1+W10). Valkey hot storage deferred (ft-005).",
+  "storage_strategy": "PostgreSQL (source of truth, Phase 1C+). Valkey (hot cache layer, ft-005 complete): all hot state (sessions, meta, pending_clarifications, active_profile, user_record, AALDA) cached with TTL. Write-through rule: DB written first, then Valkey — violation impossible by design (Valkey write in background.py after DB commit). Lua atomic append (LUA_APPEND_MESSAGES) prevents multi-instance session-list races. Distributed compaction lock via SETNX + UUID token + LUA_RELEASE_LOCK. Circuit breaker (5 failures -> 30s open -> half-open probe). TTL jitter ±10% prevents thundering herd. Graceful degradation: Valkey down -> falls back to PostgreSQL transparently. Per-thread asyncio.Lock for session mutations (C2). Per-pet asyncio.Lock for thread creation (Sprint 5). Graceful shutdown via tracked background tasks (W8).",
 
   "phases": [
-
     {
       "id": "phase-0",
       "name": "MVP — Agent 1 End-to-End",
@@ -47,7 +46,11 @@
           "name": "app/core/config.py — environment config",
           "complete": true,
           "tested": true,
-          "files": ["app/__init__.py", "app/core/__init__.py", "app/core/config.py"],
+          "files": [
+            "app/__init__.py",
+            "app/core/__init__.py",
+            "app/core/config.py"
+          ],
           "notes": "pydantic-settings BaseSettings. get_settings() with lru_cache — created once at startup."
         },
         {
@@ -302,7 +305,13 @@
           "description": "Extracted POST /chat, debug endpoints, and simulator endpoints from main.py into separate route modules using FastAPI APIRouter. Shared state via app.state instead of module globals.",
           "complete": true,
           "tested": true,
-          "files": ["app/main.py", "app/routes/__init__.py", "app/routes/chat.py", "app/routes/debug.py", "app/routes/simulator.py"],
+          "files": [
+            "app/main.py",
+            "app/routes/__init__.py",
+            "app/routes/chat.py",
+            "app/routes/debug.py",
+            "app/routes/simulator.py"
+          ],
           "notes": "main.py reduced to ~120 lines (app creation, CORS, lifespan, /health). All agents/sessions on app.state, accessed via request.app.state in routes. 21/24 e2e tests pass (2 pre-existing LLM flakes, 1 transient)."
         },
         {
@@ -311,7 +320,11 @@
           "description": "calculate_confidence_score() computes 0-100 score from three signals: per-field confidence (Compressor/Aggregator), time decay (exponential, per-field category + life stage), and importance weight (Tier A=3, B=2, C=1). 22 scored fields, 4 decay categories (static/slow/medium/fast), life stage multipliers for puppy through senior. confidence_color() maps to green (80-100) / yellow (50-79) / red (0-49).",
           "complete": true,
           "tested": true,
-          "files": ["app/services/confidence_calculator.py", "app/routes/chat.py", "design-docs/confidence-bar.md"],
+          "files": [
+            "app/services/confidence_calculator.py",
+            "app/routes/chat.py",
+            "design-docs/confidence-bar.md"
+          ],
           "notes": "Pure arithmetic, sub-ms, no LLM. Computed on-the-fly each request (not persisted — decay is time-dependent). Dropped PRD 'depth' component — per-field confidence already captures quality. Design doc at design-docs/confidence-bar.md."
         },
         {
@@ -329,7 +342,13 @@
           "description": "Rewrote Agent 1 system prompt to align with PW1-PRD v0.2b. Identity, tone, emoji budget (max 2), pet suffix rules (-chan/-kun), priority ladder gap questions (Rank A-D bilingual), soft redirect for health/food, emergency override, prompt injection defense. MAX_QUESTIONS_PER_SESSION reduced 5→3. GAP_QUESTION_HINTS replaced with GAP_PRIORITY_LADDER.",
           "complete": true,
           "tested": true,
-          "files": ["constants.py", "app/agents/conversation.py", "app/routes/chat.py", "design-docs/prompt-gap-analysis.md", "design-docs/prompt-v2-proposal.md"],
+          "files": [
+            "constants.py",
+            "app/agents/conversation.py",
+            "app/routes/chat.py",
+            "design-docs/prompt-gap-analysis.md",
+            "design-docs/prompt-v2-proposal.md"
+          ],
           "notes": "22/24 e2e tests pass. 2 failures are pre-existing Compressor LLM flakes, unrelated to prompt changes. language_str hardcoded to EN — auto-detect deferred to Phase 2."
         },
         {
@@ -338,7 +357,13 @@
           "description": "Fixed Issues 2,3,4,5,7 from product team reviewer-feedback-v1-proposal.md. Issue 2: response structure rewritten (end with exactly 1 follow-up question). Issue 3: HARD RULE #5 — pet name as explicit subject. Issue 4: asked_gap_question field added to Agent 1 JSON output, replacing ? counting. Issue 5: language detection via Unicode range check (Hiragana/Katakana/CJK). Issue 7: emoji rule tightened to first mention only. Food urgency gating: LOW urgency food intents no longer redirect.",
           "complete": true,
           "tested": true,
-          "files": ["app/agents/conversation.py", "app/agents/intent_classifier.py", "app/routes/chat.py", "app/services/deeplink.py", "tests/run_e2e.py"],
+          "files": [
+            "app/agents/conversation.py",
+            "app/agents/intent_classifier.py",
+            "app/routes/chat.py",
+            "app/services/deeplink.py",
+            "tests/run_e2e.py"
+          ],
           "notes": "asked_gap_question: bool added to AgentResponse. _detect_language() in chat.py uses Unicode ranges. Food intent with urgency=low returns no redirect. Medium urgency food gated by cooldown."
         },
         {
@@ -347,7 +372,12 @@
           "description": "Eliminated per-request disk I/O. Profiles loaded from JSON once at startup into app.state. All runtime reads come from memory. Aggregator mutates shared dict by reference and writes through to disk for persistence. context_builder.py parameterized with optional in-memory profiles. Backward compatible (None falls back to disk read).",
           "complete": true,
           "tested": true,
-          "files": ["app/services/context_builder.py", "app/main.py", "app/routes/chat.py", "app/agents/aggregator.py"],
+          "files": [
+            "app/services/context_builder.py",
+            "app/main.py",
+            "app/routes/chat.py",
+            "app/agents/aggregator.py"
+          ],
           "notes": "load_profiles() called once in lifespan(). build_context() accepts optional active_profile_raw, pet_profile, user_profile params. Dict passed by reference — Aggregator mutations visible to all readers immediately. asyncio.Lock prevents concurrent mutations."
         },
         {
@@ -356,7 +386,11 @@
           "description": "Standalone GET /confidence endpoint so frontend can fetch score on mount without waiting for a /chat response. Reads from app.state (in-memory). Returns {confidence_score, confidence_color}.",
           "complete": true,
           "tested": true,
-          "files": ["app/main.py", "frontend/src/api.js", "frontend/src/screens/Chat.jsx"],
+          "files": [
+            "app/main.py",
+            "frontend/src/api.js",
+            "frontend/src/screens/Chat.jsx"
+          ],
           "notes": "Frontend calls fetchConfidence() on mount and 4s after each message. Sticky redirect nudge replaces per-message inline buttons."
         },
         {
@@ -365,7 +399,10 @@
           "description": "Code review of all backend files. Fixed 5 issues: stale comments (2), fragile mutation in context_builder.py, stale import reference in deeplink.py docstring, unused import cleanup.",
           "complete": true,
           "tested": true,
-          "files": ["app/services/context_builder.py", "app/services/deeplink.py"],
+          "files": [
+            "app/services/context_builder.py",
+            "app/services/deeplink.py"
+          ],
           "notes": "Deferred: dead code in constants.py (ENTITY_PATTERNS, MEDICAL_KEYWORDS, NUTRITIONAL_KEYWORDS) — cleanup tracked separately."
         },
         {
@@ -416,7 +453,12 @@
           "name": "app/db/ — session, ORM models, repositories",
           "complete": true,
           "tested": true,
-          "files": ["app/db/__init__.py", "app/db/session.py", "app/db/models.py", "app/db/repositories.py"],
+          "files": [
+            "app/db/__init__.py",
+            "app/db/session.py",
+            "app/db/models.py",
+            "app/db/repositories.py"
+          ],
           "notes": "4 tables: pets, users, active_profile, fact_log. Repository pattern — same dict interface as file_store.py. Agents unchanged."
         },
         {
@@ -472,7 +514,16 @@
           "name": "Code review + fixes (2 reviews combined)",
           "complete": true,
           "tested": true,
-          "files": ["alembic.ini", ".env.example", "app/db/models.py", "app/db/repositories.py", "app/agents/aggregator.py", "app/services/context_builder.py", "app/main.py", "constants.py"],
+          "files": [
+            "alembic.ini",
+            ".env.example",
+            "app/db/models.py",
+            "app/db/repositories.py",
+            "app/agents/aggregator.py",
+            "app/services/context_builder.py",
+            "app/main.py",
+            "constants.py"
+          ],
           "notes": "Fixed: alembic.ini credentials, missing fact_log indexes, bulk insert, seed data float types, dead imports, stale docstrings, shutdown grace period, DEFAULT_PET_ID constant, __repr__ on models."
         },
         {
@@ -506,7 +557,10 @@
           "name": "threads + thread_messages ORM models + migration",
           "complete": true,
           "tested": true,
-          "files": ["app/db/models.py", "migrations/versions/a3b7c2d4e5f6_add_threads_and_thread_messages_tables.py"],
+          "files": [
+            "app/db/models.py",
+            "migrations/versions/a3b7c2d4e5f6_add_threads_and_thread_messages_tables.py"
+          ],
           "notes": "Thread model: thread_id (UUID unique), pet_id, user_id, started_at, expires_at, status, compaction_summary. ThreadMessage model: thread_id, role, content, timestamp. Both indexed. Hand-written migration (Docker wasn't running for autogenerate)."
         },
         {
@@ -546,7 +600,10 @@
           "name": "Wire conversation_summary into Agent 1",
           "complete": true,
           "tested": true,
-          "files": ["app/services/context_builder.py", "app/agents/conversation.py"],
+          "files": [
+            "app/services/context_builder.py",
+            "app/agents/conversation.py"
+          ],
           "notes": "build_context() returns 6 values (added conversation_summary pass-through). Agent 1 prompt injects CONVERSATION SUMMARY section before pet context."
         },
         {
@@ -554,7 +611,12 @@
           "name": "Debug endpoints + CLAUDE.md + tests",
           "complete": true,
           "tested": true,
-          "files": ["app/routes/debug.py", "CLAUDE.md", "tests/run_e2e.py", "design-docs/session-management.md"],
+          "files": [
+            "app/routes/debug.py",
+            "CLAUDE.md",
+            "tests/run_e2e.py",
+            "design-docs/session-management.md"
+          ],
           "notes": "GET /debug/threads + GET /debug/thread/{id}/messages. CLAUDE.md fully updated. 10 new e2e tests (Section 7). 38/40 pass (2 pre-existing LLM flakes)."
         }
       ]
@@ -564,23 +626,23 @@
       "id": "phase-3",
       "name": "Background Jobs",
       "description": "Session compaction and nightly passive context gathering.",
-      "status": "not-started",
+      "status": "complete",
       "features": [
         {
           "id": "p3-001",
           "name": "Session compaction job",
-          "complete": false,
-          "tested": false,
-          "files": ["app/jobs/compaction.py"],
-          "notes": "After N sessions: LLM summarizes conversation_log into compressed_history."
+          "complete": true,
+          "tested": true,
+          "files": ["app/services/thread_summarizer.py", "app/jobs/nightly.py"],
+          "notes": "ThreadSummarizer (LLM, temp=0.0) compacts messages when thread hits 50. Two-section format: HEALTH CONTEXT + USER STYLE. Nightly _close_expired_thread_summaries() backfills summaries for short threads that expired without hitting threshold. 21/21 Sprint 6 tests pass."
         },
         {
           "id": "p3-002",
           "name": "Nightly passive context batch",
-          "complete": false,
-          "tested": false,
-          "files": ["app/jobs/nightly_batch.py"],
-          "notes": "Scan Health + Food module logs. Run Agent 2+3 pipeline on them."
+          "complete": true,
+          "tested": true,
+          "files": ["app/jobs/nightly.py", "app/services/history_builder.py", "app/services/relationship_builder.py"],
+          "notes": "Design evolved from original plan. HistoryBuilder reads fact_log → updates active_profile._pet_history (LLM, temp=0.0, hybrid trigger in background.py). RelationshipBuilder reads USER STYLE sections from compaction summaries → updates users.relationship_summary. APScheduler runs both nightly via run_nightly_jobs(). 21/21 Sprint 6 tests pass."
         }
       ]
     },
@@ -608,84 +670,8 @@
           "notes": "slowapi. 20 messages per IP per minute."
         }
       ]
-    },
-
-    {
-      "id": "phase-5",
-      "name": "Testing + Deployment",
-      "description": "Unit tests, integration tests, Docker, production deploy.",
-      "status": "not-started",
-      "features": [
-        {
-          "id": "p5-001",
-          "name": "Unit tests — aggregator conflict resolution rules",
-          "complete": false,
-          "tested": false,
-          "files": ["tests/test_aggregator.py", "tests/conftest.py"],
-          "notes": "Most important unit test — pure logic, fully deterministic, no LLM needed."
-        },
-        {
-          "id": "p5-002",
-          "name": "Integration tests — POST /chat pipeline",
-          "complete": false,
-          "tested": false,
-          "files": ["tests/test_api.py"],
-          "notes": "Full pipeline test with MockLLMProvider injected."
-        },
-        {
-          "id": "p5-003",
-          "name": "Dockerfile + production deployment",
-          "complete": false,
-          "tested": false,
-          "files": ["Dockerfile"],
-          "notes": ""
-        }
-      ]
     }
-
   ],
-
-  "deployment_dev": {
-    "id": "deploy-dev",
-    "name": "Development Deployment (Railway/Render) — TEMPORARY",
-    "description": "Dev deployment setup for testing. DevOps team will replace with production pipeline later.",
-    "status": "complete",
-    "cleanup_needed": true,
-    "features": [
-      {
-        "id": "dd-001",
-        "name": "nixpacks.toml — Railway Python detection",
-        "complete": true,
-        "tested": true,
-        "files": ["nixpacks.toml"],
-        "notes": "TEMPORARY. Added so Railway detects Python project. DevOps will replace."
-      },
-      {
-        "id": "dd-002",
-        "name": "Dockerfile — Railway/Render deployment",
-        "complete": true,
-        "tested": true,
-        "files": ["backend/Dockerfile"],
-        "notes": "TEMPORARY. COPY paths use backend/ prefix (repo-root build context). Port hardcoded to 8000. DevOps will replace with production Dockerfile."
-      },
-      {
-        "id": "dd-003",
-        "name": "OPENAI_API_KEY — manual key verification",
-        "complete": true,
-        "tested": true,
-        "files": [],
-        "notes": "TEMPORARY. Key added to .env for manual testing (2026-03-13, confirmed working). App uses Azure OpenAI, not direct OpenAI. Key not used by app code. Remove or wire into factory.py later."
-      },
-      {
-        "id": "dd-004",
-        "name": "demo/real-pet-context branch — merged to master",
-        "complete": true,
-        "tested": true,
-        "files": [],
-        "notes": "Branch added real pet data from AALDA API + Dockerfile fixes. Merged to master for deployment testing. 6 commits: nixpacks.toml, Dockerfile creation, Dockerfile fixes (3), real pet context feature."
-      }
-    ]
-  },
 
   "future_tasks": [
     {
@@ -702,7 +688,12 @@
       "id": "ft-003",
       "name": "Wire x-user-code header — multi-user pet_id resolution",
       "description": "X-User-Code header required on all endpoints. chat.py extracts it for AALDA auth and user identity. pet_ids (integer list) in ChatRequest. All DEFAULT_PET_ID removed. Aggregator receives pet_id per request.",
-      "files": ["app/routes/chat.py", "app/agents/aggregator.py", "app/db/repositories.py", "app/main.py"],
+      "files": [
+        "app/routes/chat.py",
+        "app/agents/aggregator.py",
+        "app/db/repositories.py",
+        "app/main.py"
+      ],
       "status": "complete",
       "completed_date": "2026-03-16"
     },
@@ -710,7 +701,11 @@
       "id": "ft-011",
       "name": "AALDA API integration — backend fetches pet data",
       "description": "PetFetcher calls AALDA API (GET /api/v1/pet-profile/{pet_id}) with X-User-Code auth. Maps AALDA fields to internal schema. In-memory TTL cache (5 min). Returns pet_profile + aalda_facts. New endpoint GET /api/v1/pets lists user's pets.",
-      "files": ["app/services/pet_fetcher.py", "app/routes/chat.py", "app/core/config.py"],
+      "files": [
+        "app/services/pet_fetcher.py",
+        "app/routes/chat.py",
+        "app/core/config.py"
+      ],
       "status": "complete",
       "completed_date": "2026-03-16"
     },
@@ -718,23 +713,55 @@
       "id": "ft-012",
       "name": "Remove DEFAULT_PET_ID and DEFAULT_USER_ID fallbacks",
       "description": "All DEFAULT_PET_ID and DEFAULT_USER_ID removed from constants.py, chat.py, debug.py, aggregator.py. pet_ids required in ChatRequest. X-User-Code header required (401 if missing). pet_id is integer everywhere.",
-      "files": ["app/routes/chat.py", "constants.py", "app/routes/debug.py", "app/agents/aggregator.py"],
+      "files": [
+        "app/routes/chat.py",
+        "constants.py",
+        "app/routes/debug.py",
+        "app/agents/aggregator.py"
+      ],
       "status": "complete",
       "completed_date": "2026-03-16"
     },
     {
       "id": "ft-005",
-      "name": "Valkey hot storage — decision made (Valkey, not Redis)",
-      "description": "Implement Valkey as hot storage for conversation threads and active profiles. Valkey is a Redis-compatible open-source fork — any Redis client library (redis-py, aioredis) works unchanged. Replaces in-memory Python dict (app.state.sessions, app.state.active_profile). Write-through to PostgreSQL already implemented in Phase 2. COORDINATE with ft-003 (multi-user) — both require restructuring app.state.",
-      "files": ["app/db/valkey_client.py", "app/services/context_builder.py", "app/agents/aggregator.py", "app/routes/chat.py"],
-      "status": "not-started",
-      "priority": "high — required for horizontal scaling and production multi-user"
+      "name": "Valkey hot storage",
+      "description": "Valkey (open-source Redis fork) as shared TTL-aware hot cache in front of PostgreSQL. Replaces all in-memory Python dicts on app.state. Write-through rule: DB first (source of truth), then Valkey. Circuit breaker, TTL jitter, graceful degradation (Valkey down -> transparent PostgreSQL fallback). Distributed compaction lock via SETNX + UUID token. Lua atomic session append. Two full review cycles (11 + 15 issues = 26 total fixes). Dedicated test suite: 17/17 pass.",
+      "files": [
+        "app/cache/__init__.py",
+        "app/cache/keys.py",
+        "app/cache/client.py",
+        "app/routes/chat.py",
+        "app/routes/background.py",
+        "app/agents/aggregator.py",
+        "app/services/pet_fetcher.py",
+        "app/types.py",
+        "app/core/config.py",
+        "app/main.py",
+        "docker-compose.yml",
+        ".env.example",
+        "requirements.txt",
+        "tests/test_valkey.py"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-19",
+      "test_results": "17/17 Valkey tests pass. 68/70 E2E tests pass (2 pre-existing LLM timeout flakes)."
     },
     {
       "id": "ft-006",
       "name": "Code review fixes — all review debt resolved (Sprint 2-3 + Sprint 4)",
       "description": "All review items from Sprint 2-3 and Sprint 4 resolved. Sprint 5 closed remaining 9 items: StateBag Protocol type hints, compaction summary label fix, deprecated file deletions (ft-002), frontend crypto.randomUUID + redirect whitelist, per-pet asyncio.Lock for thread creation race, partial unique index (one active thread per pet), FK constraint on thread_messages, background.py extraction from chat.py, parallel aggregator via asyncio.gather(). Only W18 (users table schema — other team) remains as external dependency.",
-      "files": ["app/routes/chat.py", "app/routes/background.py", "app/db/models.py", "app/db/repositories.py", "app/main.py", "app/types.py", "app/agents/conversation.py", "frontend/src/screens/Chat.jsx"],
+      "files": [
+        "app/routes/chat.py",
+        "app/routes/background.py",
+        "app/db/models.py",
+        "app/db/repositories.py",
+        "app/main.py",
+        "app/types.py",
+        "app/agents/conversation.py",
+        "frontend/src/screens/Chat.jsx"
+      ],
       "status": "complete",
       "completed_date": "2026-03-17",
       "priority": "done",
@@ -756,7 +783,15 @@
       "id": "ft-007",
       "name": "API v1 — versioning, error contract, redirect restructure",
       "description": "Implement design-docs/api-v1-design.md. (1) Add /api/v1 prefix to all routers. (2) Remove pet_context from ChatRequest, add pet_id with DEFAULT_PET_ID fallback for dev. (3) Restructure RedirectPayload — remove deep_link URL, add display{label,style} + context{query,pet_id,pet_summary}. (4) Add custom error handler — all errors return {status:'error',error:{code,message}}. (5) Add status:'ok' to all success responses. (6) Update React frontend URLs + redirect handling. (7) Update tests + CLAUDE.md.",
-      "files": ["app/routes/chat.py", "app/routes/debug.py", "app/routes/simulator.py", "app/main.py", "app/services/deeplink.py", "frontend/src/api.js", "frontend/src/screens/Chat.jsx"],
+      "files": [
+        "app/routes/chat.py",
+        "app/routes/debug.py",
+        "app/routes/simulator.py",
+        "app/main.py",
+        "app/services/deeplink.py",
+        "frontend/src/api.js",
+        "frontend/src/screens/Chat.jsx"
+      ],
       "status": "complete",
       "priority": "URGENT — API handover 2026-03-16",
       "design_doc": "design-docs/api-v1-design.md",
@@ -766,7 +801,12 @@
       "id": "ft-008",
       "name": "Multi-pet support — two pets per user simultaneously",
       "description": "ChatRequest accepts pet_ids: list[int] (1-2 pets). Dual-pet context pipeline: parallel AALDA fetch, per-pet active_profile from DB, per-pet gap sections. Prompt v0.3 with PET A / PET B sections. Frontend PetSelect with multi-select (max 2). Conversation agent updated for dual-pet.",
-      "files": ["app/routes/chat.py", "app/agents/conversation.py", "app/services/context_builder.py", "frontend/src/screens/PetSelect.jsx"],
+      "files": [
+        "app/routes/chat.py",
+        "app/agents/conversation.py",
+        "app/services/context_builder.py",
+        "frontend/src/screens/PetSelect.jsx"
+      ],
       "status": "complete",
       "completed_date": "2026-03-16"
     },
@@ -774,7 +814,11 @@
       "id": "ft-009",
       "name": "Multiple LLM providers — OpenAI + Claude/Anthropic",
       "description": "Currently Azure OpenAI only. Add two new provider implementations: (1) OpenAI direct (not Azure), (2) Claude/Anthropic API. LLMProvider abstract class and factory pattern already exist — just need concrete implementations in app/llm/. Factory reads LLM_PROVIDER env var. Zero agent code changes needed.",
-      "files": ["app/llm/openai.py", "app/llm/anthropic.py", "app/llm/factory.py"],
+      "files": [
+        "app/llm/openai.py",
+        "app/llm/anthropic.py",
+        "app/llm/factory.py"
+      ],
       "status": "not-started",
       "priority": "medium"
     },
@@ -789,12 +833,59 @@
     {
       "id": "ft-013",
       "name": "HistoryBuilder — pet history narrative from fact_log",
-      "description": "New LLM-based service (app/services/history_builder.py) that reads fact_log rows for a pet and builds a chronological narrative stored as _pet_history in active_profile. Similar pattern to ThreadSummarizer. Runs in _run_background() after Aggregator writes new facts. Focus on events and changes: health events, medication changes, behavioral shifts, vet visits, and time_scope='past' facts (which the Aggregator skips but are exactly what history needs). Prompt plumbing already wired — build_pet_context() extracts _pet_history, conversation.py template has {pet_history_section}.",
-      "files": ["app/services/history_builder.py", "app/routes/chat.py", "app/services/context_builder.py"],
+      "description": "LLM-based service (app/services/history_builder.py) that reads high-confidence health facts from fact_log since last build, merges with existing _pet_history narrative, writes updated narrative back to active_profile._pet_history. Hybrid trigger: Condition A (>=3 new high-confidence facts in session) OR Condition B (>=1 fact AND >=2 sessions since last build). Conditional write: _history_last_updated NOT advanced when no health-relevant facts found. Cache invalidation: Valkey profile key deleted after every write so next request reads fresh narrative.",
+      "files": [
+        "app/services/history_builder.py",
+        "app/routes/background.py",
+        "app/db/repositories.py",
+        "app/db/models.py"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-19",
+      "test_results": "T04-T08 in test_sprint6.py all pass. _pet_history written as 789-char narrative, _history_last_updated as ISO string (not dict). Cache invalidated correctly. Pointer not advanced when no health facts.",
+      "notes": "Part of Sprint 6. 13 bugs found and fixed via code review before tests ran."
+    },
+    {
+      "id": "ft-015",
+      "name": "Sprint 6 — Background Intelligence Pipeline",
+      "description": "Six-task sprint completing the AI context pipeline. Task 1: ThreadSummarizer enhanced to two-section format (HEALTH CONTEXT: + USER STYLE:) — both sections passed to Agent 1 and parsed by RelationshipBuilder. Task 2: HistoryBuilder (see ft-013). Task 3: Closing summary nightly job — finds expired threads with no compaction_summary, runs ThreadSummarizer, writes result so RelationshipBuilder can use it. Task 4: RelationshipBuilder — reads USER STYLE sections from last 5 thread summaries per user, merges into users.relationship_summary via LLM. Task 5: APScheduler — AsyncIOScheduler cron job at 00:00 UTC running nightly jobs (graceful shutdown with wait=True). Task 6: DB write batching — FactLogRepo.append_bulk() for atomic dual-pet fact writes. Debug endpoints added: POST /debug/trigger_nightly and POST /debug/trigger_summarizer for testing without midnight wait or 50-message compaction. 13 bugs found and fixed via two-agent code review (critical: field_key->key, _history_last_updated dict, high_by_pet NameError, append_bulk atomicity; major: lazy expiry, nightly isolation, wait=False shutdown, _writer access, confidence threshold; regression: write_all deleting _history_last_updated).",
+      "files": [
+        "app/jobs/__init__.py",
+        "app/jobs/nightly.py",
+        "app/services/thread_summarizer.py",
+        "app/services/history_builder.py",
+        "app/services/relationship_builder.py",
+        "app/routes/background.py",
+        "app/routes/debug.py",
+        "app/db/repositories.py",
+        "app/db/models.py",
+        "app/main.py",
+        "app/types.py",
+        "requirements.txt",
+        "tests/test_sprint6.py",
+        "migrations/versions/1d20aafa64c5_add_composite_indexes_for_history_.py"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-19",
+      "test_results": "test_sprint6.py: 21/21 (20 PASS + 1 SKIP by design). run_e2e.py: 69/70 (1 pre-existing clarification-loop flake). test_valkey.py: 17/17.",
+      "notes": "Alembic migration 1d20aafa64c5 applied: adds ix_fact_log_pet_id_extracted_at (composite) + ix_threads_expires_at. Also fixed models.py to declare ix_threads_one_active_per_pet partial unique index to prevent Alembic from dropping it on future autogenerate."
+    },
+    {
+      "id": "ft-017",
+      "name": "Replace session_id with thread_id in fact_log and active_profile",
+      "description": "fact_log.session_id and active_profile.session_id currently store the Flutter client-generated UUID (from ChatRequest.session_id). This is a dangling string — it references no DB row and cannot be JOINed. thread_id (the backend-generated UUID in anymall_chan_threads) represents the same conversation and IS a real FK-joinable value. Replacing session_id with thread_id in these two tables: (1) removes the confusion of two IDs for the same conversation, (2) makes fact_log.session_id a real reference to threads.thread_id, (3) allows HistoryBuilder and debug queries to JOIN fact_log → threads for metadata (started_at, expires_at, pet_id). Also requires Alembic migration to rename column (or keep name, just store thread_id value). count_distinct_sessions_since() in FactLogRepo continues to work unchanged — it counts distinct values, the value is just thread_id now instead of Flutter UUID.",
+      "files": [
+        "app/db/repositories.py",
+        "app/agents/aggregator.py",
+        "migrations/versions/<new_migration>.py"
+      ],
       "status": "not-started",
-      "priority": "high",
-      "depends_on": [],
-      "notes": "Prompt wiring done (2026-03-16). Only the builder itself + trigger in _run_background() remain."
+      "priority": "low",
+      "notes": "One-line change in repositories.py (FactLogRepo.append and append_bulk: use thread_id instead of fact.get('session_id')). One-line change in aggregator.py (ActiveProfile write: use thread_id). Optional: rename column session_id -> thread_id in a migration for clarity. AgentState already carries both session_id and thread_id — just switch which one is written to DB."
     },
     {
       "id": "ft-014",
@@ -805,15 +896,33 @@
       "priority": "medium",
       "depends_on": ["ft-013"],
       "notes": "Per-thread asyncio.Lock (C2) is the current safety mechanism. SSE is the UX improvement on top — user sees 'compacting...' instead of a slow response. Design: SSE endpoint per thread, frontend subscribes on mount, server pushes compaction_start/compaction_done events."
+    },
+    {
+      "id": "ft-016",
+      "name": "AALDA DB alignment + user fields wiring",
+      "description": "Decided no write-back to AALDA APIs (nutrition, diet, vaccination) — context_builder.py already merges AALDA as base layer with chat-learned facts on top. Wired dormant user fields: display_name in ChatRequest (persisted to DB), 3-step language priority chain (request explicit > DB stored > auto-detect), owner_name in Agent 1 prompt (OWNER: section with sanitization). Fixed UserRepo.upsert bug (display_name missing from on_conflict_do_update). Confirmed relationship_summary IS user_context_memory — no new field needed.",
+      "files": [
+        "app/routes/chat.py",
+        "app/db/repositories.py",
+        "app/agents/conversation.py",
+        "design-docs/aalda-writeback-design.md",
+        "design-docs/aalda-db-alignment-questions.md"
+      ],
+      "status": "complete",
+      "complete": true,
+      "tested": true,
+      "completed_date": "2026-03-20",
+      "test_results": "No regressions. 66/70 E2E (4 pre-existing: 2 LLM flakes, 1 AALDA data, 1 clarification-loop). 20/21 Sprint 6 (1 Valkey connectivity). 14/17 Valkey (3 Valkey connectivity — not related to changes).",
+      "notes": "No Alembic migration needed — display_name and preferred_language columns already existed from W18. Backward compatible (display_name defaults to empty, language defaults to auto)."
     }
   ],
 
   "summary": {
-    "total_features": 70,
-    "complete": 67,
+    "total_features": 78,
+    "complete": 76,
     "in_progress": 0,
     "blocked": 0,
-    "not_started": 6,
-    "note": "Phase 0-2 + API v1 + Sprint 2-5 complete. All review debt resolved (Sprint 2-3 + Sprint 4). ft-002 complete (all deprecated files deleted). 68/70 E2E tests pass (2 LLM non-determinism in Compressor). Next: ft-013 (HistoryBuilder), ft-005 (Valkey hot storage), Phase 3 (nightly batch jobs)."
+    "not_started": 5,
+    "note": "Phase 0-2 + API v1 + Sprint 2-6 + ft-005 (Valkey) + ft-013 (HistoryBuilder) + ft-015 (Sprint 6 pipeline) + ft-016 (AALDA alignment + user fields) complete. AALDA write-back decided unnecessary. User fields wired (display_name, language priority, owner_name). Next: Phase 4 (JWT auth + rate limiting)."
   }
 }

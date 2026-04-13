@@ -12,7 +12,10 @@
 #   don't need `Any` type hints.
 
 import asyncio
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict, TYPE_CHECKING, runtime_checkable
+
+if TYPE_CHECKING:
+    from app.cache.client import ValkeyClient
 
 
 class ActiveProfileEntry(TypedDict, total=False):
@@ -42,6 +45,19 @@ class ActiveProfileEntry(TypedDict, total=False):
     trend_flag: str
 
 
+@runtime_checkable
+class UserProfileWriter(Protocol):
+    """
+    Abstraction over writing user relationship data.
+
+    Current implementation: UserRepo (direct PostgreSQL write).
+    Future implementation: AALDA user API (swap without changing RelationshipBuilder).
+
+    Same strategy pattern as LLMProvider — zero RelationshipBuilder changes to swap.
+    """
+    async def update_relationship_summary(self, user_code: str, summary: str) -> None: ...
+
+
 class StateBag(Protocol):
     """
     Type contract for FastAPI's app.state object.
@@ -63,4 +79,11 @@ class StateBag(Protocol):
     aggregator: Any
     thread_summarizer: Any
     pet_fetcher: Any
+    recipe_fetcher: Any      # RecipeFetcher — MCP client for recipe recommendations (Phase 3)
+    food_agent: Any          # FoodAgent — specialized food intent node (Phase 4)
     llm_provider: Any
+    valkey: "ValkeyClient"
+    scheduler: Any           # AsyncIOScheduler — nightly cron jobs (Sprint 6)
+    history_builder: Any     # HistoryBuilder — fact_log → _pet_history narrative (ft-013)
+    relationship_builder: Any  # RelationshipBuilder — USER STYLE → relationship_summary (Sprint 6)
+    suggested_questions_agent: Any  # SuggestedQuestionsAgent — home screen question generator

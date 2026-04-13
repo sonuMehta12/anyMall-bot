@@ -50,8 +50,13 @@ class AgentState:
     # ── Set at request start — never modified ────────────────────────────────
     session_id: str
     thread_id: str     # Phase 2 — backend's thread UUID for DB writes
+    user_code: str     # X-User-Code — threaded to all DB writes in background pipeline
     user_message: str
     pets: list[PetInfo]  # index 0 = Pet A (always), index 1 = Pet B (if dual-pet)
+    all_pet_ids: list[int] = field(default_factory=list)
+    # Full list of pet IDs the user owns — sent by frontend on POST /chat.
+    # Distinct from pets (active session pets). Used by regen to personalize all 10
+    # suggested question slots regardless of which pet is in the current session.
 
     # ── Set by ConversationAgent after run() ─────────────────────────────────
     is_entity: bool = False       # True  → run Compressor

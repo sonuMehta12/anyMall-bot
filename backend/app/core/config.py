@@ -38,8 +38,7 @@ class Settings(BaseSettings):
 
     # ── LLM Provider ──────────────────────────────────────────────────────────
     # Which LLM backend to use.  Matches LLM_PROVIDER in .env.
-    # Valid values: "azure"
-    # Phase 1 will add "openai" as a valid value.
+    # Valid values: "azure" | "openai"
     llm_provider: str = "azure"
 
     # ── Azure OpenAI ──────────────────────────────────────────────────────────
@@ -52,10 +51,12 @@ class Settings(BaseSettings):
     azure_openai_api_version: str = "2025-01-01-preview"
     azure_openai_deployment_chat: str = "gpt-4.1"
 
-    # ── Future: direct OpenAI (Phase 1+) ─────────────────────────────────────
-    # Not used yet.  Defined here so the Settings class is already ready.
+    # ── Direct OpenAI ──────────────────────────────────────────────────────
+    # Used when llm_provider == "openai".
+    # OPENAI_API_KEY is required. OPENAI_MODEL_CHAT sets the default model
+    # for all agents (overridable per-agent via _MODEL constant in each file).
     openai_api_key: str | None = None
-    openai_model_chat: str = "gpt-4o"
+    openai_model_chat: str = "gpt-5.4"
 
     # ── Database (Phase 1C) ────────────────────────────────────────────────
     # PostgreSQL connection string for async SQLAlchemy.
@@ -66,9 +67,27 @@ class Settings(BaseSettings):
 
     # ── AALDA API ──────────────────────────────────────────────────────────
     # External API for real pet data (profiles, diets, vaccinations).
-    # Backend calls this on every chat request (cached in memory for 5 min).
+    # Backend calls this on every chat request (cached in Valkey for 5 min).
     aalda_api_url: str = "https://anymall-api.stagingapp.in/api/v1"
     aalda_timeout_seconds: float = 10.0  # httpx timeout for AALDA API calls
+
+    # ── Valkey cache (ft-005) ──────────────────────────────────────────────
+    # Connection URL for the Valkey (Redis-compatible) in-memory cache.
+    # Default points to the local Docker container defined in docker-compose.yml.
+    # Format: valkey://:password@host:port/db
+    valkey_url: str = "valkey://:valkey_dev@localhost:6379/0"
+
+    # ── Recipe MCP Server (Phase 3 — Recipe Integration) ────────────────────
+    # External MCP server for recipe recommendations based on pet profiles.
+    # Runs on the Streamable HTTP protocol; one pet per call.
+    recipe_mcp_url: str = "https://afa.stagingapp.in/mcp"
+    # slightly shorter than AALDA to fail fast
+    recipe_mcp_timeout_seconds: float = 8.0
+
+    # ── Tavily Web Search (Food AI — Phase 4) ────────────────────────────────
+    # API key for Tavily web search, used by FoodAgent in modes 2 and 3.
+    # If empty, web search is skipped (FoodAgent still runs but without web context).
+    tavily_api_key: str = ""
 
     # ── pydantic-settings configuration ──────────────────────────────────────
     # env_file: which file to read from disk.

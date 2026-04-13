@@ -8,24 +8,30 @@
 #
 # Auth: X-User-Code header (same value Flutter sends to us).
 #
-# Caching: in-memory dict with 5-minute TTL.  One entry per (user_code, pet_id).
-# On cache miss: call AALDA API.  On AALDA failure: try expired cache, then DB.
+# Caching (ft-005): Valkey with 5-minute TTL.  One entry per (user_code, pet_id).
+#   am:aalda:{user_code}:{pet_id} — fresh result, TTL_AALDA (300s)
+#
+# On cache miss: call AALDA API.  On AALDA failure: PetFetchError (AALDA is sole source of truth).
 #
 # Returns TWO things per pet:
 #   pet_profile — static identity (pet_id, name, species, breed, date_of_birth, sex)
 #   aalda_facts — dynamic facts for active_profile seeding (neutered, diet, vaccinations)
 
+import json
 import logging
 import time
 from datetime import date
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from app.cache.keys import CacheKeys, TTL_AALDA, jittered_ttl
 
-CACHE_TTL_SECONDS: int = 300  # 5 minutes
+if TYPE_CHECKING:
+    from app.cache.client import ValkeyClient
+
+logger = logging.getLogger(__name__)
 
 
 class PetFetchError(Exception):
@@ -35,33 +41,32 @@ class PetFetchError(Exception):
 
 class PetFetcher:
     """
-    Async client for the AALDA pet data API with in-memory caching.
+    Async client for the AALDA pet data API with Valkey caching (ft-005).
 
     Created once at startup, stored on app.state.pet_fetcher.
     Closed at shutdown via close().
-    """
 
-    CACHE_MAX_SIZE: int = 500  # evict oldest entries beyond this limit
+    Cache strategy:
+      - Fresh key (am:aalda:…) → 5-min TTL, always re-fetched on expiry
+      - If cache miss AND AALDA is unreachable → PetFetchError
+      AALDA is the sole source of truth for pet identity — no stale fallbacks.
+    """
 
     def __init__(
         self,
         base_url: str,
-        db_fallback: Any | None = None,
-        db_persist: Any | None = None,
         timeout: float = 10.0,
+        valkey: "ValkeyClient | None" = None,
     ) -> None:
         """
         Args:
             base_url: AALDA API base URL.
-            db_fallback: async callback(pet_id) -> dict|None — reads from pets table.
-            db_persist: async callback(pet_profile) -> None — writes to pets table.
-            timeout: httpx timeout in seconds for AALDA API calls.
+            timeout:  httpx timeout in seconds for AALDA API calls.
+            valkey:   ValkeyClient instance for caching.  If None, cache is skipped.
         """
         self._base_url = base_url.rstrip("/")
-        self._cache: dict[tuple[str, int], tuple[dict, float]] = {}
         self._client = httpx.AsyncClient(timeout=timeout)
-        self._db_fallback = db_fallback
-        self._db_persist = db_persist
+        self._valkey = valkey
         logger.info("PetFetcher initialised — base_url=%s timeout=%.1fs", self._base_url, timeout)
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -77,52 +82,36 @@ class PetFetcher:
             pet_profile: static identity dict for build_context().
             aalda_facts: dynamic facts dict to seed active_profile.
 
-        Fallback chain (W1):
-            1. Fresh cache (TTL not expired)
+        Fallback chain:
+            1. Fresh Valkey key (am:aalda:…, TTL 5 min)
             2. AALDA API call
-            3. Expired cache entry (stale but usable)
-            4. DB fallback (via _db_fallback callback, if set)
-            5. PetFetchError (only if ALL above fail)
+            3. PetFetchError (AALDA is sole source of truth)
         """
-        cache_key = (user_code, pet_id)
-        cached = self._cache.get(cache_key)
-        if cached:
-            result, ts = cached
-            if time.monotonic() - ts < CACHE_TTL_SECONDS:
-                logger.debug("PetFetcher cache hit — pet_id=%d", pet_id)
-                return result["pet_profile"], result["aalda_facts"]
-            # Expired — fall through to AALDA, keep cached for fallback
+        fresh_key = CacheKeys.aalda(user_code, pet_id)
 
-        # ── Try AALDA API ────────────────────────────────────────────────────
+        # ── 1. Fresh Valkey cache ─────────────────────────────────────────────
+        if self._valkey is not None:
+            raw = await self._valkey.get(fresh_key)
+            if raw is not None:
+                try:
+                    cached = json.loads(raw)
+                    logger.debug("PetFetcher cache hit — pet_id=%d", pet_id)
+                    return cached["pet_profile"], cached["aalda_facts"]
+                except (ValueError, KeyError):
+                    logger.warning("Corrupted AALDA cache — pet_id=%d, falling through to API", pet_id)
+                    # fall through to AALDA API call below
+
+        # ── 2. Try AALDA API ──────────────────────────────────────────────────
         try:
             pet_profile, aalda_facts = await self._fetch_from_aalda(user_code, pet_id)
         except PetFetchError as exc:
             logger.warning("AALDA fetch failed for pet_id=%d: %s", pet_id, exc)
-
-            # ── Fallback 1: expired cache entry ──────────────────────────────
-            if cached:
-                result, _ = cached
-                logger.info("Using expired cache for pet_id=%d (AALDA down)", pet_id)
-                return result["pet_profile"], result["aalda_facts"]
-
-            # ── Fallback 2: DB (pets table) ──────────────────────────────────
-            if self._db_fallback:
-                db_profile = await self._db_fallback(pet_id)
-                if db_profile:
-                    logger.info("Using DB fallback for pet_id=%d (AALDA down, no cache)", pet_id)
-                    return db_profile, {}  # no aalda_facts from DB — just identity
-
-            # ── All fallbacks exhausted ──────────────────────────────────────
             raise
 
-        # ── Success: cache + persist to DB (W10) ─────────────────────────────
-        self._cache_result(cache_key, pet_profile, aalda_facts)
-
-        if self._db_persist:
-            try:
-                await self._db_persist(pet_profile)
-            except Exception as db_exc:
-                logger.warning("Failed to persist pet_id=%d to DB: %s", pet_id, db_exc)
+        # ── 3. Success: write fresh cache key ────────────────────────────────
+        if self._valkey is not None:
+            payload = json.dumps({"pet_profile": pet_profile, "aalda_facts": aalda_facts})
+            await self._valkey.setex(fresh_key, jittered_ttl(TTL_AALDA), payload)
 
         logger.info(
             "PetFetcher fetched pet_id=%d name=%s from AALDA",
@@ -176,26 +165,6 @@ class PetFetcher:
             )
 
         return self._extract_pet_profile(data), self._extract_aalda_facts(data)
-
-    # ── Cache management ───────────────────────────────────────────────────────
-
-    def _cache_result(
-        self, cache_key: tuple[str, int], pet_profile: dict, aalda_facts: dict,
-    ) -> None:
-        """Store result in cache and prune if oversized."""
-        now = time.monotonic()
-        self._cache[cache_key] = (
-            {"pet_profile": pet_profile, "aalda_facts": aalda_facts},
-            now,
-        )
-        if len(self._cache) > self.CACHE_MAX_SIZE:
-            expired = [k for k, (_, ts) in self._cache.items() if now - ts >= CACHE_TTL_SECONDS]
-            for k in expired:
-                del self._cache[k]
-            if len(self._cache) > self.CACHE_MAX_SIZE:
-                by_age = sorted(self._cache.items(), key=lambda item: item[1][1])
-                for k, _ in by_age[: len(self._cache) - self.CACHE_MAX_SIZE]:
-                    del self._cache[k]
 
     async def fetch_user_pets(self, user_code: str) -> list[dict]:
         """

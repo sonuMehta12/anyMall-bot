@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/simulator", tags=["simulator"])
 
 
-@router.get("/health", response_class=HTMLResponse, summary="Health module simulator")
+@router.get("/health_v1", response_class=HTMLResponse, summary="Health module simulator")
 async def health_simulator(
     query: str = "",
     urgency: str = "low",

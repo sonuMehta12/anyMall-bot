@@ -18,7 +18,23 @@
       "Bash(powershell -Command \"Get-Process -Name python -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name uvicorn -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host done\")",
       "Bash(rm -f config.py main.py requirements.txt)",
       "Bash(rm -rf __pycache__)",
-      "Bash(alembic revision:*)"
+      "Bash(alembic revision:*)",
+      "WebFetch(domain:valkey-py.readthedocs.io)",
+      "WebSearch",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:aiven.io)",
+      "WebFetch(domain:leapcell.io)",
+      "Bash(.venv/Scripts/python tests/run_e2e.py)",
+      "Bash(.venv/Scripts/python tests/test_sprint6.py)",
+      "WebFetch(domain:platform.openai.com)",
+      "Bash(.venv/Scripts/python -m alembic heads)",
+      "Bash(.venv/Scripts/python tests/test_suggested_questions.py --unit)",
+      "Bash(python -m py_compile backend/app/services/recipe_fetcher.py backend/app/main.py backend/app/routes/chat.py)",
+      "Bash(python -X utf8 -c ':*)",
+      "Bash(.venv/Scripts/python tests/test_food_ai.py unit)",
+      "Read(//tmp/**)",
+      "Bash(.venv/Scripts/pip show:*)",
+      "Bash(.venv/Scripts/python tests/test_food_ai.py --unit)"
     ]
   }
 }

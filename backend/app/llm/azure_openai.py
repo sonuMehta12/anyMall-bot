@@ -67,6 +67,7 @@ class AzureOpenAIProvider(LLMProvider):
         messages: list[dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 512,
+        model: str | None = None,
     ) -> str:
         """
         Send a chat completion to Azure OpenAI and return the reply text.
@@ -78,21 +79,28 @@ class AzureOpenAIProvider(LLMProvider):
              {"role": "assistant", "content": "..."},
              ...]
 
+        Args:
+            model: Optional deployment name override.  None = use the
+                   deployment configured at startup (self._deployment).
+                   Set per-agent to test a specific Azure deployment without
+                   changing provider config or affecting other agents.
+
         Raises LLMProviderError on any API failure so callers stay
         provider-agnostic.
         """
+        deployment = model or self._deployment
         full_messages = [{"role": "system", "content": system_prompt}] + messages
 
         logger.debug(
             "Sending completion. deployment=%s messages=%d temperature=%s",
-            self._deployment,
+            deployment,
             len(full_messages),
             temperature,
         )
 
         try:
             response = await self._client.chat.completions.create(
-                model=self._deployment,   # Azure uses deployment name here
+                model=deployment,         # Azure uses deployment name here
                 messages=full_messages,   # type: ignore[arg-type]
                 temperature=temperature,
                 max_tokens=max_tokens,

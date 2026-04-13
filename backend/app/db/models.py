@@ -3,7 +3,6 @@
 # SQLAlchemy ORM models for AnyMall-chan backend.
 #
 # Tables:
-#   Pet            → static pet identity (pet_id is Integer from AALDA)
 #   User           → owner relationship data (user_id is x-user-code string)
 #   ActiveProfile  → current best-known facts per field
 #   FactLog        → append-only audit trail
@@ -22,8 +21,12 @@
 #   All metadata columns (confidence, source_rank, etc.) are NULL.
 #   to_dict_entry() returns the raw string for this key.
 
+from datetime import datetime
+
 from sqlalchemy import (
+    BigInteger,
     Boolean,
+    DateTime,
     Float,
     ForeignKey,
     Index,
@@ -32,6 +35,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.types import ActiveProfileEntry
@@ -46,49 +50,6 @@ class Base(DeclarativeBase):
     pass
 
 
-# ── Pet ──────────────────────────────────────────────────────────────────────
-
-class Pet(Base):
-    """
-    Static pet identity — set at onboarding, rarely changes.
-
-    pet_id is the integer ID from the AALDA API (e.g. 143).
-    One row per pet.  Multi-pet supported via AALDA integration.
-    """
-    __tablename__ = "pets"
-
-    id: Mapped[int] = mapped_column(
-        Integer, primary_key=True, autoincrement=True)
-    pet_id: Mapped[int] = mapped_column(
-        Integer, unique=True, nullable=False)
-    name: Mapped[str] = mapped_column(String(128), nullable=False)
-    species: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="dog")
-    breed: Mapped[str] = mapped_column(
-        String(128), nullable=False, default="unknown")
-    date_of_birth: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="unknown")
-    sex: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="unknown")
-    life_stage: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="adult")
-
-    def __repr__(self) -> str:
-        return f"<Pet pet_id={self.pet_id!r} name={self.name!r}>"
-
-    def to_dict(self) -> dict:
-        """Return the same dict shape as pet_profile.json."""
-        return {
-            "pet_id": self.pet_id,
-            "name": self.name,
-            "species": self.species,
-            "breed": self.breed,
-            "date_of_birth": self.date_of_birth,
-            "sex": self.sex,
-            "life_stage": self.life_stage,
-        }
-
-
 # ── User ─────────────────────────────────────────────────────────────────────
 
 class User(Base):
@@ -99,7 +60,7 @@ class User(Base):
     Pet ownership comes from AALDA API — NOT stored on the user table.
     Auto-upserted on first chat request with sensible defaults.
     """
-    __tablename__ = "users"
+    __tablename__ = "anymall_chan_users"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
@@ -120,6 +81,10 @@ class User(Base):
         String(64), nullable=False, default="")
     updated_at: Mapped[str] = mapped_column(
         String(64), nullable=False, default="")
+    last_known_pet_ids: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True, default=list)
+    # Full list of pet IDs the user owns — written on every POST /chat.
+    # Used by nightly job to regen suggested questions without a chat request.
 
     def __repr__(self) -> str:
         return f"<User user_code={self.user_code!r}>"
@@ -134,6 +99,7 @@ class User(Base):
             "preferred_language": self.preferred_language,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "last_known_pet_ids": self.last_known_pet_ids or [],
         }
 
 
@@ -151,11 +117,13 @@ class ActiveProfile(Base):
       all metadata columns (confidence, source_rank, etc.) = NULL.
       to_dict_entry() returns the raw string for this key.
     """
-    __tablename__ = "active_profile"
+    __tablename__ = "anymall_chan_active_profile"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
     pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_code: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="")
     field_key: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # The fact value — always a string (even for _pet_history).
@@ -175,7 +143,8 @@ class ActiveProfile(Base):
     # One row per pet+field combination.
     __table_args__ = (
         UniqueConstraint("pet_id", "field_key",
-                         name="uq_active_profile_pet_field"),
+                         name="uq_anymall_chan_active_profile_pet_field"),
+        Index("ix_anymall_chan_active_profile_user_code", "user_code"),
     )
 
     def __repr__(self) -> str:
@@ -189,7 +158,8 @@ class ActiveProfile(Base):
         For regular fields: returns the full metadata dict matching
         what the Aggregator writes to active_profile.json.
         """
-        if self.field_key == "_pet_history":
+        if self.field_key in ("_pet_history", "_history_last_updated"):
+            # Both are stored as plain strings — return the raw value, not a metadata dict.
             return self.value
 
         return {
@@ -216,11 +186,13 @@ class FactLog(Base):
     the same field can appear many times (every conversation may extract
     the same fact).
     """
-    __tablename__ = "fact_log"
+    __tablename__ = "anymall_chan_fact_log"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
     pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_code: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="")
     session_id: Mapped[str] = mapped_column(String(128), nullable=False)
     field_key: Mapped[str] = mapped_column(String(128), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
@@ -239,8 +211,11 @@ class FactLog(Base):
     extracted_at: Mapped[str] = mapped_column(String(64), nullable=False)
 
     __table_args__ = (
-        Index("ix_fact_log_pet_id", "pet_id"),
-        Index("ix_fact_log_session_id", "session_id"),
+        Index("ix_anymall_chan_fact_log_pet_id", "pet_id"),
+        Index("ix_anymall_chan_fact_log_session_id", "session_id"),
+        # Composite index for HistoryBuilder queries (pet_id + extracted_at range scan).
+        Index("ix_anymall_chan_fact_log_pet_id_extracted_at", "pet_id", "extracted_at"),
+        Index("ix_anymall_chan_fact_log_user_code", "user_code"),
     )
 
     def __repr__(self) -> str:
@@ -261,6 +236,7 @@ class FactLog(Base):
             "pet_label": self.pet_label,
             "extracted_at": self.extracted_at,
             "session_id": self.session_id,
+            "user_code": self.user_code,
         }
 
 
@@ -275,7 +251,7 @@ class Thread(Base):
     The compaction_summary column stores an LLM-generated summary of
     older messages after compaction runs.
     """
-    __tablename__ = "threads"
+    __tablename__ = "anymall_chan_threads"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
@@ -295,9 +271,18 @@ class Thread(Base):
         Integer, nullable=True)
 
     __table_args__ = (
-        Index("ix_threads_pet_id_status", "pet_id", "status"),
-        Index("ix_threads_secondary_pet_id", "secondary_pet_id"),
-        Index("ix_threads_user_id", "user_id"),
+        Index("ix_anymall_chan_threads_pet_id_status", "pet_id", "status"),
+        Index("ix_anymall_chan_threads_secondary_pet_id", "secondary_pet_id"),
+        Index("ix_anymall_chan_threads_user_id", "user_id"),
+        # Composite index for nightly job queries (expires_at range on expired threads).
+        Index("ix_anymall_chan_threads_expires_at", "expires_at"),
+        # Partial unique index: at most one active thread per pet at any time.
+        Index(
+            "ix_anymall_chan_threads_one_active_per_pet",
+            "pet_id",
+            unique=True,
+            postgresql_where="status = 'active'",
+        ),
     )
 
     def __repr__(self) -> str:
@@ -328,19 +313,19 @@ class ThreadMessage(Base):
     Write-through pattern: appended to app.state.sessions (in-memory)
     synchronously, then INSERT'd to PostgreSQL in _run_background().
     """
-    __tablename__ = "thread_messages"
+    __tablename__ = "anymall_chan_thread_messages"
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True)
     thread_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("threads.thread_id", ondelete="CASCADE"),
+        String(128), ForeignKey("anymall_chan_threads.thread_id", ondelete="CASCADE"),
         nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     timestamp: Mapped[str] = mapped_column(String(64), nullable=False)
 
     __table_args__ = (
-        Index("ix_thread_messages_thread_id", "thread_id"),
+        Index("ix_anymall_chan_thread_messages_thread_id", "thread_id"),
     )
 
     def __repr__(self) -> str:
@@ -352,4 +337,49 @@ class ThreadMessage(Base):
             "role": self.role,
             "content": self.content,
             "timestamp": self.timestamp,
+        }
+
+
+# ── SuggestedQuestion ─────────────────────────────────────────────────────────
+
+class SuggestedQuestion(Base):
+    """
+    Cold storage for per-pet suggested questions (v2 per-pet redesign).
+
+    One row per (user_code, language, pet_id). Each pet has its own 10-question
+    set: 3 dedicated food + 1 food/both + 3 dedicated health + 1 health/both +
+    1 anymall/this_pet + 1 anymall/both.
+
+    Valkey is the hot cache (10-day TTL, keyed by pet_id). This table is the
+    fallback: Valkey miss → check here → load into Valkey → serve. Regen only
+    happens when profile changed or questions are older than 7 days.
+    """
+    __tablename__ = "anymall_chan_suggested_questions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    language: Mapped[str] = mapped_column(String(10), nullable=False)
+    pet_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    questions: Mapped[list] = mapped_column(JSONB, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_code", "language", "pet_id", name="uq_suggested_questions"),
+        Index("idx_sq_user_code", "user_code"),
+        Index("idx_sq_generated_at", "generated_at"),
+        Index("idx_sq_pet_id", "pet_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SuggestedQuestion user_code={self.user_code!r} language={self.language!r} pet_id={self.pet_id!r}>"
+
+    def to_dict(self) -> dict:
+        """Return the stored blob as a plain dict."""
+        return {
+            "user_code": self.user_code,
+            "language": self.language,
+            "pet_id": self.pet_id,
+            "questions": self.questions,
+            "generated_at": self.generated_at,
         }

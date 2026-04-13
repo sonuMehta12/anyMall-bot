@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import ChatBubble from '../components/ChatBubble.jsx'
 import ConfidenceBar from '../components/ConfidenceBar.jsx'
-import { sendMessage, fetchConfidence, BASE } from '../api.js'
+import RecipeCard from '../components/RecipeCard.jsx'
+import { sendMessage, fetchSetup, fetchConfidence, BASE } from '../api.js'
 import './Chat.css'
 
 const SPECIES_EMOJI = { dog: '🐕', cat: '🐱' }
@@ -19,6 +20,7 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
   const [confidenceScore, setConfidenceScore] = useState(0)
   const [confidenceColor, setConfidenceColor] = useState('red')
   const [activeRedirect, setActiveRedirect] = useState(null)
+  const [suggestedQuestions, setSuggestedQuestions] = useState([])
 
   const messagesEndRef = useRef(null)
   const textareaRef = useRef(null)
@@ -32,15 +34,18 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isTyping])
 
-  // Fetch confidence score on mount (for primary pet)
+  // Fetch setup (confidence + suggested questions) on mount
   useEffect(() => {
     if (!primaryPet) return
-    fetchConfidence(primaryPet.pet_id, userCode)
+    fetchSetup(petIds, userCode, language, 'anymall')
       .then(data => {
         setConfidenceScore(data.confidence_score ?? 0)
         setConfidenceColor(data.confidence_color ?? 'red')
+        if (data.suggested_questions?.length) {
+          setSuggestedQuestions(data.suggested_questions)
+        }
       })
-      .catch(err => console.warn('Could not fetch initial confidence:', err))
+      .catch(err => console.warn('Could not fetch setup:', err))
   }, [])
 
   // Show opening greeting when chat first mounts
@@ -55,13 +60,14 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
     setMessages([{ id: 1, text: greeting, isUser: false }])
   }, [])
 
-  async function handleSend() {
-    const text = inputText.trim()
+  async function handleSend(overrideText) {
+    const text = (overrideText || inputText).trim()
     if (!text || isTyping) return
 
     setInputText('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
+    setSuggestedQuestions([])  // hide chips once user sends any message
     setMessages(prev => [...prev, { id: Date.now(), text, isUser: true }])
     setIsTyping(true)
 
@@ -72,10 +78,8 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
         petIds,
         userCode,
         language,
+        displayName: 'Sarah',
       })
-
-      setConfidenceScore(data.confidence_score ?? 0)
-      setConfidenceColor(data.confidence_color ?? 'red')
 
       if (data.redirect) {
         console.log('[Redirect payload]', data.redirect)
@@ -84,16 +88,35 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
         setActiveRedirect(null)
       }
 
+      // Flatten recipes and attach to the message object so they persist in scroll history
+      const flatRecipes = []
+      if (data.recipes_by_pet && Object.keys(data.recipes_by_pet).length > 0) {
+        for (const [petIdStr, recipes] of Object.entries(data.recipes_by_pet)) {
+          const petId = parseInt(petIdStr)
+          const petName = selectedPets.find(p => p.pet_id === petId)?.name || null
+          if (Array.isArray(recipes)) {
+            recipes.forEach(recipe => flatRecipes.push({ ...recipe, petName }))
+          }
+        }
+      }
+
+      const isHtmlResponse = (
+        data.output_mode === 'food_recipes_info' ||
+        data.output_mode === 'food_info'
+      )
+
       setIsTyping(false)
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
         text: data.message,
         isUser: false,
+        recipes: flatRecipes,
+        isHtml: isHtmlResponse,
       }])
 
       // Refresh confidence after background pipeline finishes
       setTimeout(() => {
-        fetchConfidence(primaryPet.pet_id, userCode)
+        fetchConfidence(petIds, userCode)
           .then(fresh => {
             setConfidenceScore(fresh.confidence_score ?? data.confidence_score)
             setConfidenceColor(fresh.confidence_color ?? data.confidence_color)
@@ -102,12 +125,19 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
       }, 4000)
     } catch (err) {
       setIsTyping(false)
-      setMessages(prev => [...prev, {
-        id: Date.now() + 1,
-        text: `I'm having trouble connecting right now. Please try again! 🐢`,
-        isUser: false,
-      }])
+      const text = err.isRejection
+        ? err.message
+        : `I'm having trouble connecting right now. Please try again! 🐢`
+      setMessages(prev => [...prev, { id: Date.now() + 1, text, isUser: false }])
     }
+  }
+
+  function handleChipTap(questionText) {
+    if (isTyping) return
+    // Set the input text and let handleSend do the rest
+    setInputText(questionText)
+    // Use a microtask so React flushes the state update before handleSend reads it
+    setTimeout(() => handleSend(questionText), 0)
   }
 
   function handleKeyDown(e) {
@@ -143,8 +173,36 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
         </div>
 
         {messages.map(msg => (
-          <ChatBubble key={msg.id} message={msg.text} isUser={msg.isUser} />
+          <div key={msg.id}>
+            {/* Recipe carousel — attached to the message it belongs to */}
+            {!msg.isUser && msg.recipes?.length > 0 && (
+              <div className="chat-recipe-carousel">
+                <div className="chat-recipe-label">🍽️ おすすめレシピ</div>
+                <div className="chat-recipe-scroll">
+                  {msg.recipes.map((r, idx) => (
+                    <RecipeCard key={`${r.petName ?? 'pet'}-${r.id}-${idx}`} recipe={r} petName={r.petName} />
+                  ))}
+                </div>
+              </div>
+            )}
+            <ChatBubble message={msg.text} isUser={msg.isUser} isHtml={msg.isHtml} />
+          </div>
         ))}
+
+        {/* Suggested question chips — shown only on blank state */}
+        {suggestedQuestions.length > 0 && messages.length <= 1 && !isTyping && (
+          <div className="chat-suggested-questions">
+            {suggestedQuestions.map((q, i) => (
+              <button
+                key={i}
+                className="suggested-chip"
+                onClick={() => handleChipTap(q.text)}
+              >
+                {q.text}
+              </button>
+            ))}
+          </div>
+        )}
 
         {isTyping && <ChatBubble isTyping />}
 
@@ -176,7 +234,12 @@ export default function Chat({ selectedPets, userCode, language, onBack }) {
           >
             {activeRedirect.display.label} →
           </button>
-          <button className="redirect-dismiss" onClick={() => setActiveRedirect(null)}>✕</button>
+          <button
+            className="redirect-dismiss"
+            onClick={() => setActiveRedirect(null)}
+          >
+            ✕
+          </button>
         </div>
       )}
 

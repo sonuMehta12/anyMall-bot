@@ -17,6 +17,8 @@ import logging
 import math
 from datetime import datetime, timezone
 
+from constants import CONFIDENCE_GREEN_THRESHOLD, CONFIDENCE_YELLOW_THRESHOLD
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,9 +110,10 @@ LIFE_STAGE_MULTIPLIERS: dict[str, dict[str, float]] = {
 
 
 # ── Color thresholds ────────────────────────────────────────────────────────
+# Imported from constants.py — single source of truth shared with routes/UI.
 
-_GREEN_THRESHOLD: int = 80
-_YELLOW_THRESHOLD: int = 50
+_GREEN_THRESHOLD: int = CONFIDENCE_GREEN_THRESHOLD
+_YELLOW_THRESHOLD: int = CONFIDENCE_YELLOW_THRESHOLD
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────

@@ -280,6 +280,9 @@ FIELD_LABELS: dict[str, str] = {
     "behavioral_traits": "Behavioral Traits",
     "microchipped":     "Microchipped",
     "insurance":        "Pet Insurance",
+    "meal_frequency":   "Meal Frequency",
+    "bathroom_habits":  "Bathroom Habits",
+    "indoor_outdoor":   "Indoor / Outdoor",
 }
 
 
@@ -456,9 +459,15 @@ GAP_LADDER_ALL_KEYS: list[str] = [
 # Always use these constants — never type "health" or "food" as a raw string.
 # If we rename intents later, one change here fixes everything.
 
-INTENT_GENERAL: str = "general"   # normal conversation — no redirect
-INTENT_HEALTH: str  = "health"    # medical concern → redirect to Health module
-INTENT_FOOD: str    = "food"      # diet / nutrition question → redirect to Food module
+INTENT_GENERAL: str   = "general"    # normal conversation — no redirect
+INTENT_HEALTH: str    = "health"     # medical concern → redirect to Health module
+INTENT_FOOD: str      = "food"       # diet / nutrition question → redirect to Food module
+INTENT_UNTRUSTED: str = "untrusted"  # injection/jailbreak attempt → reject, no pipeline
+
+# Food sub-intents (Food AI — Phase 4)
+INTENT_FOOD_RECIPES: str      = "food_recipes"       # pure browse — MCP only, no LLM
+INTENT_FOOD_RECIPES_INFO: str = "food_recipes_info"  # MCP + FoodAgent + Tavily
+INTENT_FOOD_INFO: str         = "food_info"           # FoodAgent + Tavily, no recipes
 
 
 # ── 12. Urgency Level Constants ───────────────────────────────────────────────

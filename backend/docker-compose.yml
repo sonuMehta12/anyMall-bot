@@ -33,5 +33,30 @@ services:
       timeout: 3s
       retries: 5
 
+  valkey:
+    # NOTE: Valkey has no persistent volume — this is intentional.
+    # Valkey is a cache layer only; PostgreSQL is the source of truth.
+    # On container restart all cached data is lost; the first request after
+    # restart will be a cache miss and reload from PostgreSQL (cache-aside).
+    # To inspect cache: docker exec -it anymall-valkey valkey-cli -a ${VALKEY_PASSWORD:-valkey_dev}
+    image: valkey/valkey:8-alpine
+    container_name: anymall-valkey
+    # maxmemory: 64MB is more than enough for our session/profile cache footprint
+    # (~1.25MB estimated + 10x safety margin = 12.5MB; 64MB gives plenty of headroom)
+    # allkeys-lru: evict least-recently-used key from ALL keys when memory is full.
+    # This is the industry-standard eviction policy for caching workloads.
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD:-valkey_dev}
+      --maxmemory 64mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD:-valkey_dev}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 volumes:
   pgdata:

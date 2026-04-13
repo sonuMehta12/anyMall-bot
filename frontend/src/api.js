@@ -13,7 +13,7 @@ export async function fetchPets(userCode) {
 }
 
 // POST /api/v1/chat
-export async function sendMessage({ sessionId, message, petIds, userCode, language = 'auto' }) {
+export async function sendMessage({ sessionId, message, petIds, userCode, language = 'auto', displayName = '' }) {
   const res = await fetch(`${BASE}/api/v1/chat`, {
     method: 'POST',
     headers: {
@@ -25,9 +25,18 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
       message,
       pet_ids: petIds,
       language,
+      display_name: displayName,
     }),
   })
-  if (!res.ok) throw new Error(`${res.status} — failed to send message`)
+  if (!res.ok) {
+    if (res.status === 400) {
+      const body = await res.json().catch(() => ({}))
+      const err = new Error(body.detail || "I can't help with that.")
+      err.isRejection = true
+      throw err
+    }
+    throw new Error(`${res.status} — failed to send message`)
+  }
   const data = await res.json()
 
   // ── Agent 1 — logged immediately (synchronous, in the /chat response) ───────
@@ -115,9 +124,30 @@ export async function sendMessage({ sessionId, message, petIds, userCode, langua
 }
 
 
-// GET /api/v1/confidence — dedicated endpoint for fresh confidence score
-export async function fetchConfidence(petId, userCode) {
-  const res = await fetch(`${BASE}/api/v1/confidence?pet_id=${petId}`, {
+// POST /api/v1/pets/setup/query — confidence score + suggested questions.
+// Returns confidence_score, confidence_color, and suggested_questions (3 items,
+// filtered by module). Works for 1 or more pet IDs.
+// module: 'anymall' (default) | 'food' | 'health'
+export async function fetchSetup(petIds, userCode, language = 'auto', module = 'anymall') {
+  const ids = Array.isArray(petIds) ? petIds : [petIds]
+  const res = await fetch(`${BASE}/api/v1/pets/setup/query`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Code': userCode,
+    },
+    body: JSON.stringify({ pet_ids: ids, language, module }),
+  })
+  if (!res.ok) throw new Error(`${res.status} — failed to fetch setup`)
+  return res.json()
+}
+
+// GET /api/v1/confidence — backward-compatible alias (confidence only, no questions).
+// Still used by the post-chat refresh (only needs score, not questions).
+export async function fetchConfidence(petIds, userCode) {
+  const ids = Array.isArray(petIds) ? petIds : [petIds]
+  const query = ids.map(id => `pet_id=${id}`).join('&')
+  const res = await fetch(`${BASE}/api/v1/confidence?${query}`, {
     headers: { 'X-User-Code': userCode },
   })
   if (!res.ok) throw new Error(`${res.status} — failed to fetch confidence`)

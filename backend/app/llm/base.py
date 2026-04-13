@@ -25,7 +25,7 @@ class LLMProvider(ABC):
 
     Concrete implementations live in this same package:
       - AzureOpenAIProvider  (azure_openai.py)   ← current
-      - OpenAIProvider       (openai.py)          ← Phase 1
+      - OpenAIProvider       (openai_provider.py) ← current
       - MockLLMProvider      (mock.py)            ← future tests
 
     Agent 1 receives an LLMProvider instance via dependency injection.
@@ -39,6 +39,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 512,
+        model: str | None = None,
     ) -> str:
         """
         Send a chat completion request and return the assistant's reply as a
@@ -55,6 +56,11 @@ class LLMProvider(ABC):
                             Range: 0.0 (deterministic) to 1.0 (creative).
             max_tokens:     Hard ceiling on reply length.  512 is enough for
                             a conversational response.  Prevents runaway bills.
+            model:          Optional model override.  None = use the provider's
+                            configured default (set via OPENAI_MODEL_CHAT or
+                            AZURE_OPENAI_DEPLOYMENT_CHAT in .env).
+                            Set per-agent to test specific models without
+                            changing provider config or other agents.
 
         Returns:
             The assistant reply text.  Plain string, no wrapping object.

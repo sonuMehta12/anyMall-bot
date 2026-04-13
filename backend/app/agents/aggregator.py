@@ -24,12 +24,18 @@
 #   - On any failure: caller (_run_background) catches and logs — never crashes.
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from app.agents.compressor import ExtractedFact
+from app.cache.keys import CacheKeys, TTL_PROFILE, jittered_ttl
 from app.db.repositories import ActiveProfileRepo
 from app.types import ActiveProfileEntry
+
+if TYPE_CHECKING:
+    from app.cache.client import ValkeyClient
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +92,10 @@ class AggregatorAgent:
     matching rule wins — remaining rules are not evaluated.
     """
 
-    def __init__(self, get_session=None) -> None:
-        self._lock = asyncio.Lock()
+    def __init__(self, get_session=None, valkey: "ValkeyClient | None" = None) -> None:
+        self._locks: dict[int, asyncio.Lock] = {}
         self._get_session = get_session  # async context manager for DB writes
+        self._valkey = valkey            # Valkey client for write-through cache (ft-005)
         logger.info("AggregatorAgent initialised (no LLM).")
 
     async def run(
@@ -96,7 +103,8 @@ class AggregatorAgent:
         facts: list[ExtractedFact],
         session_id: str,
         active_profile: dict[str, ActiveProfileEntry] | None = None,
-        pet_id: int = 0,
+        pet_id: int | None = None,
+        user_code: str = "",
     ) -> dict[str, ActiveProfileEntry]:
         """
         Merge a list of high-confidence facts into active_profile.
@@ -115,7 +123,8 @@ class AggregatorAgent:
         Returns:
             The updated active_profile dict after all merges.
         """
-        async with self._lock:
+        pet_lock = self._locks.setdefault(pet_id if pet_id is not None else 0, asyncio.Lock())
+        async with pet_lock:
             if active_profile is None:
                 logger.warning(
                     "Aggregator called without active_profile — using empty dict.")
@@ -128,9 +137,31 @@ class AggregatorAgent:
                     changes += 1
 
             if changes > 0 and self._get_session is not None:
+                # Always write to PostgreSQL first (source of truth)
                 async with self._get_session() as session:
                     repo = ActiveProfileRepo(session)
-                    await repo.write_all(pet_id, profile)
+                    await repo.write_all(pet_id, profile, user_code=user_code)
+
+                # Write-through to Valkey after DB succeeds (ft-005, Step 6)
+                # DB first, then cache — so a crash between the two writes
+                # leaves DB correct and cache stale (stale → reload on next miss).
+                if self._valkey is not None and pet_id is not None:
+                    await self._valkey.setex(
+                        CacheKeys.profile(pet_id),
+                        jittered_ttl(TTL_PROFILE),
+                        json.dumps(profile),
+                    )
+
+                # Bust suggested-questions cache for this user — profile data
+                # changed, so pre-generated questions may reference stale gaps.
+                # Wildcard delete hits all pet/language combos for this user.
+                if self._valkey is not None and user_code:
+                    pattern = CacheKeys.suggested_pattern(user_code)
+                    try:
+                        await self._valkey.delete_pattern(pattern)
+                    except Exception as sq_exc:
+                        # Non-fatal — questions will just be stale until nightly refresh
+                        logger.debug("Suggested-questions cache bust failed: %s", sq_exc)
 
             logger.info(
                 "Aggregator done — session=%s facts=%d changes=%d",
